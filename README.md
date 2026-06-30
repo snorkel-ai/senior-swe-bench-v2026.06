@@ -26,5 +26,5 @@ MODEL=anthropic/claude-opus-4-8
 AGENT=mini-swe-agent
 
 # Run Harbor
-harbor run --repo snorkel-ai/senior-swe-bench -a $AGENT -m $MODEL
+harbor run --repo snorkel-ai/senior-swe-bench-v2026.06 -a $AGENT -m $MODEL
 ```
