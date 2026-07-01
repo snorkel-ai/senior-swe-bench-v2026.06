@@ -1,0 +1,19 @@
+{
+  "files": [
+    "rust/libs/connlib/tunnel/src/messages/client.rs",
+    "rust/libs/connlib/tunnel/src/client.rs",
+    "rust/libs/connlib/tunnel/src/dns/device_stub_resolver.rs",
+    "rust/libs/client-shared/src/eventloop.rs"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "keeps_inmemory_field_stable",
+      "description": "The fix restores wire compatibility for the device-pool member identifier by realigning the SERIALIZATION name (e.g. a `#[serde(rename = \"client_id\")]` / `#[serde(alias = \"client_id\")]` attribute) while keeping the in-memory struct field named `id`. It must NOT rename the in-memory field back to `client_id`, which would churn the unrelated call sites that read the field (e.g. in routing-table / pending-device-access handling). The senior choice here is a serde attribute, not a field rename: realign the wire format without touching the in-memory API. Flag a solution that renames the in-memory field (forcing call-site churn) even if it happens to deserialize the portal payload."
+    },
+    {
+      "name": "access_denied_optional_addr_routing",
+      "description": "Because the portal may omit one or both addresses on a device-access denial, the denial-handling path treats the ipv4/ipv6 addresses as optional and resolves the affected routing-table entry by trying the ipv4 address first and falling back to the ipv6 address (or an equivalent that handles either address being absent). A denial that carries only one address family must still find its routing entry, and a missing address must not cause a panic or an unwrap on absent data. Flag a solution that keeps the addresses mandatory, or that only ever looks one address family up with no fallback when the other is the one present."
+    }
+  ],
+  "pass_to_pass": []
+}

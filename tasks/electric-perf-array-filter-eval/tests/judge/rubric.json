@@ -1,0 +1,25 @@
+{
+  "files": [
+    "packages/sync-service/lib/electric/shapes/filter.ex",
+    "packages/sync-service/lib/electric/shapes/filter/where_condition.ex",
+    "packages/sync-service/lib/electric/shapes/filter/index.ex",
+    "packages/sync-service/lib/electric/shapes/filter/indexes/equality_index.ex",
+    "packages/sync-service/lib/electric/shapes/filter/indexes/inclusion_index.ex"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "any_and_in_optimisations_run_at_registration_time",
+      "description": "Both `const = ANY(array_field)` and `field IN (c1, c2, ...)` WHERE clauses are detected at shape-registration time (when a shape is added to the filter) and routed into an indexed lookup path — not the linear per-shape `other_shapes` scan. The agent's solution recognises the parsed AST shapes (the ANY-Func wrapping an `=` Func, and the OR-chain produced by the parser for IN) at registration time and writes per-shape entries to one or more index-side ETS tables. Accept any of: (a) reusing the existing equality / inclusion indexes (ANY → array-containment via single-element array; IN → equality index once per value), (b) introducing dedicated new index modules for ANY and IN, or (c) a unified multi-value index covering both. The defining property is that the per-record `affected_shapes` lookup for an ANY- or IN-registered shape goes through an indexed lookup whose cost does not scale with the total registered shape count — not a smarter scan over `other_shapes`."
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "or_chain_optimisation_validates_same_field_and_type",
+      "description": "The OR-chain detection that recognises IN expansions only fires when EVERY branch of the chain is an equality on the SAME field with the SAME type. Mixed-field chains (e.g., `id = 1 OR number = 2`) and mixed-type chains MUST fall through to the existing non-optimisable path. The agent's flatten/validate step must check both field equality and type equality across all branches before treating the chain as an IN. Accept any detection algorithm — recursive descent, `Enum.reduce_while` over a flattened tree, an explicit list-builder, or different-named helpers — as long as the validation rejects heterogeneous chains. Reject implementations that treat any OR chain as IN, that compare only field names without type, or that silently optimise mixed-field chains and produce wrong results for records whose values straddle the chain."
+    },
+    {
+      "name": "in_remove_path_is_symmetric_with_add_path",
+      "description": "Removing a shape that was registered via `IN (...)` removes every per-value entry the registration created, and the surrounding state (the WhereCondition's index_keys set, or whatever the agent's design uses to track which indexed lookups exist for a table) correctly drops the IN shape's key when the last per-value entry vanishes. The remove path iterates the registered values and propagates a cascading deletion signal so the index-key cleanup happens at the right time. Accept any data layout — per-value entries can live in the equality index, a dedicated IN index, or a unified multi-value index — as long as add and remove are symmetric. Reject implementations whose remove path forgets values, leaks per-value entries across add+remove cycles, or fails to drop the IN shape's index key when no per-value entries remain."
+    }
+  ]
+}

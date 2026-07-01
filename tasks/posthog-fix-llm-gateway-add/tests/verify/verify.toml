@@ -1,0 +1,15 @@
+# Run pytest inside the llm-gateway service's uv-managed venv.
+#
+# The python_runner sets cwd to /repo/posthog (the repo root). Adding
+# `--directory services/llm-gateway` makes uv resolve the project +
+# venv at services/llm-gateway/. The service's pyproject.toml installs
+# `llm_gateway` as an editable package, so `from llm_gateway.api.routes
+# import router` resolves directly from the venv — no PYTHONPATH gymnastics.
+#
+# `--rootdir services/llm-gateway` forces pytest to honor the service's
+# pyproject.toml settings (notably `asyncio_mode = "auto"` for any future
+# async fixtures, and `pythonpath = ["src"]` belt-and-suspenders), since
+# verify.py lives at /tests/verify/verify.py — outside the project tree.
+[pytest]
+command = "uv run --directory services/llm-gateway pytest"
+timeout = 300

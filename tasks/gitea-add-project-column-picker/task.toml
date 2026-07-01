@@ -1,0 +1,197 @@
+version = "1.0"
+
+[environment]
+base_image = "gitea-add-project-column-picker:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1200.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "gitea"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "gitea"
+
+[metadata]
+family = "gitea-add-project-column-picker"
+variant = "hard"
+segment = "design"
+repo = "gitea"
+tags = ["gitea", "go", "html-css"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Gitea has project boards (Kanban-style) where issues and pull requests
+live in columns like "To Do" / "In Progress" / "Done". Today, to move a
+ticket between columns you have to open the project board, hunt down the
+issue's card, and drag it. People who live on the issue page want to move
+the ticket to its next column right from the issue's sidebar — the same
+sidebar that already shows the issue's labels, milestone, assignees, and
+project. Make the issue/PR sidebar able to move the issue between the
+columns of the project it belongs to, with the usual permission rules:
+people who can edit the issue get an interactive picker, everyone else
+just sees which column it's currently in.
+"""
+context = """The issue/PR page sidebar is assembled in
+`routers/web/repo/issue_page_meta.go`. `retrieveRepoIssueMetaData`
+populates an `IssuePageMetaData` struct that the sidebar templates under
+`templates/repo/issue/sidebar/` render. Project data lives on
+`issueSidebarProjectsData` and is filled by `retrieveProjectData` (runs
+for everyone, sets the issue's currently-selected project + its columns)
+and `retrieveProjectsDataForIssueWriter` (runs only for writers, sets the
+list of open/closed projects for the project-assignment dropdown). The
+sidebar's project section is rendered by
+`templates/repo/issue/sidebar/project_list.tmpl`.
+
+Project columns and the issue<->column relationship live in
+`models/project/` (`Column`, `ProjectIssue`) and `models/issues/`
+(`Issue.LoadProject`, `Issue.ProjectColumnID`). Moving issues between
+columns is already implemented by
+`services/projects.MoveIssuesOnProjectColumn(ctx, doer, column,
+sortedIssueIDs)`, which updates the `project_issue` rows and writes the
+"moved this to <column>" timeline comment. Each `project_issue` row
+carries a `sorting` value; when an issue lands in a column it should be
+appended at the end (one past the current max sorting in that column).
+The existing assignment path
+(`models/issues/issue_project.go::IssueAssignOrRemoveProject`) and the
+column-deletion path (`models/project/issue.go`) both compute that
+"next sorting" value with an inline `max(sorting)+1` query.
+
+Issue-sidebar dropdowns use a shared front-end convention: an
+`issue-sidebar-combo` element with a hidden `combo-value` input and a
+`data-update-url`; selecting a menu item POSTs the chosen value to that
+URL. The project-assignment dropdown already uses this pattern, posting
+to `/{owner}/{repo}/issues/projects`. Sidebar POST endpoints are
+registered in `routers/web/web.go` under the issue group and gated by
+permission middleware (`reqRepoIssuesOrPullsWriter`,
+`reqRepoProjectsReader`, `reqRepoProjectsWriter`).
+
+Permissions: `IssuePageMetaData.CanModifyIssueOrPull` is true when the
+viewer can write issues/PRs on a non-archived repo. The existing project
+sidebar already distinguishes writers (interactive) from read-only
+viewers (static display).
+
+Test infrastructure: gitea's `tests/integration` package boots a full
+in-memory server (sqlite + YAML fixtures) and drives real HTTP requests
+via `loginUser` / `NewRequest` / `NewRequestWithValues` /
+`MakeRequest` / `NewHTMLParser`. Repo `user2/repo1` (public) has project
+1 ("First project") with columns "To Do" (default, id 1), "In Progress"
+(id 2) and "Done" (id 3); fixtures place issue 3 in column "In Progress"
+and issue 5 (page index 4) in column "Done".
+"""
+solution = """Canonical fix (reference example, 9 files):
+
+1. **`models/project/issue.go`** — extract the inline "next sorting"
+   query into `GetColumnIssueNextSorting(ctx, projectID, columnID int64)
+   (int64, error)` (max(sorting)+1, or 0 when the column is empty), and
+   reuse it inside the column-move helper. The reference example also
+   turns the `(*Column).moveIssuesToAnotherColumn` method into a package
+   function `moveIssuesToAnotherColumn(ctx, oldColumn, newColumn)`; this
+   is incidental cleanup, not required.
+
+2. **`models/issues/issue_project.go`** — `IssueAssignOrRemoveProject`
+   calls the new `GetColumnIssueNextSorting` instead of its inline query.
+
+3. **`models/project/column.go`** + **`models/project/column_test.go`** —
+   updated call sites for the helper extraction.
+
+4. **`models/issues/issue.go`** — add
+   `GetIssueByRepoID(ctx, repoID, issueID int64) (*Issue, error)` that
+   returns `ErrIssueNotExist` when the issue isn't in that repo (so a
+   move request can't reach an issue in another repo).
+
+5. **`routers/web/repo/projects.go`** — new handler
+   `UpdateIssueProjectColumn(ctx)`: look up the issue scoped to the
+   current repo (`GetIssueByRepoID`), look up the requested column
+   (`GetColumn`), load the issue's project, and verify the requested
+   column actually belongs to that project — if not, `ctx.NotFound`.
+   Compute the append sorting with `GetColumnIssueNextSorting` and call
+   `project_service.MoveIssuesOnProjectColumn`, then `ctx.JSONOK()`.
+
+6. **`routers/web/web.go`** — register
+   `m.Post("/projects/column", reqRepoIssuesOrPullsWriter,
+   reqRepoProjectsWriter, repo.UpdateIssueProjectColumn)` in the issue
+   sidebar group.
+
+7. **`routers/web/repo/issue_page_meta.go`** — replace the flat
+   `SelectedProjectColumns`/`SelectedProjectColumn` fields with a
+   per-project `issueSidebarProjectCardData` ({Project, Columns,
+   SelectedColumn}) and a `ProjectCards` slice; rewrite
+   `retrieveProjectData` to build one card for the issue's project.
+
+8. **`templates/repo/issue/sidebar/project_list.tmpl`** — render the
+   project card. For writers (`CanModifyIssueOrPull`) emit an
+   `issue-sidebar-combo` column dropdown whose `data-update-url` points
+   at the new endpoint (`.../issues/projects/column?issue_id=...`) and
+   whose menu lists every project column with the current one selected.
+   For read-only viewers, render the current column's name as static
+   text. Show "No projects" when the issue isn't on a board.
+
+9. **`options/locale/locale_en-US.json`** — add the
+   `repo.issues.new.no_column` string used when no column is selected.
+
+Alternative valid implementations the reward stack must accept:
+- A different route path / handler name for the move endpoint (the
+  sidebar template's `data-update-url` is the source of truth for where
+  the move POST goes).
+- Reusing the existing `MoveIssuesOnProjectColumn` service vs. writing
+  the column update inline.
+- Keeping `moveIssuesToAnotherColumn` as a method instead of a function.
+- Naming the new sorting helper differently, or computing the append
+  sorting inline in the handler.
+- Different sidebar markup/class names, as long as writers get an
+  interactive column picker and read-only viewers see the current column.
+
+Non-optimal patterns the reward stack should reject:
+- Letting a move request target a column that belongs to a different
+  project than the issue's (it must be rejected with a client error, not
+  silently moved).
+- Letting a move request reach an issue that isn't in the current repo.
+- Exposing the interactive picker to read-only viewers, or letting a
+  non-writer move the issue.
+- Placing the moved issue at a colliding/duplicate sorting value instead
+  of appending it to the end of the target column.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["go", "html-css"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "framework-fluency", "api-contract-design", "interface-design", "security-reasoning"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 200
+files = 10
+hunks = 13
+scope = "broad"
+
+[metadata.origin]
+repo = "go-gitea/gitea"
+pr_numbers = [37037]
+base_commit = "6ed861589aba9bf8668c2bbf273ba35b36ed002b"
+base_commit_date = "2026-04-19"
+merged_at = "2026-04-19"
+
+
+
+

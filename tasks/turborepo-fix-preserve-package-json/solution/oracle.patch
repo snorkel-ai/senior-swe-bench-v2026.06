@@ -1,0 +1,221 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 1fdd577..9caefaf 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -166,7 +166,7 @@ regex = "1.7.0"
+ secrecy = "0.10.3"
+ semver = "1.0.16"
+ serde = { version = "1.0.228", features = ["derive"] }
+-serde_json = "1.0.93"
++serde_json = { version = "1.0.93", features = ["preserve_order"] }
+ serde_yaml_ng = "0.10.0"
+ sha2 = "0.10.6"
+ 
+diff --git a/crates/turborepo-lib/src/commands/prune.rs b/crates/turborepo-lib/src/commands/prune.rs
+index baa07f9..9202990 100644
+--- a/crates/turborepo-lib/src/commands/prune.rs
++++ b/crates/turborepo-lib/src/commands/prune.rs
+@@ -250,7 +250,16 @@ pub async fn prune(
+             &pruned_patches,
+             repo_root,
+         );
+-        let mut pruned_json_contents = serde_json::to_string_pretty(&pruned_json)?;
++
++        // Read the original package.json as serde_json::Value to preserve key
++        // ordering. Serializing the PackageJson struct directly would sort keys
++        // alphabetically, producing a byte-different file that invalidates
++        // cache hashes. See https://github.com/vercel/turborepo/issues/12369
++        let original_contents = prune.root.resolve(package_json()).read_to_string()?;
++        let original_value: serde_json::Value = serde_json::from_str(&original_contents)?;
++        let pruned_value = serde_json::to_value(&pruned_json)?;
++        let merged = merge_preserving_key_order(&original_value, &pruned_value);
++        let mut pruned_json_contents = serde_json::to_string_pretty(&merged)?;
+         // Add trailing newline to match Go behavior
+         pruned_json_contents.push('\n');
+ 
+@@ -271,12 +280,37 @@ pub async fn prune(
+             )?;
+         }
+ 
+-        for patch in pruned_patches {
++        for patch in &pruned_patches {
+             prune.copy_file(
+                 &patch.to_anchored_system_path_buf(),
+                 Some(CopyDestination::Docker),
+             )?;
+         }
++
++        // Prune pnpm-workspace.yaml's patchedDependencies so it only
++        // references patches that are actually in the pruned output.
++        if matches!(
++            package_manager,
++            turborepo_repository::package_manager::PackageManager::Pnpm
++                | turborepo_repository::package_manager::PackageManager::Pnpm6
++                | turborepo_repository::package_manager::PackageManager::Pnpm9
++        ) {
++            let ws_config =
++                turborepo_repository::package_manager::pnpm::WORKSPACE_CONFIGURATION_PATH;
++            let ws_path = AnchoredSystemPathBuf::from_raw(ws_config)?;
++            let full_ws = prune.full_directory.resolve(&ws_path);
++            turborepo_repository::package_manager::pnpm::prune_workspace_patches(
++                &full_ws,
++                &pruned_patches,
++            )?;
++            if prune.docker {
++                let docker_ws = prune.docker_directory().resolve(&ws_path);
++                turborepo_repository::package_manager::pnpm::prune_workspace_patches(
++                    &docker_ws,
++                    &pruned_patches,
++                )?;
++            }
++        }
+     } else {
+         prune.copy_file(package_json(), Some(CopyDestination::Docker))?;
+     }
+@@ -701,3 +735,32 @@ impl<'a> Prune<'a> {
+         Ok(Some((turbo_json, turbo_json_name)))
+     }
+ }
++
++/// Merge `pruned` values into `original`, preserving the key ordering from
++/// `original`. Keys present in `original` but absent from `pruned` are dropped.
++/// Keys present in `pruned` but absent from `original` are appended.
++fn merge_preserving_key_order(
++    original: &serde_json::Value,
++    pruned: &serde_json::Value,
++) -> serde_json::Value {
++    match (original, pruned) {
++        (serde_json::Value::Object(orig_map), serde_json::Value::Object(pruned_map)) => {
++            let mut result = serde_json::Map::new();
++            for (key, orig_val) in orig_map {
++                if let Some(pruned_val) = pruned_map.get(key) {
++                    result.insert(
++                        key.clone(),
++                        merge_preserving_key_order(orig_val, pruned_val),
++                    );
++                }
++            }
++            for (key, pruned_val) in pruned_map {
++                if !orig_map.contains_key(key) {
++                    result.insert(key.clone(), pruned_val.clone());
++                }
++            }
++            serde_json::Value::Object(result)
++        }
++        (_, pruned) => pruned.clone(),
++    }
++}
+diff --git a/crates/turborepo-repository/src/package_manager/pnpm.rs b/crates/turborepo-repository/src/package_manager/pnpm.rs
+index 8c3aaee..bbcaea2 100644
+--- a/crates/turborepo-repository/src/package_manager/pnpm.rs
++++ b/crates/turborepo-repository/src/package_manager/pnpm.rs
+@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
+ use node_semver::{Range, Version};
+ use serde::Deserialize;
+ use tracing::debug;
+-use turbopath::{AbsoluteSystemPath, RelativeUnixPath};
++use turbopath::{AbsoluteSystemPath, RelativeUnixPath, RelativeUnixPathBuf};
+ 
+ use super::npmrc;
+ use crate::{
+@@ -70,7 +70,7 @@ impl Iterator for PnpmDetector<'_> {
+ pub(crate) fn prune_patches<R: AsRef<RelativeUnixPath>>(
+     package_json: &PackageJson,
+     patches: &[R],
+-    repo_root: &AbsoluteSystemPath,
++    _repo_root: &AbsoluteSystemPath,
+ ) -> PackageJson {
+     let mut pruned_json = package_json.clone();
+     let patches_set = patches.iter().map(|r| r.as_ref()).collect::<HashSet<_>>();
+@@ -83,21 +83,38 @@ pub(crate) fn prune_patches<R: AsRef<RelativeUnixPath>>(
+         existing_patches.retain(|_, patch_path| patches_set.contains(patch_path.as_ref()));
+     }
+ 
+-    // Patches can be declared in pnpm-workspace.yaml as well
+-    if let Ok(workspace) = PnpmWorkspace::from_file(repo_root) {
+-        let pnpm_config = pruned_json.pnpm.get_or_insert_with(Default::default);
+-        let patched_deps = pnpm_config
+-            .patched_dependencies
+-            .get_or_insert_with(Default::default);
++    pruned_json
++}
+ 
+-        for (key, patch_path) in workspace.patched_dependencies.into_iter().flatten() {
+-            if patches_set.contains(patch_path.as_ref()) {
+-                patched_deps.insert(key, patch_path);
+-            }
+-        }
++/// Prune `patchedDependencies` in a `pnpm-workspace.yaml` file in-place,
++/// retaining only entries whose patch path is in `patches`.
++pub fn prune_workspace_patches<R: AsRef<RelativeUnixPath>>(
++    workspace_yaml_path: &AbsoluteSystemPath,
++    patches: &[R],
++) -> Result<(), std::io::Error> {
++    if !workspace_yaml_path.exists() {
++        return Ok(());
+     }
++    let contents = workspace_yaml_path.read_to_string()?;
++    let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&contents)
++        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+ 
+-    pruned_json
++    let patches_set: HashSet<&RelativeUnixPath> = patches.iter().map(|r| r.as_ref()).collect();
++
++    if let Some(patched_deps) = doc.get_mut("patchedDependencies")
++        && let Some(mapping) = patched_deps.as_mapping_mut()
++    {
++        mapping.retain(|_key, val| {
++            val.as_str()
++                .and_then(|s| RelativeUnixPathBuf::new(s).ok())
++                .is_some_and(|p| patches_set.contains(p.as_ref()))
++        });
++    }
++
++    let output = serde_yaml_ng::to_string(&doc)
++        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
++    workspace_yaml_path.create_with_contents(output)?;
++    Ok(())
+ }
+ 
+ pub fn link_workspace_packages(pnpm_version: PnpmVersion, repo_root: &AbsoluteSystemPath) -> bool {
+@@ -140,7 +157,8 @@ pub fn get_default_exclusions() -> &'static [&'static str] {
+ struct PnpmWorkspace {
+     pub packages: Vec<String>,
+     link_workspace_packages: Option<LinkWorkspacePackages>,
+-    pub patched_dependencies:
++    #[serde(rename = "patchedDependencies")]
++    _patched_dependencies:
+         Option<std::collections::BTreeMap<String, turbopath::RelativeUnixPathBuf>>,
+     /// Default catalog (`catalog:` protocol resolves to these)
+     #[serde(default)]
+@@ -297,7 +315,7 @@ mod test {
+     }
+ 
+     #[test]
+-    fn test_workspace_patches_pruning() {
++    fn test_workspace_patches_not_migrated_to_package_json() {
+         let tmpdir = tempfile::tempdir().unwrap();
+         let repo_root = AbsoluteSystemPath::from_std_path(tmpdir.path()).unwrap();
+ 
+@@ -315,18 +333,14 @@ mod test {
+             .unwrap();
+         let patches = vec![RelativeUnixPathBuf::new("patches/foo@1.0.0.patch").unwrap()];
+         let pruned = prune_patches(&package_json, &patches, repo_root);
++        // prune_patches should NOT migrate workspace yaml patches into
++        // package.json — that would change its content and invalidate caches.
+         assert_eq!(
+             pruned
+                 .pnpm
+                 .as_ref()
+                 .and_then(|c| c.patched_dependencies.as_ref()),
+-            Some(
+-                [("foo@1.0.0", "patches/foo@1.0.0.patch")]
+-                    .iter()
+-                    .map(|(k, v)| (k.to_string(), RelativeUnixPathBuf::new(*v).unwrap()))
+-                    .collect::<BTreeMap<_, _>>()
+-            )
+-            .as_ref()
++            None,
+         );
+     }
+ 

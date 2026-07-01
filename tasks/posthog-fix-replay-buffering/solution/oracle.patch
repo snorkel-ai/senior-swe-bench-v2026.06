@@ -1,0 +1,421 @@
+diff --git a/common/replay-shared/src/snapshot-store/SnapshotStore.ts b/common/replay-shared/src/snapshot-store/SnapshotStore.ts
+index 1631f445cfa..31e69c6a1aa 100644
+--- a/common/replay-shared/src/snapshot-store/SnapshotStore.ts
++++ b/common/replay-shared/src/snapshot-store/SnapshotStore.ts
+@@ -115,7 +115,17 @@ export class SnapshotStore {
+         return result
+     }
+ 
+-    getSourceIndexForTimestamp(ts: number): number {
++    /**
++     * Returns the index of the source whose timestamp range contains `ts`,
++     * or the nearest source if `ts` falls outside any range. Returns `null`
++     * when the store has no sources yet — callers MUST handle this case
++     * explicitly rather than conflating it with "source 0", which is a
++     * valid result and hides initial-load races (see #53893).
++     */
++    getSourceIndexForTimestamp(ts: number): number | null {
++        if (this.entries.length === 0) {
++            return null
++        }
+         for (let i = 0; i < this.entries.length; i++) {
+             const entry = this.entries[i]
+             if (ts >= entry.startMs && ts <= entry.endMs) {
+@@ -143,6 +153,9 @@ export class SnapshotStore {
+         }
+ 
+         const targetIndex = this.getSourceIndexForTimestamp(ts)
++        if (targetIndex === null) {
++            return false
++        }
+ 
+         for (let i = fullSnapshotInfo.sourceIndex; i <= targetIndex; i++) {
+             if (this.entries[i]?.state !== 'loaded') {
+diff --git a/frontend/src/scenes/session-recordings/player/sessionRecordingPlayerLogic.test.ts b/frontend/src/scenes/session-recordings/player/sessionRecordingPlayerLogic.test.ts
+index aa3963bb778..72a699d1257 100644
+--- a/frontend/src/scenes/session-recordings/player/sessionRecordingPlayerLogic.test.ts
++++ b/frontend/src/scenes/session-recordings/player/sessionRecordingPlayerLogic.test.ts
+@@ -326,11 +326,9 @@ describe('sessionRecordingPlayerLogic', () => {
+             expect(logic.cache.hasInitialized).toBeFalsy()
+         })
+ 
+-        // `t=999` against the ~12s mock recording lands seekToTime's clamp
+-        // on exactly `end`, which previously tripped the `>= end` check in
+-        // seekToTimestamp and fired endReached before tryInitReplayer could
+-        // run. See the isPastEnd comment in sessionRecordingPlayerLogic.ts.
+-        it('handles out-of-range ?t= parameter without leaving player in endReached state', async () => {
++        // Seeking past the end of a recording should not leave the player
++        // stuck buffering. See #53686, #53893.
++        it('handles out-of-range ?t= parameter without getting stuck', async () => {
+             logic.unmount()
+             router.actions.push('/replay/2', { t: '999' })
+ 
+@@ -349,22 +347,15 @@ describe('sessionRecordingPlayerLogic', () => {
+                 ])
+                 .toFinishAllListeners()
+ 
+-            // A window segment (not buffer/gap) is required for tryInitReplayer
+-            // to find snapshots and create the rrweb Replayer.
+-            expect(logic.values.currentSegment?.kind).toBe('window')
+-            expect(logic.values.currentSegment?.windowId).not.toBeUndefined()
+-
+-            // seekToTime clamps to [start, end] inclusive, so landing exactly
+-            // on `end` is expected and valid.
++            // The player must have a valid timestamp and not be stuck in
++            // an unrecoverable state. endReached may legitimately be true
++            // here — updateAnimation detects end-of-recording after the
++            // normal BUFFER → load cycle completes. The important thing
++            // is the player initialized (didn't get stuck before
++            // tryInitReplayer) and isn't permanently buffering.
+             const start = logic.values.sessionPlayerData.start?.valueOf() ?? 0
+-            const end = logic.values.sessionPlayerData.end?.valueOf() ?? 0
+             expect(logic.values.currentTimestamp).toBeGreaterThanOrEqual(start)
+-            expect(logic.values.currentTimestamp).toBeLessThanOrEqual(end)
+-
+-            // With isPastEnd using `> end`, landing on exactly `end` must NOT
+-            // trip endReached — otherwise the player pauses before the rrweb
+-            // wrapper is created and only appears after manual interaction.
+-            expect(logic.values.endReached).toBe(false)
++            expect(logic.values.isBuffering).toBe(false)
+         })
+     })
+ 
+diff --git a/frontend/src/scenes/session-recordings/player/sessionRecordingPlayerLogic.ts b/frontend/src/scenes/session-recordings/player/sessionRecordingPlayerLogic.ts
+index 8bfb18de3f8..4916bf554d5 100644
+--- a/frontend/src/scenes/session-recordings/player/sessionRecordingPlayerLogic.ts
++++ b/frontend/src/scenes/session-recordings/player/sessionRecordingPlayerLogic.ts
+@@ -2238,6 +2238,16 @@ export const sessionRecordingPlayerLogic = kea<sessionRecordingPlayerLogicType>(
+                 actions.syncSnapshotsWithPlayer()
+             }
+         },
++        isWaitingForPlayableFullSnapshot: (isWaiting: boolean, wasWaiting: boolean | undefined) => {
++            // Force a buffering re-check when the scheduler gives up on seek
++            // without loading new snapshots. checkBufferingCompleted normally
++            // fires via syncSnapshotsWithPlayer on new data, but a silent
++            // seek → buffer_ahead transition delivers none, so the player
++            // would stay stuck in BUFFER without this listener (#53893).
++            if (wasWaiting && !isWaiting) {
++                actions.checkBufferingCompleted()
++            }
++        },
+         timestampChangeTracking: (value) => {
+             if (value.timestampMatchesPrevious < 10) {
+                 return
+diff --git a/frontend/src/scenes/session-recordings/player/snapshot-store/LoadingScheduler.ts b/frontend/src/scenes/session-recordings/player/snapshot-store/LoadingScheduler.ts
+index 3c0c376870b..16ef14002d3 100644
+--- a/frontend/src/scenes/session-recordings/player/snapshot-store/LoadingScheduler.ts
++++ b/frontend/src/scenes/session-recordings/player/snapshot-store/LoadingScheduler.ts
+@@ -58,8 +58,11 @@ export class LoadingScheduler {
+         }
+         const targetTs = this.mode.targetTimestamp
+ 
+-        // Step 1: Load window around target if not loaded
++        // Step 1: Load window around target if not loaded.
+         const targetIndex = store.getSourceIndexForTimestamp(targetTs)
++        if (targetIndex === null) {
++            return null
++        }
+         const windowStart = Math.max(0, targetIndex - SEEK_WINDOW_BEHIND)
+         const windowEnd = Math.min(store.sourceCount - 1, targetIndex + SEEK_WINDOW_AHEAD)
+ 
+@@ -129,10 +132,16 @@ export class LoadingScheduler {
+     }
+ 
+     private getBufferAheadBatch(store: SnapshotStore, batchSize: number, playbackPosition?: number): LoadBatch | null {
+-        const anchorIndex =
+-            playbackPosition !== undefined
+-                ? store.getSourceIndexForTimestamp(playbackPosition)
+-                : (this.seekRangeEnd ?? 0)
++        let anchorIndex: number
++        if (playbackPosition !== undefined) {
++            const idx = store.getSourceIndexForTimestamp(playbackPosition)
++            if (idx === null) {
++                return null
++            }
++            anchorIndex = idx
++        } else {
++            anchorIndex = this.seekRangeEnd ?? 0
++        }
+ 
+         const bufferEnd = Math.min(store.sourceCount - 1, anchorIndex + BUFFER_AHEAD_SOURCES - 1)
+         const aheadIndices = store.getUnloadedIndicesInRange(anchorIndex, bufferEnd)
+diff --git a/frontend/src/scenes/session-recordings/player/snapshot-store/SnapshotStore.test.ts b/frontend/src/scenes/session-recordings/player/snapshot-store/SnapshotStore.test.ts
+index 0497b269c7e..b285e6ba97b 100644
+--- a/frontend/src/scenes/session-recordings/player/snapshot-store/SnapshotStore.test.ts
++++ b/frontend/src/scenes/session-recordings/player/snapshot-store/SnapshotStore.test.ts
+@@ -211,6 +211,14 @@ describe('SnapshotStore', () => {
+             // Should return source 0 (the one before the gap) since ts < source 1's startMs
+             expect(result).toBe(0)
+         })
++
++        it('returns null for an empty store (not 0, which would be ambiguous with source 0)', () => {
++            // Regression guard for #53893: before this change, an empty store
++            // returned 0 for any timestamp, and callers couldn't distinguish
++            // "empty — I don't know" from "timestamp falls in source 0".
++            const store = new SnapshotStore()
++            expect(store.getSourceIndexForTimestamp(Date.now())).toBeNull()
++        })
+     })
+ 
+     describe('canPlayAt', () => {
+diff --git a/frontend/src/scenes/session-recordings/player/snapshot-store/integration.test.ts b/frontend/src/scenes/session-recordings/player/snapshot-store/integration.test.ts
+index aea163e6488..3d9bbd8c5a9 100644
+--- a/frontend/src/scenes/session-recordings/player/snapshot-store/integration.test.ts
++++ b/frontend/src/scenes/session-recordings/player/snapshot-store/integration.test.ts
+@@ -468,8 +468,8 @@ describe('SnapshotStore + LoadingScheduler integration', () => {
+             })
+ 
+             // Sources 0-26 are still unloaded — this is the gap the user would seek back into
+-            const startIdx = store.getSourceIndexForTimestamp(tsForMinute(5))
+-            const endIdx = store.getSourceIndexForTimestamp(tsForMinute(20))
++            const startIdx = store.getSourceIndexForTimestamp(tsForMinute(5))!
++            const endIdx = store.getSourceIndexForTimestamp(tsForMinute(20))!
+             const unloaded = store.getUnloadedIndicesInRange(startIdx, endIdx)
+             expect(unloaded.length).toBeGreaterThan(0)
+ 
+@@ -487,8 +487,8 @@ describe('SnapshotStore + LoadingScheduler integration', () => {
+             }
+ 
+             // All loaded — gaps here are real inactivity, not pending data
+-            const startIdx = store.getSourceIndexForTimestamp(tsForMinute(3))
+-            const endIdx = store.getSourceIndexForTimestamp(tsForMinute(7))
++            const startIdx = store.getSourceIndexForTimestamp(tsForMinute(3))!
++            const endIdx = store.getSourceIndexForTimestamp(tsForMinute(7))!
+             expect(store.getUnloadedIndicesInRange(startIdx, endIdx).length).toBe(0)
+         })
+     })
+diff --git a/frontend/src/scenes/session-recordings/player/snapshotDataLogic.store.test.ts b/frontend/src/scenes/session-recordings/player/snapshotDataLogic.store.test.ts
+index a7a70db2da2..6e740253004 100644
+--- a/frontend/src/scenes/session-recordings/player/snapshotDataLogic.store.test.ts
++++ b/frontend/src/scenes/session-recordings/player/snapshotDataLogic.store.test.ts
+@@ -208,6 +208,109 @@ describe('snapshotDataLogic (store-based loading)', () => {
+ 
+             expect(logic.values.isWaitingForPlayableFullSnapshot).toBe(false)
+         })
++
++        it('re-evaluates isWaitingForPlayableFullSnapshot after silent seek clear (#53893 Bug B)', async () => {
++            // Regression test for the stale-selector half of #53893.
++            //
++            // When LoadingScheduler.getSeekBatch silently clears seek mode
++            // (step 5: backward search exhausted, no full snapshot found),
++            // it mutates cache.scheduler.currentMode directly. The store's
++            // version doesn't bump because no data is added. Without the
++            // storeUpdated dispatch on that transition and a selector
++            // dependency that tracks it, isWaitingForPlayableFullSnapshot
++            // stays cached at `true` — poisoning the next seekToTimestamp.
++            //
++            // This exercise uses the step-5 path specifically because it's
++            // the case where mode changes WITHOUT any store mutation, so
++            // we can isolate the selector-reactivity half of the fix from
++            // the step-2 path (where markLoaded would also bump the
++            // selector's storeVersion dependency and mask a regression).
++            mountLogic()
++
++            // Pre-load sources as loaded-but-empty. state='loaded' means
++            // no seek batch will try to load them, and empty snapshots mean
++            // no full snapshot exists anywhere → canPlayAt is always false
++            // and the backward search in getSeekBatch step 4/5 will exhaust.
++            const store = logic.values.snapshotStore!
++            store.setSources([SOURCE_A, SOURCE_B])
++            store.markLoaded(0, [])
++            store.markLoaded(1, [])
++
++            // Tell Kea about the sources. setSources preserves loaded
++            // entries by blob_key, and loadNextSnapshotSource sees
++            // everything as loaded → no loader dispatches.
++            logic.actions.loadSnapshotSourcesSuccess([SOURCE_A, SOURCE_B])
++            await expectLogic(logic).toFinishAllListeners()
++
++            // Directly put the scheduler in seek mode. setTargetTimestamp
++            // would work too, but it's fiddly to arrange the early-return
++            // checks in this state — direct seekTo is cleaner.
++            // eslint-disable-next-line @typescript-eslint/no-explicit-any
++            const scheduler = (logic as any).cache.scheduler as {
++                seekTo: (ts: number) => void
++                currentMode: { kind: string }
++            }
++            scheduler.seekTo(tsMs(0, 30))
++
++            // Pre-read: seek mode + no full snapshot → true, CACHED.
++            expect(logic.values.isWaitingForPlayableFullSnapshot).toBe(true)
++
++            // Trigger getSeekBatch. Step 1 finds nothing unloaded (all
++            // loaded), step 2 canPlayAt=false (no full snapshot), step 3
++            // findNearestFullSnapshot=null, step 4 backward search has
++            // nothing unloaded, step 5 exhausted → clearSeek. Mode flips
++            // to buffer_ahead WITHOUT any store mutation — this is the
++            // isolation point that catches Bug B.
++            logic.actions.loadNextSnapshotSource()
++            await expectLogic(logic).toFinishAllListeners()
++
++            // Sanity: scheduler actually exited seek mode.
++            expect(scheduler.currentMode.kind).toBe('buffer_ahead')
++
++            // Without the fix (no storeUpdated dispatch on silent clearSeek,
++            // or selector depending on storeVersion instead of storeUpdateCount),
++            // this returns a stale `true` because nothing in Kea's
++            // reactivity graph changed while the mode flipped.
++            expect(logic.values.isWaitingForPlayableFullSnapshot).toBe(false)
++        })
++
++        it('enters seek mode when called before sources load (past-end URL regression #53893)', async () => {
++            // Regression test for the stuck-buffer follow-up to #53686, fixed in #53893.
++            //
++            // Scenario: a user opens a replay with a ?t=<past-end> URL.
++            // The player dispatches setTargetTimestamp before the async
++            // snapshot source list has resolved, so the store is still
++            // empty at the point setTargetTimestamp runs.
++            //
++            // Before the fix, getSourceIndexForTimestamp returned 0 for
++            // any timestamp on an empty store, tripping the "source 0 in
++            // buffer_ahead" optimization and skipping scheduler.seekTo.
++            // The scheduler then stayed in buffer_ahead, and once sources
++            // arrived it anchored on the trailing blob (a heartbeat with
++            // no full snapshot) — leaving the player stuck in BUFFER.
++            mountLogic()
++
++            // Pre-condition: store is mounted but has no sources yet.
++            expect(logic.values.snapshotStore!.sourceCount).toBe(0)
++
++            // Force memoization at false so the test catches a missing storeUpdated
++            // after scheduler.seekTo (per review feedback on #53893).
++            expect(logic.values.isWaitingForPlayableFullSnapshot).toBe(false)
++
++            logic.actions.setTargetTimestamp(tsMs(5, 0))
++            await expectLogic(logic).toFinishAllListeners()
++
++            // With the fix: getSourceIndexForTimestamp returns null for
++            // the empty store, so targetIndex === 0 is false and the
++            // optimization doesn't fire. scheduler.seekTo runs and the
++            // storeUpdated dispatch on the wasSeeking transition ensures
++            // the selector re-evaluates. canPlayAt is false (no data),
++            // so isWaitingForPlayableFullSnapshot is true.
++            //
++            // Without the fix: scheduler stays in buffer_ahead, selector
++            // returns false, player has no signal to keep buffering.
++            expect(logic.values.isWaitingForPlayableFullSnapshot).toBe(true)
++        })
+     })
+ 
+     describe('updatePlaybackPosition', () => {
+diff --git a/frontend/src/scenes/session-recordings/player/snapshotDataLogic.tsx b/frontend/src/scenes/session-recordings/player/snapshotDataLogic.tsx
+index 1c087939226..f3e04ec67bb 100644
+--- a/frontend/src/scenes/session-recordings/player/snapshotDataLogic.tsx
++++ b/frontend/src/scenes/session-recordings/player/snapshotDataLogic.tsx
+@@ -35,6 +35,14 @@ export interface SnapshotLogicProps {
+     accessToken?: string
+ }
+ 
++// Reactivity note (#53893): `cache.store` (SnapshotStore) and `cache.scheduler`
++// (LoadingScheduler) live outside Kea. Their mutations are invisible to
++// selectors unless `storeUpdated()` is dispatched. Any listener that
++// mutates either — scheduler.seekTo, scheduler.clearSeek, store.markLoaded,
++// store.setSources — MUST dispatch `storeUpdated()` afterwards. Any selector
++// that reads `cache.scheduler.currentMode` or `cache.store` state MUST depend
++// on `storeUpdateCount` (not `storeVersion`, which only bumps on data mutations
++// and would memoize to stale values across pure mode transitions).
+ export const snapshotDataLogic = kea<snapshotDataLogicType>([
+     path((key) => ['scenes', 'session-recordings', 'snapshotLogic', key]),
+     props({} as SnapshotLogicProps),
+@@ -63,7 +71,8 @@ export const snapshotDataLogic = kea<snapshotDataLogicType>([
+         updatePlaybackPosition: (timestamp: number) => ({ timestamp }),
+         setPlayerActive: (active: boolean) => ({ active }),
+         loadAllSources: true,
+-        // dispatch after any cache.store mutation to trigger a new Redux notification cycle
++        // dispatch after any mutation to cache.store or cache.scheduler —
++        // these live outside Kea's reactivity and need explicit invalidation
+         storeUpdated: true,
+     }),
+     reducers(() => ({
+@@ -232,19 +241,23 @@ export const snapshotDataLogic = kea<snapshotDataLogicType>([
+                 }
+                 // If we can already play at this position (data is loaded), no need to seek —
+                 // this handles segment transitions during normal forward playback
+-                if (cache.store?.canPlayAt(timestamp)) {
++                if (cache.store.canPlayAt(timestamp)) {
+                     actions.loadNextSnapshotSource()
+                     return
+                 }
+                 // Don't enter seek mode when at source 0 and already in buffer_ahead mode —
+-                // buffer_ahead loading already starts from the beginning
+-                const targetIndex = cache.store?.getSourceIndexForTimestamp(timestamp) ?? 0
++                // buffer_ahead loading already starts from the beginning. An empty store
++                // returns null here, which naturally falls through to scheduler.seekTo —
++                // that's required for ?t=<past-end> URLs that arrive before sources load
++                // (see #53893).
++                const targetIndex = cache.store.getSourceIndexForTimestamp(timestamp)
+                 if (targetIndex === 0 && currentMode.kind === 'buffer_ahead') {
+                     actions.loadNextSnapshotSource()
+                     return
+                 }
+ 
+                 cache.scheduler.seekTo(timestamp)
++                actions.storeUpdated()
+                 actions.loadNextSnapshotSource()
+             }
+         },
+@@ -420,7 +433,14 @@ export const snapshotDataLogic = kea<snapshotDataLogicType>([
+             if (!cache.scheduler || !cache.store) {
+                 return
+             }
++            // getNextBatch may flip the scheduler out of seek mode without
++            // mutating the store. Kea can't see that, so dispatch storeUpdated
++            // to invalidate selectors that read scheduler state (#53893).
++            const wasSeeking = cache.scheduler.currentMode.kind === 'seek'
+             const batch = cache.scheduler.getNextBatch(cache.store, 10, cache.playbackPosition)
++            if (wasSeeking && cache.scheduler.currentMode.kind !== 'seek') {
++                actions.storeUpdated()
++            }
+             if (!batch) {
+                 actions.maybeStartPolling()
+                 return
+@@ -486,7 +506,11 @@ export const snapshotDataLogic = kea<snapshotDataLogicType>([
+         ],
+ 
+         isWaitingForPlayableFullSnapshot: [
+-            (s) => [s.storeVersion],
++            // Depends on storeUpdateCount (not storeVersion) because this
++            // selector reads scheduler state, which can mutate without
++            // bumping store.version — storeVersion would memoize to a
++            // stale value. storeUpdateCount invalidates on every storeUpdated.
++            (s) => [s.storeUpdateCount],
+             (): boolean => {
+                 if (!cache.scheduler || !cache.store) {
+                     return false
+diff --git a/frontend/src/scenes/session-recordings/player/utils/segment-kind-conversion.ts b/frontend/src/scenes/session-recordings/player/utils/segment-kind-conversion.ts
+index 2f57b8926c2..fb112d92fe1 100644
+--- a/frontend/src/scenes/session-recordings/player/utils/segment-kind-conversion.ts
++++ b/frontend/src/scenes/session-recordings/player/utils/segment-kind-conversion.ts
+@@ -11,19 +11,21 @@ export function convertSegmentKinds(
+         if (snapshotStore.sourceCount > 0) {
+             const startIdx = snapshotStore.getSourceIndexForTimestamp(segment.startTimestamp)
+             const endIdx = snapshotStore.getSourceIndexForTimestamp(segment.endTimestamp)
+-            const hasUnloaded = snapshotStore.getUnloadedIndicesInRange(startIdx, endIdx).length > 0
++            if (startIdx !== null && endIdx !== null) {
++                const hasUnloaded = snapshotStore.getUnloadedIndicesInRange(startIdx, endIdx).length > 0
+ 
+-            if (segment.kind === 'buffer' && !hasUnloaded) {
+-                // All sources covering this buffer range are already loaded —
+-                // the data isn't pending, it's a gap with no events.
+-                return { ...segment, kind: 'gap' as const }
+-            }
++                if (segment.kind === 'buffer' && !hasUnloaded) {
++                    // All sources covering this buffer range are already loaded —
++                    // the data isn't pending, it's a gap with no events.
++                    return { ...segment, kind: 'gap' as const }
++                }
+ 
+-            if (segment.kind === 'gap' && hasUnloaded) {
+-                // This looks like a gap but has unloaded sources — it's actually
+-                // a region where data hasn't been fetched yet. Convert to buffer
+-                // so the player pauses and waits for data instead of skipping.
+-                return { ...segment, kind: 'buffer' as const, isLoading: isLoadingSnapshots }
++                if (segment.kind === 'gap' && hasUnloaded) {
++                    // This looks like a gap but has unloaded sources — it's actually
++                    // a region where data hasn't been fetched yet. Convert to buffer
++                    // so the player pauses and waits for data instead of skipping.
++                    return { ...segment, kind: 'buffer' as const, isLoading: isLoadingSnapshots }
++                }
+             }
+         }
+ 

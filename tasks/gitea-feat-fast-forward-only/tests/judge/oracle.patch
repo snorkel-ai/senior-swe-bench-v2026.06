@@ -1,0 +1,236 @@
+diff --git a/options/locale/locale_en-US.json b/options/locale/locale_en-US.json
+index 18ce2c970a..6281ff8f54 100644
+--- a/options/locale/locale_en-US.json
++++ b/options/locale/locale_en-US.json
+@@ -1850,6 +1850,7 @@
+   "repo.pulls.merge_manually": "Manually merged",
+   "repo.pulls.merge_commit_id": "The merge commit ID",
+   "repo.pulls.require_signed_wont_sign": "The branch requires signed commits but this merge will not be signed",
++  "repo.pulls.require_signed_head_commits_unverified": "The branch requires signed commits but one or more commits on this pull request are not verified",
+   "repo.pulls.invalid_merge_option": "You cannot use this merge option for this pull request.",
+   "repo.pulls.merge_conflict": "Merge Failed: There was a conflict while merging. Hint: Try a different strategy.",
+   "repo.pulls.merge_conflict_summary": "Error Message",
+diff --git a/routers/api/v1/repo/pull.go b/routers/api/v1/repo/pull.go
+index ef8cc6cd93..4cde030c40 100644
+--- a/routers/api/v1/repo/pull.go
++++ b/routers/api/v1/repo/pull.go
+@@ -965,7 +965,7 @@ func MergePullRequest(ctx *context.APIContext) {
+ 	}
+ 
+ 	// start with merging by checking
+-	if err := pull_service.CheckPullMergeable(ctx, ctx.Doer, &ctx.Repo.Permission, pr, mergeCheckType, form.ForceMerge); err != nil {
++	if err := pull_service.CheckPullMergeable(ctx, ctx.Doer, &ctx.Repo.Permission, pr, mergeCheckType, repo_model.MergeStyle(form.Do), form.ForceMerge); err != nil {
+ 		if errors.Is(err, pull_service.ErrIsClosed) {
+ 			ctx.APIErrorNotFound()
+ 		} else if errors.Is(err, pull_service.ErrNoPermissionToMerge) {
+@@ -980,6 +980,8 @@ func MergePullRequest(ctx *context.APIContext) {
+ 			ctx.APIError(http.StatusMethodNotAllowed, err)
+ 		} else if asymkey_service.IsErrWontSign(err) {
+ 			ctx.APIError(http.StatusMethodNotAllowed, err)
++		} else if errors.Is(err, pull_service.ErrHeadCommitsNotAllVerified) {
++			ctx.APIError(http.StatusMethodNotAllowed, err)
+ 		} else {
+ 			ctx.APIErrorInternal(err)
+ 		}
+diff --git a/routers/web/repo/pull.go b/routers/web/repo/pull.go
+index efcdaac674..639ebbf270 100644
+--- a/routers/web/repo/pull.go
++++ b/routers/web/repo/pull.go
+@@ -1100,7 +1100,7 @@ func MergePullRequest(ctx *context.Context) {
+ 	}
+ 
+ 	// start with merging by checking
+-	if err := pull_service.CheckPullMergeable(ctx, ctx.Doer, &ctx.Repo.Permission, pr, mergeCheckType, form.ForceMerge); err != nil {
++	if err := pull_service.CheckPullMergeable(ctx, ctx.Doer, &ctx.Repo.Permission, pr, mergeCheckType, repo_model.MergeStyle(form.Do), form.ForceMerge); err != nil {
+ 		switch {
+ 		case errors.Is(err, pull_service.ErrIsClosed):
+ 			if issue.IsPull {
+@@ -1120,6 +1120,8 @@ func MergePullRequest(ctx *context.Context) {
+ 			ctx.JSONError(ctx.Tr("repo.pulls.no_merge_not_ready"))
+ 		case asymkey_service.IsErrWontSign(err):
+ 			ctx.JSONError(err.Error()) // has no translation ...
++		case errors.Is(err, pull_service.ErrHeadCommitsNotAllVerified):
++			ctx.JSONError(ctx.Tr("repo.pulls.require_signed_head_commits_unverified"))
+ 		case errors.Is(err, pull_service.ErrDependenciesLeft):
+ 			ctx.JSONError(ctx.Tr("repo.issues.dependency.pr_close_blocked"))
+ 		default:
+diff --git a/services/asymkey/sign.go b/services/asymkey/sign.go
+index cffefe08ae..8c28717e5d 100644
+--- a/services/asymkey/sign.go
++++ b/services/asymkey/sign.go
+@@ -338,26 +338,41 @@ Loop:
+ 				return false, nil, nil, &ErrWontSign{headSigned}
+ 			}
+ 		case commitsSigned:
+-			verification := ParseCommitWithSignature(ctx, headCommit)
+-			if !verification.Verified {
+-				return false, nil, nil, &ErrWontSign{commitsSigned}
+-			}
+-			// need to work out merge-base
+-			mergeBaseCommit, err := gitrepo.MergeBase(ctx, pr.BaseRepo, baseCommit.ID.String(), headCommit.ID.String())
+-			if err != nil {
+-				return false, nil, nil, err
+-			}
+-			commitList, err := headCommit.CommitsBeforeUntil(mergeBaseCommit)
++			verified, err := AllHeadCommitsVerified(ctx, pr, gitRepo)
+ 			if err != nil {
+ 				return false, nil, nil, err
+ 			}
+-			for _, commit := range commitList {
+-				verification := ParseCommitWithSignature(ctx, commit)
+-				if !verification.Verified {
+-					return false, nil, nil, &ErrWontSign{commitsSigned}
+-				}
++			if !verified {
++				return false, nil, nil, &ErrWontSign{commitsSigned}
+ 			}
+ 		}
+ 	}
+ 	return true, signingKey, signer, nil
+ }
++
++// AllHeadCommitsVerified checks that every new commit in the PR head has a
++// verified signature.
++func AllHeadCommitsVerified(ctx context.Context, pr *issues_model.PullRequest, gitRepo *git.Repository) (bool, error) {
++	baseCommit, err := gitRepo.GetCommit(pr.BaseBranch)
++	if err != nil {
++		return false, err
++	}
++	headCommit, err := gitRepo.GetCommit(pr.GetGitHeadRefName())
++	if err != nil {
++		return false, err
++	}
++	mergeBaseCommit, err := gitrepo.MergeBase(ctx, pr.BaseRepo, baseCommit.ID.String(), headCommit.ID.String())
++	if err != nil {
++		return false, err
++	}
++	commitList, err := headCommit.CommitsBeforeUntil(mergeBaseCommit)
++	if err != nil {
++		return false, err
++	}
++	for _, commit := range commitList {
++		if !ParseCommitWithSignature(ctx, commit).Verified {
++			return false, nil
++		}
++	}
++	return true, nil
++}
+diff --git a/services/automerge/automerge.go b/services/automerge/automerge.go
+index b3a988320b..b06fc723be 100644
+--- a/services/automerge/automerge.go
++++ b/services/automerge/automerge.go
+@@ -251,7 +251,7 @@ func handlePullRequestAutoMerge(pullID int64, sha string) {
+ 		return
+ 	}
+ 
+-	if err := pull_service.CheckPullMergeable(ctx, doer, &perm, pr, pull_service.MergeCheckTypeGeneral, false); err != nil {
++	if err := pull_service.CheckPullMergeable(ctx, doer, &perm, pr, pull_service.MergeCheckTypeGeneral, scheduledPRM.MergeStyle, false); err != nil {
+ 		if errors.Is(err, pull_service.ErrNotReadyToMerge) {
+ 			log.Info("%-v was scheduled to automerge by an unauthorized user", pr)
+ 			return
+diff --git a/services/pull/check.go b/services/pull/check.go
+index 6486ca79df..996994cea9 100644
+--- a/services/pull/check.go
++++ b/services/pull/check.go
+@@ -38,14 +38,15 @@ import (
+ var prPatchCheckerQueue *queue.WorkerPoolQueue[string]
+ 
+ var (
+-	ErrIsClosed            = errors.New("pull is closed")
+-	ErrNoPermissionToMerge = errors.New("no permission to merge")
+-	ErrNotReadyToMerge     = errors.New("not ready to merge")
+-	ErrHasMerged           = errors.New("has already been merged")
+-	ErrIsWorkInProgress    = errors.New("work in progress PRs cannot be merged")
+-	ErrIsChecking          = errors.New("cannot merge while conflict checking is in progress")
+-	ErrNotMergeableState   = errors.New("not in mergeable state")
+-	ErrDependenciesLeft    = errors.New("is blocked by an open dependency")
++	ErrIsClosed                  = errors.New("pull is closed")
++	ErrNoPermissionToMerge       = errors.New("no permission to merge")
++	ErrNotReadyToMerge           = errors.New("not ready to merge")
++	ErrHasMerged                 = errors.New("has already been merged")
++	ErrIsWorkInProgress          = errors.New("work in progress PRs cannot be merged")
++	ErrIsChecking                = errors.New("cannot merge while conflict checking is in progress")
++	ErrNotMergeableState         = errors.New("not in mergeable state")
++	ErrDependenciesLeft          = errors.New("is blocked by an open dependency")
++	ErrHeadCommitsNotAllVerified = errors.New("the branch requires signed commits but not all head commits are verified")
+ )
+ 
+ func markPullRequestStatusAsChecking(ctx context.Context, pr *issues_model.PullRequest) bool {
+@@ -132,7 +133,13 @@ const (
+ )
+ 
+ // CheckPullMergeable check if the pull mergeable based on all conditions (branch protection, merge options, ...)
+-func CheckPullMergeable(stdCtx context.Context, doer *user_model.User, perm *access_model.Permission, pr *issues_model.PullRequest, mergeCheckType MergeCheckType, adminForceMerge bool) error {
++// mergeStyle tailors the "require signed commits" prechecks:
++//   - fast-forward-only: no Gitea commit is produced, so Gitea's merge-signing check is skipped;
++//     only the user's head commits are verified.
++//   - merge: both the head commits must be verified and Gitea must sign the merge commit.
++//   - rebase, rebase-merge, squash: Gitea rewrites the commits and signs each, so only Gitea's
++//     signing ability is checked.
++func CheckPullMergeable(stdCtx context.Context, doer *user_model.User, perm *access_model.Permission, pr *issues_model.PullRequest, mergeCheckType MergeCheckType, mergeStyle repo_model.MergeStyle, adminForceMerge bool) error {
+ 	return db.WithTx(stdCtx, func(ctx context.Context) error {
+ 		if pr.HasMerged {
+ 			return ErrHasMerged
+@@ -207,7 +214,7 @@ func CheckPullMergeable(stdCtx context.Context, doer *user_model.User, perm *acc
+ 			}
+ 		}
+ 
+-		if _, err := isSignedIfRequired(ctx, pr, doer); err != nil {
++		if err := checkSigningRequirements(ctx, pr, doer, mergeStyle); err != nil {
+ 			return err
+ 		}
+ 
+@@ -221,26 +228,45 @@ func CheckPullMergeable(stdCtx context.Context, doer *user_model.User, perm *acc
+ 	})
+ }
+ 
+-// isSignedIfRequired check if merge will be signed if required
+-func isSignedIfRequired(ctx context.Context, pr *issues_model.PullRequest, doer *user_model.User) (bool, error) {
++// checkSigningRequirements enforces the target branch's RequireSignedCommits rule
++// against the selected merge style:
++//   - fast-forward-only and merge keep the user's commits on the base branch, so
++//     those commits must all be verified, or the pre-receive hook will reject the
++//     push with a generic error.
++//   - fast-forward-only creates no Gitea commit, so Gitea's signing key is not used.
++//   - merge, rebase, rebase-merge and squash produce a Gitea-signed commit, so
++//     Gitea must be configured to sign it.
++func checkSigningRequirements(ctx context.Context, pr *issues_model.PullRequest, doer *user_model.User, mergeStyle repo_model.MergeStyle) error {
+ 	pb, err := git_model.GetFirstMatchProtectedBranchRule(ctx, pr.BaseRepoID, pr.BaseBranch)
+ 	if err != nil {
+-		return false, err
++		return err
+ 	}
+-
+ 	if pb == nil || !pb.RequireSignedCommits {
+-		return true, nil
++		return nil
+ 	}
+ 
+ 	gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpen(ctx, pr.BaseRepo)
+ 	if err != nil {
+-		return false, err
++		return err
+ 	}
+ 	defer closer.Close()
+ 
+-	sign, _, _, err := asymkey_service.SignMerge(ctx, pr, doer, gitRepo)
++	if mergeStyle == repo_model.MergeStyleFastForwardOnly || mergeStyle == repo_model.MergeStyleMerge {
++		verified, err := asymkey_service.AllHeadCommitsVerified(ctx, pr, gitRepo)
++		if err != nil {
++			return err
++		}
++		if !verified {
++			return ErrHeadCommitsNotAllVerified
++		}
++	}
+ 
+-	return sign, err
++	if mergeStyle != repo_model.MergeStyleFastForwardOnly {
++		if _, _, _, err := asymkey_service.SignMerge(ctx, pr, doer, gitRepo); err != nil {
++			return err
++		}
++	}
++	return nil
+ }
+ 
+ // markPullRequestAsMergeable checks if pull request is possible to leaving checking status,

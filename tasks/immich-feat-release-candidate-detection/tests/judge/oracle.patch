@@ -1,0 +1,329 @@
+diff --git a/server/src/config.ts b/server/src/config.ts
+index 999e1e45bc..8f5c9b2579 100644
+--- a/server/src/config.ts
++++ b/server/src/config.ts
+@@ -1,4 +1,5 @@
+ import { CronExpression } from '@nestjs/schedule';
++import { ReleaseChannel } from 'src/dtos/system-config.dto';
+ import {
+   AudioCodec,
+   Colorspace,
+@@ -135,6 +136,7 @@ export type SystemConfig = {
+   };
+   newVersionCheck: {
+     enabled: boolean;
++    channel: ReleaseChannel;
+   };
+   nightlyTasks: {
+     startTime: string;
+@@ -344,6 +346,7 @@ export const defaults = Object.freeze<SystemConfig>({
+   },
+   newVersionCheck: {
+     enabled: true,
++    channel: ReleaseChannel.Stable,
+   },
+   nightlyTasks: {
+     startTime: '00:00',
+diff --git a/server/src/decorators.ts b/server/src/decorators.ts
+index c8cf1f9221..513ae36c9f 100644
+--- a/server/src/decorators.ts
++++ b/server/src/decorators.ts
+@@ -265,3 +265,13 @@ export class HistoryBuilder {
+     return this;
+   }
+ }
++
++// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
++export const extraModels: Function[] = [];
++
++export const ExtraModel = (): ClassDecorator => {
++  // eslint-disable-next-line unicorn/consistent-function-scoping, @typescript-eslint/no-unsafe-function-type
++  return (object: Function) => {
++    extraModels.push(object);
++  };
++};
+diff --git a/server/src/dtos/server.dto.ts b/server/src/dtos/server.dto.ts
+index 57a58e1dd7..c770ec12ca 100644
+--- a/server/src/dtos/server.dto.ts
++++ b/server/src/dtos/server.dto.ts
+@@ -1,5 +1,6 @@
+ import { createZodDto } from 'nestjs-zod';
+ import type { SemVer } from 'semver';
++import { ExtraModel, HistoryBuilder } from 'src/decorators';
+ import { isoDatetimeToDate } from 'src/validation';
+ import z from 'zod';
+ 
+@@ -58,9 +59,15 @@ const ServerStorageResponseSchema = z
+ 
+ const ServerVersionResponseSchema = z
+   .object({
+-    major: z.int().describe('Major version number'),
+-    minor: z.int().describe('Minor version number'),
+-    patch: z.int().describe('Patch version number'),
++    major: z.int().min(0).describe('Major version number'),
++    minor: z.int().min(0).describe('Minor version number'),
++    patch: z.int().min(0).describe('Patch version number'),
++    prerelease: z
++      .int()
++      .min(0)
++      .nullable()
++      .meta(HistoryBuilder.v3().getExtensions())
++      .describe('Pre-release version number'),
+   })
+   .meta({ id: 'ServerVersionResponseDto' });
+ 
+@@ -140,6 +147,26 @@ const ServerFeaturesSchema = z
+   })
+   .meta({ id: 'ServerFeaturesDto' });
+ 
++export enum ReleaseType {
++  Major = 'major',
++  Premajor = 'premajor',
++  Minor = 'minor',
++  Preminor = 'preminor',
++  Patch = 'patch',
++  Prepatch = 'prepatch',
++  Prerelease = 'prerelease',
++}
++
++const ReleaseTypeSchema = z.enum(ReleaseType).meta({ id: 'ReleaseType' }).describe('Release type');
++
++const ReleaseEventV1Schema = z.object({
++  isAvailable: z.boolean().describe('Whether a new version is available'),
++  checkedAt: z.string().describe('When the server last checked for a latest version. As an ISO timestamp'),
++  serverVersion: ServerVersionResponseSchema,
++  releaseVersion: ServerVersionResponseSchema,
++  type: ReleaseTypeSchema.nullable(),
++});
++
+ export class ServerPingResponse extends createZodDto(ServerPingResponseSchema) {}
+ export class ServerAboutResponseDto extends createZodDto(ServerAboutResponseSchema) {}
+ export class ServerApkLinksDto extends createZodDto(ServerApkLinksSchema) {}
+@@ -147,7 +174,12 @@ export class ServerStorageResponseDto extends createZodDto(ServerStorageResponse
+ 
+ export class ServerVersionResponseDto extends createZodDto(ServerVersionResponseSchema) {
+   static fromSemVer(value: SemVer): z.infer<typeof ServerVersionResponseSchema> {
+-    return { major: value.major, minor: value.minor, patch: value.patch };
++    return {
++      major: value.major,
++      minor: value.minor,
++      patch: value.patch,
++      prerelease: (value.prerelease[1] as number) ?? null,
++    };
+   }
+ }
+ 
+@@ -158,10 +190,5 @@ export class ServerMediaTypesResponseDto extends createZodDto(ServerMediaTypesRe
+ export class ServerConfigDto extends createZodDto(ServerConfigSchema) {}
+ export class ServerFeaturesDto extends createZodDto(ServerFeaturesSchema) {}
+ 
+-export interface ReleaseNotification {
+-  isAvailable: boolean;
+-  /** ISO8601 */
+-  checkedAt: string;
+-  serverVersion: ServerVersionResponseDto;
+-  releaseVersion: ServerVersionResponseDto;
+-}
++@ExtraModel()
++export class ReleaseEventV1 extends createZodDto(ReleaseEventV1Schema) {}
+diff --git a/server/src/dtos/sync.dto.ts b/server/src/dtos/sync.dto.ts
+index 35ef874dfa..698939e627 100644
+--- a/server/src/dtos/sync.dto.ts
++++ b/server/src/dtos/sync.dto.ts
+@@ -1,5 +1,5 @@
+-/* eslint-disable @typescript-eslint/no-unsafe-function-type */
+ import { createZodDto } from 'nestjs-zod';
++import { ExtraModel } from 'src/decorators';
+ import { AssetEditActionSchema } from 'src/dtos/editing.dto';
+ import {
+   AlbumUserRole,
+@@ -17,15 +17,6 @@ import {
+ import { isoDatetimeToDate } from 'src/validation';
+ import z from 'zod';
+ 
+-export const extraSyncModels: Function[] = [];
+-
+-const ExtraModel = (): ClassDecorator => {
+-  // eslint-disable-next-line unicorn/consistent-function-scoping
+-  return (object: Function) => {
+-    extraSyncModels.push(object);
+-  };
+-};
+-
+ const SyncUserV1Schema = z
+   .object({
+     id: z.string().describe('User ID'),
+diff --git a/server/src/dtos/system-config.dto.ts b/server/src/dtos/system-config.dto.ts
+index 94c1aa36b0..d21a0f9dcf 100644
+--- a/server/src/dtos/system-config.dto.ts
++++ b/server/src/dtos/system-config.dto.ts
+@@ -151,8 +151,15 @@ const SystemConfigMapSchema = z
+   })
+   .meta({ id: 'SystemConfigMapDto' });
+ 
++export enum ReleaseChannel {
++  Stable = 'stable',
++  ReleaseCandidate = 'releaseCandidate',
++}
++
++const ReleaseChannelSchema = z.enum(ReleaseChannel).describe('Release channel').meta({ id: 'ReleaseChannel' });
++
+ const SystemConfigNewVersionCheckSchema = z
+-  .object({ enabled: configBool.describe('Enabled') })
++  .object({ enabled: configBool.describe('Enabled'), channel: ReleaseChannelSchema })
+   .meta({ id: 'SystemConfigNewVersionCheckDto' });
+ 
+ const SystemConfigNightlyTasksSchema = z
+diff --git a/server/src/repositories/server-info.repository.ts b/server/src/repositories/server-info.repository.ts
+index 85d26d6cfa..c8fb896281 100644
+--- a/server/src/repositories/server-info.repository.ts
++++ b/server/src/repositories/server-info.repository.ts
+@@ -4,6 +4,7 @@ import { exec as execCallback } from 'node:child_process';
+ import { readFile } from 'node:fs/promises';
+ import { promisify } from 'node:util';
+ import sharp from 'sharp';
++import { ReleaseChannel } from 'src/dtos/system-config.dto';
+ import { ConfigRepository } from 'src/repositories/config.repository';
+ import { LoggingRepository } from 'src/repositories/logging.repository';
+ 
+@@ -64,10 +65,12 @@ export class ServerInfoRepository {
+     this.logger.setContext(ServerInfoRepository.name);
+   }
+ 
+-  async getLatestRelease(): Promise<VersionResponse> {
++  async getLatestRelease(channel: ReleaseChannel): Promise<VersionResponse> {
+     try {
+       const { versionCheck } = this.configRepository.getEnv();
+-      const response = await fetch(versionCheck.url);
++      const url = new URL(versionCheck.url);
++      url.searchParams.append('channel', channel);
++      const response = await fetch(url);
+ 
+       if (!response.ok) {
+         throw new Error(`Version check request failed with status ${response.status}: ${await response.text()}`);
+diff --git a/server/src/repositories/websocket.repository.ts b/server/src/repositories/websocket.repository.ts
+index b4a0fcc00a..d87d38c40b 100644
+--- a/server/src/repositories/websocket.repository.ts
++++ b/server/src/repositories/websocket.repository.ts
+@@ -10,7 +10,7 @@ import { Server, Socket } from 'socket.io';
+ import { AssetResponseDto } from 'src/dtos/asset-response.dto';
+ import { AuthDto } from 'src/dtos/auth.dto';
+ import { NotificationDto } from 'src/dtos/notification.dto';
+-import { ReleaseNotification, ServerVersionResponseDto } from 'src/dtos/server.dto';
++import { ReleaseEventV1, ServerVersionResponseDto } from 'src/dtos/server.dto';
+ import { SyncAssetEditV1, SyncAssetExifV1, SyncAssetV2 } from 'src/dtos/sync.dto';
+ import { AppRestartEvent, ArgsOf, EventRepository } from 'src/repositories/event.repository';
+ import { LoggingRepository } from 'src/repositories/logging.repository';
+@@ -31,7 +31,7 @@ export interface ClientEventMap {
+   on_person_thumbnail: [string];
+   on_server_version: [ServerVersionResponseDto];
+   on_config_update: [];
+-  on_new_release: [ReleaseNotification];
++  on_new_release: [ReleaseEventV1];
+   on_notification: [NotificationDto];
+   on_session_delete: [string];
+ 
+diff --git a/server/src/services/version.service.ts b/server/src/services/version.service.ts
+index ce6d6d7a6f..37010db5e7 100644
+--- a/server/src/services/version.service.ts
++++ b/server/src/services/version.service.ts
+@@ -3,19 +3,27 @@ import { DateTime } from 'luxon';
+ import semver, { SemVer } from 'semver';
+ import { serverVersion } from 'src/constants';
+ import { OnEvent, OnJob } from 'src/decorators';
+-import { ReleaseNotification, ServerVersionResponseDto } from 'src/dtos/server.dto';
++import { ReleaseEventV1, ReleaseType, ServerVersionResponseDto } from 'src/dtos/server.dto';
++import { ReleaseChannel } from 'src/dtos/system-config.dto';
+ import { CronJob, DatabaseLock, ImmichWorker, JobName, JobStatus, QueueName, SystemMetadataKey } from 'src/enum';
+ import { ArgOf } from 'src/repositories/event.repository';
+ import { BaseService } from 'src/services/base.service';
+ import { VersionCheckMetadata } from 'src/types';
+ import { handlePromiseError } from 'src/utils/misc';
+ 
+-const asNotification = ({ checkedAt, releaseVersion }: VersionCheckMetadata): ReleaseNotification => {
++const asNotification = (
++  channel: ReleaseChannel,
++  { checkedAt, releaseVersion }: VersionCheckMetadata,
++): ReleaseEventV1 => {
+   return {
+-    isAvailable: semver.gt(releaseVersion, serverVersion),
++    // can't use gt because it's broken for release candidates F https://github.com/npm/node-semver/issues/483
++    isAvailable: semver.intersects(`>${serverVersion}`, releaseVersion.toString(), {
++      includePrerelease: channel === ReleaseChannel.ReleaseCandidate,
++    }),
+     checkedAt,
+     serverVersion: ServerVersionResponseDto.fromSemVer(serverVersion),
+     releaseVersion: ServerVersionResponseDto.fromSemVer(new SemVer(releaseVersion)),
++    type: semver.diff(serverVersion, releaseVersion) as ReleaseType,
+   };
+ };
+ 
+@@ -98,14 +106,21 @@ export class VersionService extends BaseService {
+         }
+       }
+ 
+-      const { version: releaseVersion, published_at: publishedAt } = await this.serverInfoRepository.getLatestRelease();
++      const { version: releaseVersion, published_at: publishedAt } = await this.serverInfoRepository.getLatestRelease(
++        newVersionCheck.channel,
++      );
+       const metadata: VersionCheckMetadata = { checkedAt: DateTime.utc().toISO(), releaseVersion };
+ 
+       await this.systemMetadataRepository.set(SystemMetadataKey.VersionCheckState, metadata);
+ 
+-      if (semver.gt(releaseVersion, serverVersion)) {
++      // can't use gt because it's broken for release candidates F https://github.com/npm/node-semver/issues/483
++      if (
++        semver.intersects(`>${serverVersion}`, releaseVersion.toString(), {
++          includePrerelease: newVersionCheck.channel === ReleaseChannel.ReleaseCandidate,
++        })
++      ) {
+         this.logger.log(`Found ${releaseVersion}, released at ${new Date(publishedAt).toLocaleString()}`);
+-        this.websocketRepository.clientBroadcast('on_new_release', asNotification(metadata));
++        this.websocketRepository.clientBroadcast('on_new_release', asNotification(newVersionCheck.channel, metadata));
+       }
+     } catch (error: Error | any) {
+       this.logger.warn(`Unable to run version check: ${error}\n${error?.stack}`);
+@@ -117,7 +132,11 @@ export class VersionService extends BaseService {
+ 
+   @OnEvent({ name: 'WebsocketConnect' })
+   async onWebsocketConnection({ userId }: ArgOf<'WebsocketConnect'>) {
+-    this.websocketRepository.clientSend('on_server_version', userId, serverVersion);
++    this.websocketRepository.clientSend(
++      'on_server_version',
++      userId,
++      ServerVersionResponseDto.fromSemVer(serverVersion),
++    );
+ 
+     const { newVersionCheck } = await this.getConfig({ withCache: true });
+     if (!newVersionCheck.enabled) {
+@@ -126,7 +145,7 @@ export class VersionService extends BaseService {
+ 
+     const metadata = await this.systemMetadataRepository.get(SystemMetadataKey.VersionCheckState);
+     if (metadata) {
+-      this.websocketRepository.clientSend('on_new_release', userId, asNotification(metadata));
++      this.websocketRepository.clientSend('on_new_release', userId, asNotification(newVersionCheck.channel, metadata));
+     }
+   }
+ }
+diff --git a/server/src/utils/misc.ts b/server/src/utils/misc.ts
+index 37fff07fd9..efcb509941 100644
+--- a/server/src/utils/misc.ts
++++ b/server/src/utils/misc.ts
+@@ -15,7 +15,7 @@ import picomatch from 'picomatch';
+ import parse from 'picomatch/lib/parse';
+ import { SystemConfig } from 'src/config';
+ import { CLIP_MODEL_INFO, endpointTags, serverVersion } from 'src/constants';
+-import { extraSyncModels } from 'src/dtos/sync.dto';
++import { extraModels } from 'src/decorators';
+ import { ApiCustomExtension, ImmichCookie, ImmichHeader, MetadataKey } from 'src/enum';
+ import { LoggingRepository } from 'src/repositories/logging.repository';
+ 
+@@ -289,7 +289,7 @@ export const useSwagger = (app: INestApplication, { write }: { write: boolean })
+ 
+   const options: SwaggerDocumentOptions = {
+     operationIdFactory: (controllerKey: string, methodKey: string) => methodKey,
+-    extraModels: extraSyncModels,
++    extraModels,
+     ignoreGlobalPrefix: true,
+   };
+ 

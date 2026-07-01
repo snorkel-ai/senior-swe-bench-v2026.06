@@ -1,0 +1,19 @@
+# Go runner config for verify_test.go (see runners/go.py for contract).
+#
+# - package: relative to the repo root inside the container (/repo/gitea).
+#   The Go runner copies verify_test.go into this directory so the test
+#   can call the unexported `CreatePushPullComment` function and access
+#   the package's other internals via the in-package import path.
+#
+# - build_tags: services/pull/main_test.go calls unittest.MainTest which
+#   refuses to start without the `sqlite` tag (see modules/setting/testenv.go).
+#   The image bakes in libsqlite3-dev + gcc + a prewarmed go-build cache
+#   so the cgo compile is hot.
+#
+# - timeout: 300s gives plenty of headroom; the actual tests run in <1s
+#   on a warm cache. The cold-cache path on a fresh Modal worker is the
+#   long pole, covered by [verifier].timeout_sec = 600 in task.toml.
+[go]
+package = "services/pull"
+build_tags = ["sqlite", "sqlite_unlock_notify"]
+timeout = 300

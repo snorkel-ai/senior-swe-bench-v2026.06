@@ -1,0 +1,130 @@
+version = "1.0"
+
+[environment]
+base_image = "posthog-feat-llma-enable-tagger:latest"
+build_timeout_sec = 1200.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 2400.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "posthog"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "posthog"
+
+[metadata]
+family = "posthog-feat-llma-enable-tagger"
+variant = "hard"
+segment = "design"
+repo = "posthog"
+tags = ["posthog", "python-service"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Harden the write path of the LLM-analytics taggers REST API. The create and
+update endpoints currently share one permissive write contract that accepts two
+classes of input a client must never be allowed to set: (1) the soft-deletion
+state, which can be supplied at creation time so a caller can create a tagger
+that is already marked deleted, and (2) a human-readable provider key name on
+the nested model configuration that the server derives on its own from the
+stored key.
+
+The task is to split the write contract so that the soft-deletion field is
+rejected on create but still accepted when editing an existing tagger
+(soft-deleting via an edit is a supported flow), and the server-derived key name
+is rejected anywhere a client tries to write it — with field-scoped HTTP 4xx
+errors and no partial persistence. Legitimate creates and edits, and the shape
+of the response body, must be preserved.
+"""
+context = """The taggers API lives at products/llm_analytics/backend/api/taggers.py: a
+TaggerViewSet (TeamAndOrgViewSetMixin + ModelViewSet) exposed under
+/api/environments/{team_id}/taggers/, backed by a single TaggerSerializer
+(ModelSerializer) with a nested TaggerModelConfigurationSerializer. The nested
+serializer already exposes provider_key_name as a read-only
+SerializerMethodField for responses, but on the write side DRF still happily
+accepts an incoming provider_key_name and discards it silently. The model's
+`deleted` boolean is part of the serializer's writable field set, so a create
+body can set it.
+
+Tests live in products/llm_analytics/backend/api/test/test_taggers.py and use
+the APIBaseTest harness (posthog/test/base.py) with helpers _setup_team() and
+_make_tagger_config(**overrides), driving /api/environments/{team.id}/taggers/.
+
+Red herrings: the same file contains a `test_hog` action that lazily imports a
+Hog tagger runtime and returns 503 when it is absent, plus a large amount of
+generated MCP/OpenAPI schema scaffolding in the surrounding PR — none of which
+affects the create/update write-contract behaviour under test.
+"""
+solution = """The reference implementation splits the single TaggerSerializer into a write base
+(TaggerBaseWriteSerializer) plus action-specific subclasses: a create serializer
+that overrides to_internal_value to reject a `deleted` key with a field-scoped
+ValidationError, an update serializer that re-adds `deleted` to its writable
+fields, and the read TaggerSerializer used to render responses. The viewset's
+get_serializer_class() routes create -> create serializer, update/partial_update
+-> update serializer, else -> read serializer. The nested model-configuration
+write serializer overrides to_internal_value to reject provider_key_name with
+"This field is read-only.", surfaced under the model_configuration field path.
+Responses are re-serialized through the read serializer so the body keeps id,
+created_at, updated_at, created_by, deleted, and the derived provider_key_name.
+
+Valid alternatives:
+- Per-action rejection can be done via separate serializer classes, a single
+  serializer that inspects self.context['view'].action, or get_fields()/
+  __init__ field stripping — any mechanism that yields the same per-action
+  acceptance is acceptable.
+- The exact error strings are not contractual; tests assert a 4xx, the offending
+  field name in the error body, and that nothing was persisted.
+- provider_key_name rejection may raise from the nested serializer or from the
+  parent validate(); tests only require the error is attributable to the nested
+  model_configuration field.
+
+What naive implementations get wrong:
+- Blocking `deleted` everywhere, breaking the supported soft-delete-via-edit flow.
+- Accepting and silently dropping provider_key_name instead of rejecting it.
+- Returning 500 (KeyError/AttributeError) instead of a structured 400.
+- Letting a row persist before validation fails (no atomicity around the reject).
+- Changing the response body shape and dropping read-only/derived fields.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-service"]
+runtime_dependence = "runtime-helpful"
+skills = ["api-contract-design", "framework-fluency", "interface-design", "codebase-exploration"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 219
+files = 1
+hunks = 17
+scope = "extensive"
+
+[metadata.origin]
+repo = "PostHog/posthog"
+pr_numbers = [58070]
+base_commit = "4e135c3be63d22cdfa27517f9aa704c772bc894c"
+base_commit_date = "2026-05-08"
+merged_at = "2026-05-08"
+
+
+
+

@@ -1,0 +1,29 @@
+# Verifier runner configuration for the harbor JS runner
+# (ssb_lib/runners/js.py).
+#
+# Discovery: the runner globs verify*.test.ts in this directory.
+# Filename MUST be *.test.ts (not *.spec.ts) — the runner only
+# discovers *.test.ts.
+#
+# Execution: the runner copies the file into
+# `repo_dir/<config_dir>/<test_parent>`, then runs from
+# `repo_dir/<config_dir>`:
+#   npx vitest run <copied-file> --reporter=json --testTimeout=<timeout*1000>
+# WITHOUT --config, so vitest auto-resolves server/vitest.config.mjs (written
+# by tests/test-setup.sh: swc + tsconfigPaths plugins, globals, TZ=UTC, no DB).
+#
+# Layout:
+# - config_dir = "server" — vitest runs from inside the server workspace so
+#   `src/...` / `test/...` tsconfig path aliases resolve.
+# - test_parent = "server/src/services" — the verifier lands beside the
+#   pre-existing version.service.spec.ts, the exact location the upstream
+#   spec lives, so `vitest.mock(import('src/constants.js'), …)` and all
+#   `src/...`/`test/...` imports resolve identically.
+# - timeout = 600 — vitest 3 cold-start + swc transform of the targeted
+#   single spec runs in ~5-7s (no DB); ample headroom.
+
+[jest]
+config_dir = "server"
+test_parent = "server/src/services"
+runner = "vitest"
+timeout = 600

@@ -1,0 +1,161 @@
+version = "1.0"
+
+[environment]
+base_image = "gitea-fix-codeql-code-scanning:latest"
+build_timeout_sec = 1800.0
+cpus = 2
+memory = "4G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "gitea"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "gitea"
+
+[metadata]
+family = "gitea-fix-codeql-code-scanning"
+variant = "hard"
+segment = "investigate"
+repo = "gitea"
+tags = ["gitea", "go"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Static analysis (CodeQL) flags ten incorrect-integer-conversion alerts
+across the Gitea backend. The shared shape of the warnings: counts
+that originate as int64 (from database row counts and pagination
+totals) get narrowed to int at internal API boundaries, and the same
+counts are then forced back to int64 at the response-header layer.
+Other alerts flag allocation-size-overflow risks where regex match
+indices or list-page sizes feed unbounded into make([]T, 0, cap).
+The warnings are mostly latent on a 64-bit deployment but are
+correct about the cross-platform contract: the receiving functions
+advertise narrower types than callers actually have.
+"""
+context = """The pagination layer in `services/context/` is the centre of the
+problem. `NewPagination(total int, ...)` accepts `int`; database
+queries return counts as `int64`; the X-Total-Count header serialiser
+already expects `int64`. Every caller currently bridges the gap with
+`int(count)` casts, and the static analyser flags those casts as
+narrow-then-widen pairs. Fixing the alerts means widening the
+receiver, not patching every caller.
+
+A handful of secondary alerts touch unrelated subsystems but follow
+the same theme:
+- `modules/charset/escape_stream.go` allocates a slice with capacity
+  derived from regex match indices the analyser cannot prove are
+  bounded by `len(data)`.
+- `modules/templates/htmlrenderer.go` round-trips a string through
+  `util.ToInt64` only to truncate to `int` immediately after — the
+  analyser flags both legs.
+- `routers/api/v1/repo/issue_dependency.go` allocates a result slice
+  whose capacity is the user-controlled page size, with no upper
+  bound.
+
+The PR thread (#36858) shows the maintainer (`wxiaoguang`) explicitly
+rejecting the contributor's first attempt — a global `Int64ToInt`
+helper — and asking for the receiving functions to take the wider
+type instead. The contributor agreed the diff would "blow up
+significantly" but went ahead and changed ~70 files. The same thread
+also reverted one fix attempt for a `bad-redirect-check` alert as a
+false positive; that revert is out of scope for the bench task.
+
+Investigation evidence available in the PR thread:
+- The CodeQL alert IDs (#110, #114, #115, #116, #105, #106, #161,
+  #162, #163, #181) — but the bench task does not surface them; the
+  agent is given the symptom (lint failures), not the alert IDs.
+- The maintainer's review comment naming `NewPagination` and
+  "rewrite the parsing code" as the right shape of the fix.
+- One reverted commit in the merge (the redirect-check alert) — out
+  of scope here.
+"""
+solution = """Canonical fix: widen `NewPagination(total int, ...)` and
+`(*APIContext).SetLinkHeader(total, pageSize int)` to take `int64`
+for the count parameter. Inside `NewPagination`, clamp to
+`int(math.MaxInt)` before calling the underlying paginator (which
+still takes `int`). Cascade the type change through every caller —
+remove `int(value)` casts on database row counts, add `int64(value)`
+casts on in-memory struct fields like `team.NumMembers` that remain
+`int`. Rename `unadoptedRepositories.index` to `count` and retype to
+`int64`, plus `start`/`end` on the same struct. Update the existing
+`adopt_test.go` to use the new field name and `assert.EqualValues`
+for the int64 comparison.
+
+For the secondary alerts:
+- `escape_stream.go`: clamp `until` and `next` with
+  `min(..., len(data))` before allocating the slice.
+- `htmlrenderer.go`: change `makeDetailedError(lineNum, posNum any,
+  ...)` to `makeDetailedError(lineNumStr, posNumStr string, ...)`
+  and parse with `strconv.Atoi`.
+- `issue_dependency.go`: cap the allocation at
+  `setting.API.MaxResponseItems`.
+
+Equally valid alternatives:
+- Different bookkeeping: keep `unadoptedRepositories.index` as the
+  field name and just retype to `int64`. The test must follow.
+- Keep `start`/`end` as `int` and only widen the cumulative `count`.
+  The verifier checks only the `ListUnadoptedRepositories` return
+  type, not internal field shapes.
+- Use a typed helper (e.g. `util.Cell2Int64`) at call sites instead
+  of bare `int64(value)` casts. Same observable behaviour.
+
+Suboptimal fixes that the verifier will reject:
+- Wrapping every CodeQL-flagged caller in `int(min(value,
+  math.MaxInt))` without changing the receiving signatures. The PR
+  maintainer explicitly rejected this style; the verifier rejects it
+  because `NewPagination`/`SetLinkHeader` would still advertise
+  `int`.
+- Leaving `ListUnadoptedRepositories` returning `int` and casting to
+  `int64` at the API caller. The verifier asserts the return type.
+
+Red herrings:
+- The redirect-check alert (#95) referenced in the PR thread was
+  reverted by the author and is out of scope. The agent should not
+  attempt to widen anti-XSS or redirect-handling code.
+- The `pull-view-file.ts` frontend file mentioned in some scraper
+  manifests was not actually part of the merged PR; ignore any TS
+  changes.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["go"]
+runtime_dependence = "code-evident"
+skills = ["codebase-exploration", "logic-fix", "framework-fluency", "build-tooling"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 318
+files = 70
+hunks = 121
+scope = "extensive"
+
+[metadata.origin]
+repo = "go-gitea/gitea"
+pr_numbers = [36858]
+base_commit = "3f1ef703d587a98ba98268a3f023d159f2c506d7"
+base_commit_date = "2026-05-22"
+merged_at = "2026-05-22"
+
+
+
+

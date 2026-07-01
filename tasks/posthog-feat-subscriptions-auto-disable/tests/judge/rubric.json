@@ -1,0 +1,31 @@
+{
+  "files": [
+    "ee/tasks/subscriptions/auto_disable.py",
+    "posthog/temporal/subscriptions/activities.py",
+    "posthog/temporal/subscriptions/workflows.py",
+    "ee/api/subscription.py",
+    "posthog/models/subscription.py",
+    "posthog/templates/email/subscription_disabled.html",
+    "frontend/src/lib/components/Subscriptions/",
+    "frontend/src/scenes/subscriptions/"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "disable_persists_when_email_send_fails",
+      "description": "When delivery to a permanently-broken target triggers auto-disable and the owner-notification email send raises, the subscription still ends up persisted as disabled (enabled=False) and no exception escapes the delivery path. The disable is the durable side effect; the notification email is best-effort and its failure must not roll back or abort the disable."
+    },
+    {
+      "name": "disable_notifies_owner",
+      "description": "On auto-disable the subscription's creator is emailed exactly once using a dedicated disabled-notification template that names the human-readable disable reason. The notification uses a per-send-unique campaign/message key so that the messaging dedup layer cannot suppress legitimately distinct disable notifications across different subscriptions or future events."
+    },
+    {
+      "name": "rejection_messages_are_actionable",
+      "description": "The user-facing messages the API returns when it refuses an unsafe action are specific and actionable, not generic or empty. Refusing a test delivery on a paused subscription tells the user to resume it first; refusing to resume a subscription whose Slack integration is gone tells them to reconnect Slack; refusing to resume an unsupported delivery channel says the channel is not currently supported; refusing a create/edit/resume that leaves an exhausted recurrence schedule says the schedule has reached its end date (and how to extend it). Each message clearly conveys what must change."
+    },
+    {
+      "name": "pause_resume_patches_enabled",
+      "description": "The subscriptions UI exposes a pause/resume affordance that persists the change by calling the pre-existing subscriptions partial-update API with the toggled enabled flag for the current team, and surfaces the outcome to the user — a success toast worded to match the requested state on success, and on failure an error toast that uses the API's error detail when present (falling back to a generic message otherwise)."
+    }
+  ],
+  "pass_to_pass": []
+}

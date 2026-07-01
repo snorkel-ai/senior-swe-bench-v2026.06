@@ -1,0 +1,175 @@
+version = "1.0"
+
+[environment]
+base_image = "better-auth-fix-api-return-response:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "better-auth"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "better-auth"
+
+[metadata]
+family = "better-auth-fix-api-return-response"
+variant = "hard"
+segment = "investigate"
+repo = "better-auth"
+tags = ["better-auth", "typescript-lib"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """OAuth/OIDC plugin endpoints return wrapped JSON
+(`{ response: { ... } }`) when invoked through their HTTP integrations,
+breaking spec compliance and dropping `Set-Cookie` headers. The same
+endpoint, called from internal plugin code without an HTTP request
+context, behaves correctly. Need a generic fix that works for every
+endpoint receiving an HTTP request context, not a path-by-path patch.
+"""
+context = """Setting:
+- `better-auth` is a framework-agnostic auth library. Endpoints are
+  registered via `createAuthEndpoint` and exposed in two shapes:
+  the public HTTP entry point (`auth.handler(request: Request)`,
+  used by Next.js / Hono / Express adapters), and a typed server-side
+  API (`auth.api.<endpoint>(input)`, used by plugins and internal
+  callers).
+- The shared dispatcher `toAuthEndpoints` in
+  `packages/better-auth/src/api/to-auth-endpoints.ts` decides between
+  "return the unwrapped business value" and "return a real `Response`"
+  based on the caller-supplied `context.asResponse` opt-in flag.
+- Three branches in the same dispatcher pick between the two output
+  shapes: (1) the before-hook short-circuit (when a registered
+  before-hook returns a non-context value), (2) the APIError handling
+  (when the handler resolves to an APIError), and (3) the final
+  response construction (the normal happy-path return).
+- All three pre-fix branches gate solely on `context?.asResponse`.
+
+Investigation evidence:
+- PR #7521 body: when OAuth/OIDC plugin endpoints are called via the
+  typed API by their HTTP integration (e.g. an OIDC token endpoint
+  forwarding the inbound `Request` so the handler can read
+  `Authorization`), the integration relies on `auth.api.<endpoint>(...)`
+  to produce a real `Response` it can ship over the wire. Pre-fix it
+  produces the unwrapped object, the wire-level body becomes
+  `{ response: {...} }`, and OAuth clients reject the shape.
+  `Set-Cookie` likewise gets lost because the typed API returns the
+  payload only — headers live on the never-constructed `Response`.
+- Linked issue: #7355.
+
+Note on patch scope:
+- The PR also adds a regression test in
+  `packages/better-auth/src/api/to-auth-endpoints.test.ts`. The
+  oracle.patch in this task curates that test out — verifier coverage
+  is independent.
+- The fix is a 5-line edit to one file. The investigation distance is
+  the hard part: the symptom is "OAuth/OIDC bodies are wrapped" and
+  the root cause is in a generic dispatcher 3 directories away from
+  any OAuth code.
+"""
+solution = """Canonical fix (reference example):
+
+In `packages/better-auth/src/api/to-auth-endpoints.ts`, derive a single
+`shouldReturnResponse` boolean once per call:
+
+```ts
+const hasRequest = context?.request instanceof Request;
+const shouldReturnResponse = context?.asResponse ?? hasRequest;
+```
+
+…then thread it through all three response-shape branches (before-hook
+short-circuit, APIError throw vs return, final response construction)
+so each branch picks `Response` whenever the caller either explicitly
+opted in (`asResponse: true`) or supplied an HTTP `Request` in the
+input context.
+
+Why this approach works:
+- Generic: every endpoint receiving an HTTP request context
+  benefits, no path allow-list maintenance.
+- `?? hasRequest` (rather than `|| hasRequest`) preserves the
+  existing semantics where a caller who explicitly passed
+  `asResponse: false` still gets the plain return value — only an
+  unset/`undefined` opt-in flag is overridden by the request-context
+  detection.
+- Threading through all three branches is necessary because OAuth/OIDC
+  flows hit hooks (before-hook short-circuit) and error paths
+  (APIError) just as often as the happy path; a partial fix
+  regresses spec compliance just as much as no fix.
+
+Alternative valid fixes:
+1. PR-description shape: `Boolean(context?.asResponse) || hasRequest`
+   instead of `??`. Verifier passes — the discriminating tests don't
+   exercise the explicit `asResponse: false` corner.
+2. Different HTTP-context detector: `typeof context?.request?.url ===
+   "string"` instead of `instanceof Request`. Both robustly identify
+   "this came from an HTTP entry point."
+3. Inline the `?? hasRequest` check at each of the three branches
+   without lifting a shared variable. Behavior identical, slightly
+   noisier code.
+4. Mutate the inner `internalContext.asResponse = hasRequest` early
+   when `context?.asResponse` is undefined, then keep all three
+   branches gating on the original flag. Slightly clunky but the
+   external behavior is the same.
+
+Non-optimal "fixes" that don't pass:
+- Touching only the final-response branch and leaving the before-hook
+  short-circuit and the APIError path on the old gate. OAuth flows
+  break whenever a hook short-circuits or an APIError fires. The
+  verifier exercises both explicitly.
+- A path-allow-list fix that special-cases OAuth/OIDC routes. Verifier
+  exercises the non-OAuth `/api/auth/ok` endpoint, which a path-scoped
+  fix would miss. Also adds future maintenance every time a new
+  spec-compliant endpoint is added.
+- Wrapping every `auth.api.*` return in a `Response` regardless of
+  input context. Plugin callers without an HTTP request rely on the
+  plain return value; the regression-guard test fails.
+- Conflating "request was passed" with "response was requested." Using
+  truthy `||` on a non-strict boolean (e.g. checking
+  `context?.request != null`) falsely fires on plugin callers that
+  pass a non-Request placeholder; sticking to `instanceof Request`
+  (or `typeof request?.url === "string"`) avoids this.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["typescript-lib"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "framework-fluency", "logic-fix", "api-contract-design", "test-execution"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 8
+files = 1
+hunks = 3
+scope = "localized"
+
+[metadata.origin]
+repo = "better-auth/better-auth"
+pr_numbers = [7521]
+base_commit = "20e4561c9bbb9d05d5a01044a24b6a53cb1f9359"
+base_commit_date = "2026-01-21"
+merged_at = "2026-03-18"
+
+
+
+

@@ -1,0 +1,12 @@
+diff --git a/crates/turborepo-fs/src/lib.rs b/crates/turborepo-fs/src/lib.rs
+index 4a8f2bfab4..8ba1b36c06 100644
+--- a/crates/turborepo-fs/src/lib.rs
++++ b/crates/turborepo-fs/src/lib.rs
+@@ -35,6 +35,7 @@ pub fn recursive_copy(
+     if src_metadata.is_dir() {
+         let walker = WalkBuilder::new(src.as_path())
+             .hidden(false)
++            .parents(false)
+             .git_ignore(use_gitignore)
+             .git_global(false)
+             .git_exclude(use_gitignore)

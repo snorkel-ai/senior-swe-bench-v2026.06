@@ -1,0 +1,22 @@
+# Plausible is a single Mix app (no umbrella). The Elixir runner copies
+# verify_test.exs into <repo>/test/__verification__/, then invokes
+# `mix test test/__verification__/verify_test.exs --trace --no-color`
+# from the repo root. Plausible's `test` mix alias chains
+# `ecto.create --quiet → ecto.migrate → test → clean_clickhouse`, so
+# every invocation re-creates the test schema in Postgres + ClickHouse.
+[mix]
+app = ""
+
+# `mix test` (no `MIX_ENV=test` prefix — env is set via the env table
+# below). The runner appends the test path and `--trace --no-color`
+# itself.
+command = "mix test"
+
+# 900 seconds = 15 minutes hard cap. A cold first run pays for
+# ecto.create + ecto.migrate (~30-60s) and any incremental compile
+# (~10-20s) before running two tests. Subsequent runs in the same
+# container reuse the already-migrated DBs and finish in ~5-10 seconds.
+timeout = 900
+
+[mix.env]
+MIX_ENV = "test"

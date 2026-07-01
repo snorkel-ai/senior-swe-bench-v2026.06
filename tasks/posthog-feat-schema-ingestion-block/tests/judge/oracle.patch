@@ -1,0 +1,842 @@
+diff --git a/ee/api/ee_event_definition.py b/ee/api/ee_event_definition.py
+index f9bb4a91a6f..78a4c3bf381 100644
+--- a/ee/api/ee_event_definition.py
++++ b/ee/api/ee_event_definition.py
+@@ -41,6 +41,7 @@ class EnterpriseEventDefinitionSerializer(TaggedItemSerializerMixin, serializers
+             "verified_at",
+             "verified_by",
+             "hidden",
++            "enforcement_mode",
+             # Action fields
+             "is_action",
+             "action_id",
+diff --git a/frontend/src/generated/core/api.schemas.ts b/frontend/src/generated/core/api.schemas.ts
+index 94c9e4c471c..4c71cabda1d 100644
+--- a/frontend/src/generated/core/api.schemas.ts
++++ b/frontend/src/generated/core/api.schemas.ts
+@@ -2376,6 +2376,17 @@ export interface PatchedDashboardTemplateApi {
+     availability_contexts?: string[] | null
+ }
+ 
++/**
++ * * `allow` - Allow
++ * `reject` - Reject
++ */
++export type EnforcementModeEnumApi = (typeof EnforcementModeEnumApi)[keyof typeof EnforcementModeEnumApi]
++
++export const EnforcementModeEnumApi = {
++    allow: 'allow',
++    reject: 'reject',
++} as const
++
+ /**
+  * Serializer mixin that handles tags for objects.
+  */
+@@ -2401,6 +2412,7 @@ export interface EnterpriseEventDefinitionApi {
+     readonly verified_by: UserBasicApi
+     /** @nullable */
+     hidden?: boolean | null
++    enforcement_mode?: EnforcementModeEnumApi
+     readonly is_action: boolean
+     readonly action_id: number
+     readonly is_calculating: boolean
+@@ -2445,6 +2457,7 @@ export interface PatchedEnterpriseEventDefinitionApi {
+     readonly verified_by?: UserBasicApi
+     /** @nullable */
+     hidden?: boolean | null
++    enforcement_mode?: EnforcementModeEnumApi
+     readonly is_action?: boolean
+     readonly action_id?: number
+     readonly is_calculating?: boolean
+diff --git a/frontend/src/lib/api.ts b/frontend/src/lib/api.ts
+index fd8654baa52..9461fe78f5f 100644
+--- a/frontend/src/lib/api.ts
++++ b/frontend/src/lib/api.ts
+@@ -2809,6 +2809,9 @@ const api = {
+         async create(data: Partial<EventSchema>, projectId?: ProjectType['id']): Promise<EventSchema> {
+             return new ApiRequest().eventSchemas(projectId).create({ data })
+         },
++        async update(id: string, data: Partial<EventSchema>, projectId?: ProjectType['id']): Promise<EventSchema> {
++            return new ApiRequest().eventSchemasDetail(id, projectId).update({ data })
++        },
+         async delete(id: string, projectId?: ProjectType['id']): Promise<void> {
+             return new ApiRequest().eventSchemasDetail(id, projectId).delete()
+         },
+diff --git a/frontend/src/scenes/data-management/events/EventDefinitionSchema.tsx b/frontend/src/scenes/data-management/events/EventDefinitionSchema.tsx
+index 021377bbe33..427898f255f 100644
+--- a/frontend/src/scenes/data-management/events/EventDefinitionSchema.tsx
++++ b/frontend/src/scenes/data-management/events/EventDefinitionSchema.tsx
+@@ -2,12 +2,12 @@ import { useActions, useValues } from 'kea'
+ import { useMemo, useState } from 'react'
+ 
+ import { IconInfo, IconPencil, IconPlus, IconTrash } from '@posthog/icons'
+-import { LemonButton, LemonTag, Link, Tooltip } from '@posthog/lemon-ui'
++import { LemonButton, LemonCheckbox, LemonTag, Link, Tooltip } from '@posthog/lemon-ui'
+ 
+ import { SceneSection } from '~/layout/scenes/components/SceneSection'
+ import { Query } from '~/queries/Query/Query'
+ import { urls } from '~/scenes/urls'
+-import { EventDefinition } from '~/types'
++import { EventDefinition, SchemaEnforcementMode } from '~/types'
+ 
+ import { PropertyGroupModal } from '../schema/PropertyGroupModal'
+ import { PropertyTypeTag } from '../schema/PropertyTypeTag'
+@@ -129,9 +129,12 @@ function PropertyGroupCard({
+ }
+ 
+ export function EventDefinitionSchema({ definition }: { definition: EventDefinition }): JSX.Element {
+-    const logic = eventDefinitionSchemaLogic({ eventDefinitionId: definition.id })
+-    const { eventSchemas, eventSchemasLoading } = useValues(logic)
+-    const { addPropertyGroup, removePropertyGroup, loadAllPropertyGroups } = useActions(logic)
++    const logic = eventDefinitionSchemaLogic({
++        eventDefinitionId: definition.id,
++    })
++    const { eventSchemas, eventSchemasLoading, schemaEnforcementMode, schemaEnforcementModeUpdating } = useValues(logic)
++    const { addPropertyGroup, removePropertyGroup, loadAllPropertyGroups, updateSchemaEnforcementMode } =
++        useActions(logic)
+     const [isModalOpen, setIsModalOpen] = useState(false)
+ 
+     const schemaLogic = schemaManagementLogic({ key: `event-${definition.id}` })
+@@ -142,19 +145,47 @@ export function EventDefinitionSchema({ definition }: { definition: EventDefinit
+         [eventSchemas]
+     )
+ 
++    const isEnforcementEnabled = schemaEnforcementMode === SchemaEnforcementMode.Reject
++
++    const hasPropertyGroups = eventSchemas.length > 0
++
+     return (
+         <SceneSection
+             title="Schema"
+             description="Define which property groups this event should have. Property groups establish a schema that helps document expected properties."
+             actions={
+-                <LemonButton
+-                    type="primary"
+-                    icon={<IconPlus />}
+-                    onClick={() => setIsModalOpen(true)}
+-                    disabled={eventSchemasLoading}
+-                >
+-                    Add Property Group
+-                </LemonButton>
++                <>
++                    <LemonCheckbox
++                        label={
++                            <span className="flex items-center gap-1">
++                                Reject invalid events
++                                <Tooltip title="When enabled, events missing required properties or with wrong types will be rejected at ingestion time">
++                                    <IconInfo className="text-lg text-secondary" />
++                                </Tooltip>
++                            </span>
++                        }
++                        bordered
++                        size="small"
++                        checked={isEnforcementEnabled}
++                        onChange={(checked) =>
++                            updateSchemaEnforcementMode(
++                                checked ? SchemaEnforcementMode.Reject : SchemaEnforcementMode.Allow
++                            )
++                        }
++                        disabled={!hasPropertyGroups || schemaEnforcementModeUpdating}
++                        disabledReason={
++                            !hasPropertyGroups ? 'Define a schema before enabling schema enforcement' : undefined
++                        }
++                    />
++                    <LemonButton
++                        type="primary"
++                        icon={<IconPlus />}
++                        onClick={() => setIsModalOpen(true)}
++                        disabled={eventSchemasLoading}
++                    >
++                        Add Property Group
++                    </LemonButton>
++                </>
+             }
+         >
+             <div className="space-y-4">
+diff --git a/frontend/src/scenes/data-management/events/eventDefinitionSchemaLogic.ts b/frontend/src/scenes/data-management/events/eventDefinitionSchemaLogic.ts
+index 9efb22a9f89..9c21999c665 100644
+--- a/frontend/src/scenes/data-management/events/eventDefinitionSchemaLogic.ts
++++ b/frontend/src/scenes/data-management/events/eventDefinitionSchemaLogic.ts
+@@ -4,6 +4,9 @@ import { loaders } from 'kea-loaders'
+ import api from 'lib/api'
+ import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+ 
++import { EventDefinition, SchemaEnforcementMode } from '~/types'
++
++import { definitionLogic } from '../definition/definitionLogic'
+ import { type SchemaPropertyGroup, schemaManagementLogic } from '../schema/schemaManagementLogic'
+ import type { eventDefinitionSchemaLogicType } from './eventDefinitionSchemaLogicType'
+ 
+@@ -62,7 +65,10 @@ export const eventDefinitionSchemaLogic = kea<eventDefinitionSchemaLogicType>([
+     props({} as EventDefinitionSchemaLogicProps),
+     key((props) => props.eventDefinitionId),
+     connect((props: EventDefinitionSchemaLogicProps) => ({
++        values: [definitionLogic({ id: props.eventDefinitionId }), ['definition']],
+         actions: [
++            definitionLogic({ id: props.eventDefinitionId }),
++            ['setDefinition'],
+             schemaManagementLogic({ key: `event-${props.eventDefinitionId}` }),
+             ['updatePropertyGroupSuccess', 'createPropertyGroupSuccess'],
+         ],
+@@ -70,6 +76,8 @@ export const eventDefinitionSchemaLogic = kea<eventDefinitionSchemaLogicType>([
+     actions({
+         addPropertyGroup: (propertyGroupId: string) => ({ propertyGroupId }),
+         removePropertyGroup: (eventSchemaId: string) => ({ eventSchemaId }),
++        updateSchemaEnforcementMode: (mode: SchemaEnforcementMode) => ({ mode }),
++        setSchemaEnforcementModeUpdating: (updating: boolean) => ({ updating }),
+     }),
+     loaders(({ props }) => ({
+         eventSchemas: {
+@@ -88,12 +96,26 @@ export const eventDefinitionSchemaLogic = kea<eventDefinitionSchemaLogicType>([
+         },
+     })),
+     reducers({
+-        eventSchemas: {
+-            removePropertyGroup: (state, { eventSchemaId }) =>
+-                state.filter((schema: EventSchema) => schema.id !== eventSchemaId),
+-        },
++        eventSchemas: [
++            [] as EventSchema[],
++            {
++                removePropertyGroup: (state, { eventSchemaId }) =>
++                    state.filter((schema: EventSchema) => schema.id !== eventSchemaId),
++            },
++        ],
++        schemaEnforcementModeUpdating: [
++            false,
++            {
++                setSchemaEnforcementModeUpdating: (_, { updating }) => updating,
++            },
++        ],
+     }),
+     selectors({
++        schemaEnforcementMode: [
++            (s) => [s.definition],
++            (definition): SchemaEnforcementMode =>
++                (definition as EventDefinition).enforcement_mode ?? SchemaEnforcementMode.Allow,
++        ],
+         availablePropertyGroups: [
+             (s) => [s.allPropertyGroups, s.eventSchemas],
+             (allPropertyGroups: SchemaPropertyGroup[], eventSchemas: EventSchema[]): SchemaPropertyGroup[] => {
+@@ -125,6 +147,26 @@ export const eventDefinitionSchemaLogic = kea<eventDefinitionSchemaLogicType>([
+                 lemonToast.error(errorMessage)
+             }
+         },
++        updateSchemaEnforcementMode: async ({ mode }) => {
++            actions.setSchemaEnforcementModeUpdating(true)
++            try {
++                await api.eventDefinitions.update({
++                    eventDefinitionId: props.eventDefinitionId,
++                    eventDefinitionData: { enforcement_mode: mode },
++                })
++                actions.setDefinition({ enforcement_mode: mode }, { merge: true })
++                if (mode === SchemaEnforcementMode.Reject) {
++                    lemonToast.success('Schema enforcement enabled. Events that fail validation will be rejected.')
++                } else {
++                    lemonToast.success('Schema enforcement disabled. All events will be accepted.')
++                }
++            } catch (error: any) {
++                const errorMessage = getErrorMessage(error, 'Failed to update schema enforcement mode')
++                lemonToast.error(errorMessage)
++            } finally {
++                actions.setSchemaEnforcementModeUpdating(false)
++            }
++        },
+         updatePropertyGroupSuccess: async () => {
+             await actions.loadEventSchemas()
+         },
+diff --git a/frontend/src/scenes/data-management/ingestion-warnings/IngestionWarningsView.tsx b/frontend/src/scenes/data-management/ingestion-warnings/IngestionWarningsView.tsx
+index c9fa0d083b9..e08dd0ece3f 100644
+--- a/frontend/src/scenes/data-management/ingestion-warnings/IngestionWarningsView.tsx
++++ b/frontend/src/scenes/data-management/ingestion-warnings/IngestionWarningsView.tsx
+@@ -32,6 +32,7 @@ const WARNING_TYPE_TO_DESCRIPTION = {
+     replay_timestamp_too_far: 'Replay event timestamp was too far in the future',
+     replay_message_too_large: 'Replay data was dropped because it was too large to ingest',
+     set_on_exception: '$set or $set_once is ignored on exception events and should not be sent',
++    schema_validation_failed: 'Event rejected due to schema validation failure',
+ }
+ 
+ const WARNING_TYPE_RENDERER = {
+@@ -246,6 +247,43 @@ const WARNING_TYPE_RENDERER = {
+             </>
+         )
+     },
++    schema_validation_failed: function Render(warning: IngestionWarning): JSX.Element {
++        const details = warning.details as {
++            eventUuid: string
++            eventName: string
++            distinctId: string
++            errors: Array<{
++                property: string
++                reason: 'missing_required' | 'type_mismatch'
++                expectedTypes?: string[]
++                actualValue?: string
++            }>
++        }
++        return (
++            <>
++                Event <strong>{details.eventName}</strong> was rejected because it failed schema validation for
++                distinct_id <Link to={urls.personByDistinctId(details.distinctId)}>{details.distinctId}</Link> (event
++                uuid: <code>{details.eventUuid}</code>):
++                <ul>
++                    {details.errors.map((error, index) => (
++                        <li key={index}>
++                            {error.reason === 'missing_required' ? (
++                                <>
++                                    Required property <code>{error.property}</code> is missing
++                                </>
++                            ) : (
++                                <>
++                                    Property <code>{error.property}</code> has invalid type (expected{' '}
++                                    {error.expectedTypes?.join(' or ')}, got{' '}
++                                    <code>{error.actualValue ?? 'unknown'}</code>)
++                                </>
++                            )}
++                        </li>
++                    ))}
++                </ul>
++            </>
++        )
++    },
+ }
+ 
+ export function IngestionWarningsView(): JSX.Element {
+diff --git a/frontend/src/types.ts b/frontend/src/types.ts
+index 5e692ff7020..c97ddac4596 100644
+--- a/frontend/src/types.ts
++++ b/frontend/src/types.ts
+@@ -4070,6 +4070,11 @@ export type HotKey =
+     | 'delete'
+ export type HotKeyOrModifier = HotKey | 'shift' | 'option' | 'command'
+ 
++export enum SchemaEnforcementMode {
++    Allow = 'allow',
++    Reject = 'reject',
++}
++
+ export interface EventDefinition {
+     id: string
+     name: string
+@@ -4087,6 +4092,7 @@ export interface EventDefinition {
+     is_action?: boolean
+     hidden?: boolean
+     default_columns?: string[]
++    enforcement_mode?: SchemaEnforcementMode
+     media_preview_urls?: string[]
+ }
+ 
+diff --git a/nodejs/src/config/config.ts b/nodejs/src/config/config.ts
+index 790bec37f22..362bb552a7d 100644
+--- a/nodejs/src/config/config.ts
++++ b/nodejs/src/config/config.ts
+@@ -72,6 +72,7 @@ export function getDefaultConfig(): PluginsServerConfig {
+         EVENT_OVERFLOW_BUCKET_REPLENISH_RATE: 1.0,
+         KAFKA_BATCH_START_LOGGING_ENABLED: false,
+         SKIP_UPDATE_EVENT_AND_PROPERTIES_STEP: false,
++        EVENT_SCHEMA_ENFORCEMENT_ENABLED: true,
+         CONSUMER_BATCH_SIZE: 500,
+         CONSUMER_MAX_HEARTBEAT_INTERVAL_MS: 30_000,
+         CONSUMER_LOOP_STALL_THRESHOLD_MS: 60_000, // 1 minute - consider loop stalled after this
+diff --git a/nodejs/src/ingestion/analytics/joined-ingestion-pipeline.ts b/nodejs/src/ingestion/analytics/joined-ingestion-pipeline.ts
+index a3dc386b2db..cdd6e37415b 100644
+--- a/nodejs/src/ingestion/analytics/joined-ingestion-pipeline.ts
++++ b/nodejs/src/ingestion/analytics/joined-ingestion-pipeline.ts
+@@ -4,6 +4,7 @@ import { HogTransformerService } from '../../cdp/hog-transformations/hog-transfo
+ import { KafkaProducerWrapper } from '../../kafka/producer'
+ import { Hub, Team } from '../../types'
+ import { EventIngestionRestrictionManager } from '../../utils/event-ingestion-restrictions'
++import { EventSchemaEnforcementManager } from '../../utils/event-schema-enforcement-manager'
+ import { PromiseScheduler } from '../../utils/promise-scheduler'
+ import { TeamManager } from '../../utils/team-manager'
+ import { EventPipelineRunnerOptions } from '../../worker/ingestion/event-pipeline/runner'
+@@ -44,6 +45,8 @@ export interface JoinedIngestionPipelineConfig {
+     groupStore: BatchWritingGroupStore
+     hogTransformer: HogTransformerService
+     eventIngestionRestrictionManager: EventIngestionRestrictionManager
++    eventSchemaEnforcementManager: EventSchemaEnforcementManager
++    eventSchemaEnforcementEnabled: boolean
+     overflowEnabled: boolean
+     overflowTopic: string
+     dlqTopic: string
+@@ -115,6 +118,8 @@ export function createJoinedIngestionPipeline<
+         groupStore,
+         hogTransformer,
+         eventIngestionRestrictionManager,
++        eventSchemaEnforcementManager,
++        eventSchemaEnforcementEnabled,
+         overflowEnabled,
+         overflowTopic,
+         dlqTopic,
+@@ -135,6 +140,8 @@ export function createJoinedIngestionPipeline<
+ 
+     const postTeamConfig: PostTeamPreprocessingSubpipelineConfig = {
+         eventIngestionRestrictionManager,
++        eventSchemaEnforcementManager,
++        eventSchemaEnforcementEnabled,
+         cookielessManager: hub.cookielessManager,
+         overflowTopic,
+         preservePartitionLocality: hub.INGESTION_OVERFLOW_PRESERVE_PARTITION_LOCALITY,
+diff --git a/nodejs/src/ingestion/analytics/post-team-preprocessing-subpipeline.ts b/nodejs/src/ingestion/analytics/post-team-preprocessing-subpipeline.ts
+index bb0899dad46..d7ac1cd9571 100644
+--- a/nodejs/src/ingestion/analytics/post-team-preprocessing-subpipeline.ts
++++ b/nodejs/src/ingestion/analytics/post-team-preprocessing-subpipeline.ts
+@@ -7,6 +7,7 @@ import { processPersonlessDistinctIdsBatchStep } from '~/worker/ingestion/event-
+ import { HogTransformerService } from '../../cdp/hog-transformations/hog-transformer.service'
+ import { EventHeaders, Hub, Team } from '../../types'
+ import { EventIngestionRestrictionManager } from '../../utils/event-ingestion-restrictions'
++import { EventSchemaEnforcementManager } from '../../utils/event-schema-enforcement-manager'
+ import { prefetchPersonsStep } from '../../worker/ingestion/event-pipeline/prefetchPersonsStep'
+ import { PersonsStore } from '../../worker/ingestion/persons/persons-store'
+ import {
+@@ -16,6 +17,7 @@ import {
+     createRateLimitToOverflowStep,
+     createValidateEventMetadataStep,
+     createValidateEventPropertiesStep,
++    createValidateEventSchemaStep,
+     createValidateEventUuidStep,
+ } from '../event-preprocessing'
+ import { createDropOldEventsStep } from '../event-processing/drop-old-events-step'
+@@ -32,6 +34,8 @@ export interface PostTeamPreprocessingSubpipelineInput {
+ 
+ export interface PostTeamPreprocessingSubpipelineConfig {
+     eventIngestionRestrictionManager: EventIngestionRestrictionManager
++    eventSchemaEnforcementManager: EventSchemaEnforcementManager
++    eventSchemaEnforcementEnabled: boolean
+     cookielessManager: Hub['cookielessManager']
+     overflowTopic: string
+     preservePartitionLocality: boolean
+@@ -49,6 +53,8 @@ export function createPostTeamPreprocessingSubpipeline<TInput extends PostTeamPr
+ ) {
+     const {
+         eventIngestionRestrictionManager,
++        eventSchemaEnforcementManager,
++        eventSchemaEnforcementEnabled,
+         cookielessManager,
+         overflowTopic,
+         preservePartitionLocality,
+@@ -63,14 +69,18 @@ export function createPostTeamPreprocessingSubpipeline<TInput extends PostTeamPr
+     return (
+         builder
+             // These validation steps are synchronous, so we can process events sequentially.
+-            .sequentially((b) =>
+-                b
+-                    .pipe(createValidateEventMetadataStep())
+-                    .pipe(createValidateEventPropertiesStep())
++            .sequentially((b) => {
++                const validated = b.pipe(createValidateEventMetadataStep()).pipe(createValidateEventPropertiesStep())
++
++                const schemaChecked = eventSchemaEnforcementEnabled
++                    ? validated.pipe(createValidateEventSchemaStep(eventSchemaEnforcementManager))
++                    : validated
++
++                return schemaChecked
+                     .pipe(createApplyPersonProcessingRestrictionsStep(eventIngestionRestrictionManager))
+                     .pipe(createValidateEventUuidStep())
+                     .pipe(createDropOldEventsStep())
+-            )
++            })
+             // We want to call cookieless with the whole batch at once.
+             // IMPORTANT: Cookieless processing changes distinct IDs (cookieless events
+             // are captured with $posthog_cookieless distinct ID and rewritten here).
+diff --git a/nodejs/src/ingestion/event-preprocessing/index.ts b/nodejs/src/ingestion/event-preprocessing/index.ts
+index a3f645e2694..9464b97d379 100644
+--- a/nodejs/src/ingestion/event-preprocessing/index.ts
++++ b/nodejs/src/ingestion/event-preprocessing/index.ts
+@@ -11,5 +11,6 @@ export { createResolveTeamStep } from './resolve-team'
+ export { createValidateAiEventTokensStep } from './validate-ai-event-tokens'
+ export { createValidateEventMetadataStep } from './validate-event-metadata'
+ export { createValidateEventPropertiesStep } from './validate-event-properties'
++export { createValidateEventSchemaStep } from './validate-event-schema'
+ export { createValidateEventUuidStep } from './validate-event-uuid'
+ export { createValidateHistoricalMigrationStep } from './validate-historical-migration'
+diff --git a/nodejs/src/ingestion/event-preprocessing/validate-event-schema.ts b/nodejs/src/ingestion/event-preprocessing/validate-event-schema.ts
+new file mode 100644
+index 00000000000..fd356bb07f2
+--- /dev/null
++++ b/nodejs/src/ingestion/event-preprocessing/validate-event-schema.ts
+@@ -0,0 +1,159 @@
++import { EventSchemaEnforcement, PipelineEvent, Team } from '../../types'
++import { EventSchemaEnforcementManager } from '../../utils/event-schema-enforcement-manager'
++import { drop, ok } from '../pipelines/results'
++import { ProcessingStep } from '../pipelines/steps'
++import { isValidClickHouseDateTime } from './clickhouse-datetime-parser'
++
++/**
++ * Checks if a value can be coerced to the given PostHog property type.
++ * See: PropertySwapper._field_type_to_property_call in posthog/hogql/transforms/property_types.py
++ */
++function canCoerceToType(value: unknown, propertyType: string): boolean {
++    if (value === null || value === undefined) {
++        return false
++    }
++
++    switch (propertyType) {
++        case 'String':
++            // Everything can be coerced to string
++            return true
++
++        case 'Numeric':
++            // Accepts: numbers, numeric strings
++            // Rejects: Infinity, -Infinity, NaN, booleans (these become null in ClickHouse)
++            if (typeof value === 'number') {
++                return Number.isFinite(value)
++            }
++            if (typeof value === 'string') {
++                const trimmed = value.trim()
++                const num = Number(trimmed)
++                return trimmed !== '' && Number.isFinite(num)
++            }
++            return false
++
++        case 'Boolean':
++            // Accepts: booleans, "true"/"false" strings (case sensitive - ClickHouse transform only matches lowercase)
++            if (typeof value === 'boolean') {
++                return true
++            }
++            if (typeof value === 'string') {
++                return value === 'true' || value === 'false'
++            }
++            return false
++
++        case 'DateTime':
++            return isValidClickHouseDateTime(value)
++
++        case 'Object':
++            return typeof value === 'object'
++
++        default:
++            // Unknown type - allow by default
++            return true
++    }
++}
++
++export interface SchemaValidationError {
++    propertyName: string
++    reason: 'missing_required' | 'type_mismatch'
++    expectedTypes?: string[]
++    actualValue?: unknown
++}
++
++export interface SchemaValidationResult {
++    valid: boolean
++    errors: SchemaValidationError[]
++}
++
++/**
++ * Validates an event's properties against an enforced schema.
++ * Only required properties are validated - optional properties are not included in the schema.
++ */
++export function validateEventAgainstSchema(
++    eventProperties: Record<string, unknown> | undefined,
++    schema: EventSchemaEnforcement
++): SchemaValidationResult {
++    const errors: SchemaValidationError[] = []
++
++    for (const [propertyName, propertyTypes] of schema.required_properties) {
++        const value = eventProperties?.[propertyName]
++
++        if (value === null || value === undefined) {
++            errors.push({
++                propertyName,
++                reason: 'missing_required',
++            })
++            continue
++        }
++
++        if (!propertyTypes.some((type) => canCoerceToType(value, type))) {
++            errors.push({
++                propertyName,
++                reason: 'type_mismatch',
++                expectedTypes: propertyTypes,
++                actualValue: value,
++            })
++        }
++    }
++
++    return {
++        valid: errors.length === 0,
++        errors,
++    }
++}
++
++/**
++ * Creates a processing step that validates events against enforced schemas.
++ * Events that fail validation are dropped and an ingestion warning is emitted.
++ *
++ * @param schemaManager - Manager for fetching enforced schemas (uses caching internally)
++ */
++export function createValidateEventSchemaStep<T extends { event: PipelineEvent; team: Team }>(
++    schemaManager: EventSchemaEnforcementManager
++): ProcessingStep<T, T> {
++    return async function validateEventSchemaStep(input) {
++        const { event, team } = input
++
++        const enforcedSchemas = await schemaManager.getSchemas(team.id)
++        if (enforcedSchemas.size === 0) {
++            return ok(input)
++        }
++
++        const schema = enforcedSchemas.get(event.event)
++        if (!schema) {
++            return ok(input)
++        }
++
++        const validationResult = validateEventAgainstSchema(event.properties, schema)
++
++        if (!validationResult.valid) {
++            return drop(
++                'schema_validation_failed',
++                [],
++                [
++                    {
++                        type: 'schema_validation_failed',
++                        details: {
++                            eventUuid: event.uuid,
++                            eventName: event.event,
++                            distinctId: event.distinct_id,
++                            errors: validationResult.errors.map((err) => ({
++                                property: err.propertyName,
++                                reason: err.reason,
++                                expectedTypes: err.expectedTypes,
++                                actualValue:
++                                    err.actualValue !== undefined
++                                        ? typeof err.actualValue === 'object'
++                                            ? JSON.stringify(err.actualValue)
++                                            : String(err.actualValue)
++                                        : undefined,
++                            })),
++                        },
++                    },
++                ]
++            )
++        }
++
++        return ok(input)
++    }
++}
+diff --git a/nodejs/src/ingestion/ingestion-consumer.ts b/nodejs/src/ingestion/ingestion-consumer.ts
+index 599e139c119..33132b71f85 100644
+--- a/nodejs/src/ingestion/ingestion-consumer.ts
++++ b/nodejs/src/ingestion/ingestion-consumer.ts
+@@ -15,6 +15,7 @@ import {
+     PluginsServerConfig,
+ } from '../types'
+ import { EventIngestionRestrictionManager } from '../utils/event-ingestion-restrictions'
++import { EventSchemaEnforcementManager } from '../utils/event-schema-enforcement-manager'
+ import { logger } from '../utils/logger'
+ import { PromiseScheduler } from '../utils/promise-scheduler'
+ import { BatchWritingGroupStore } from '../worker/ingestion/groups/batch-writing-group-store'
+@@ -62,6 +63,8 @@ export type IngestionConsumerHub = HogTransformerHub &
+         | 'personRepository'
+         // GroupTypeManager
+         | 'groupTypeManager'
++        // EventSchemaEnforcementManager
++        | 'postgres'
+     >
+ 
+ const latestOffsetTimestampGauge = new Gauge({
+@@ -90,6 +93,7 @@ export class IngestionConsumer {
+     private personsStore: PersonsStore
+     public groupStore: BatchWritingGroupStore
+     private eventIngestionRestrictionManager: EventIngestionRestrictionManager
++    private eventSchemaEnforcementManager: EventSchemaEnforcementManager
+     public readonly promiseScheduler = new PromiseScheduler()
+ 
+     private joinedPipeline!: BatchPipeline<
+@@ -129,6 +133,7 @@ export class IngestionConsumer {
+             staticSkipPersonTokens: this.tokenDistinctIdsToSkipPersons,
+             staticForceOverflowTokens: this.tokenDistinctIdsToForceOverflow,
+         })
++        this.eventSchemaEnforcementManager = new EventSchemaEnforcementManager(hub.postgres)
+ 
+         this.name = `ingestion-consumer-${this.topic}`
+ 
+@@ -207,6 +212,8 @@ export class IngestionConsumer {
+             groupStore: this.groupStore,
+             hogTransformer: this.hogTransformer,
+             eventIngestionRestrictionManager: this.eventIngestionRestrictionManager,
++            eventSchemaEnforcementManager: this.eventSchemaEnforcementManager,
++            eventSchemaEnforcementEnabled: this.hub.EVENT_SCHEMA_ENFORCEMENT_ENABLED,
+             overflowEnabled: this.overflowEnabled(),
+             overflowTopic: this.overflowTopic || '',
+             dlqTopic: this.dlqTopic,
+diff --git a/nodejs/src/types.ts b/nodejs/src/types.ts
+index 33005bce9cd..9a4611b2728 100644
+--- a/nodejs/src/types.ts
++++ b/nodejs/src/types.ts
+@@ -279,6 +279,7 @@ export type IngestionConsumerConfig = {
+ 
+     // Pipeline step config
+     SKIP_UPDATE_EVENT_AND_PROPERTIES_STEP: boolean
++    EVENT_SCHEMA_ENFORCEMENT_ENABLED: boolean
+     PIPELINE_STEP_STALLED_LOG_TIMEOUT: number
+     KAFKA_BATCH_START_LOGGING_ENABLED: boolean
+     TIMESTAMP_COMPARISON_LOGGING_SAMPLE_RATE: number
+@@ -673,6 +674,13 @@ export interface RawOrganization {
+ // NOTE: We don't need to list all options here - only the ones we use
+ export type OrganizationAvailableFeature = 'group_analytics' | 'data_pipelines' | 'zapier'
+ 
++/** Event schema with enforcement enabled. Only includes required properties since optional properties are not validated. */
++export interface EventSchemaEnforcement {
++    event_name: string
++    /** Map from property name to accepted types (multiple types when property groups disagree) */
++    required_properties: Map<string, string[]>
++}
++
+ /** Usable Team model. */
+ export interface LogsSettings {
+     capture_console_logs?: boolean
+diff --git a/nodejs/src/utils/event-schema-enforcement-manager.ts b/nodejs/src/utils/event-schema-enforcement-manager.ts
+new file mode 100644
+index 00000000000..63d109f8db2
+--- /dev/null
++++ b/nodejs/src/utils/event-schema-enforcement-manager.ts
+@@ -0,0 +1,124 @@
++import { EventSchemaEnforcement } from '../types'
++import { PostgresRouter, PostgresUse } from './db/postgres'
++import { LazyLoader } from './lazy-loader'
++
++/**
++ * Raw row from the database query - one row per property per event.
++ * Each row contains all accepted types for a property (aggregated via array_agg).
++ */
++interface RawSchemaPropertyRow {
++    team_id: number
++    event_name: string
++    property_name: string
++    property_types: string[]
++}
++
++/**
++ * Manages event schema enforcement configuration for teams.
++ *
++ * Fetches schemas for events that have enforcement_mode='reject' on their EventDefinition,
++ * which are validated at ingestion time.
++ */
++/** Map from event_name to schema for O(1) lookups */
++export type EventSchemaMap = Map<string, EventSchemaEnforcement>
++
++export class EventSchemaEnforcementManager {
++    private lazyLoader: LazyLoader<EventSchemaMap>
++
++    constructor(private postgres: PostgresRouter) {
++        this.lazyLoader = new LazyLoader({
++            name: 'EventSchemaEnforcementManager',
++            refreshAgeMs: 2 * 60 * 1000, // 2 minutes
++            refreshJitterMs: 30 * 1000, // 30 seconds
++            loader: async (teamIds: string[]) => {
++                return await this.fetchSchemas(teamIds)
++            },
++        })
++    }
++
++    /**
++     * Get enforced event schemas for a team as a Map keyed by event_name for O(1) lookups.
++     * Returns an empty Map if no schemas are configured for enforcement.
++     */
++    public async getSchemas(teamId: number): Promise<EventSchemaMap> {
++        return (await this.lazyLoader.get(String(teamId))) ?? new Map()
++    }
++
++    /**
++     * Get enforced event schemas for multiple teams.
++     */
++    public async getSchemasForTeams(teamIds: number[]): Promise<Record<string, EventSchemaMap>> {
++        const results = await this.lazyLoader.getMany(teamIds.map(String))
++        const converted: Record<string, EventSchemaMap> = {}
++        for (const [key, value] of Object.entries(results)) {
++            converted[key] = value ?? new Map()
++        }
++        return converted
++    }
++
++    private async fetchSchemas(teamIds: string[]): Promise<Record<string, EventSchemaMap | null>> {
++        const numericTeamIds = teamIds.map(Number).filter((id) => !isNaN(id) && id > 0)
++
++        if (numericTeamIds.length === 0) {
++            const result: Record<string, EventSchemaMap | null> = {}
++            for (const id of teamIds) {
++                result[id] = null
++            }
++            return result
++        }
++
++        // Collect all distinct types per property across property groups.
++        // When the same property appears in multiple groups with different types,
++        // all types are included — validation accepts if the value matches any.
++        const queryResult = await this.postgres.query<RawSchemaPropertyRow>(
++            PostgresUse.COMMON_READ,
++            `SELECT
++                ed.team_id,
++                ed.name as event_name,
++                p.name as property_name,
++                array_agg(DISTINCT p.property_type ORDER BY p.property_type) as property_types
++            FROM posthog_eventdefinition ed
++            JOIN posthog_eventschema es ON es.event_definition_id = ed.id
++            JOIN posthog_schemapropertygroupproperty p ON p.property_group_id = es.property_group_id
++            WHERE ed.team_id = ANY($1)
++              AND ed.enforcement_mode = 'reject'
++              AND p.is_required = true
++            GROUP BY ed.team_id, ed.name, p.name
++            ORDER BY ed.team_id, ed.name, p.name`,
++            [numericTeamIds],
++            'fetch-enforced-event-schemas'
++        )
++
++        // Aggregate rows into EventSchemaMap structures (Map keyed by event_name)
++        const schemasByTeam = this.aggregateRows(queryResult.rows)
++
++        // Build result with nulls for teams that weren't found
++        const result: Record<string, EventSchemaMap | null> = {}
++        for (const id of teamIds) {
++            result[id] = schemasByTeam[id] ?? null
++        }
++
++        return result
++    }
++
++    private aggregateRows(rows: RawSchemaPropertyRow[]): Record<string, EventSchemaMap> {
++        const result: Record<string, EventSchemaMap> = {}
++
++        for (const row of rows) {
++            const teamId = String(row.team_id)
++            if (!result[teamId]) {
++                result[teamId] = new Map()
++            }
++
++            let schema = result[teamId].get(row.event_name)
++            if (!schema) {
++                schema = { event_name: row.event_name, required_properties: new Map() }
++                result[teamId].set(row.event_name, schema)
++            }
++
++            schema.required_properties.set(row.property_name, row.property_types)
++        }
++
++        return result
++    }
++}
+diff --git a/posthog/api/event_definition.py b/posthog/api/event_definition.py
+index 859bb72cb3b..91666ab7326 100644
+--- a/posthog/api/event_definition.py
++++ b/posthog/api/event_definition.py
+@@ -103,6 +103,7 @@ class EventDefinitionSerializer(TaggedItemSerializerMixin, serializers.ModelSeri
+             "last_seen_at",
+             "last_updated_at",
+             "tags",
++            "enforcement_mode",
+             # Action fields
+             "is_action",
+             "action_id",
+diff --git a/posthog/api/event_schema.py b/posthog/api/event_schema.py
+index 07828c1ba9c..a2a9ce8a6d3 100644
+--- a/posthog/api/event_schema.py
++++ b/posthog/api/event_schema.py
+@@ -54,6 +54,7 @@ class EventSchemaViewSet(
+     TeamAndOrgViewSetMixin,
+     mixins.ListModelMixin,
+     mixins.CreateModelMixin,
++    mixins.UpdateModelMixin,
+     mixins.DestroyModelMixin,
+     viewsets.GenericViewSet,
+ ):

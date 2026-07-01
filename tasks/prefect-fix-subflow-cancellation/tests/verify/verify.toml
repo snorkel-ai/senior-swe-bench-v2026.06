@@ -1,0 +1,3 @@
+[pytest]
+command = "uv run pytest"
+timeout = 600

@@ -1,0 +1,368 @@
+stack_profile = "python-library"
+
+instructions = """
+General environment + contract for every story in this task.
+
+ENVIRONMENT
+- The harbor repo is at /repo/harbor with a uv-managed venv at
+  /repo/harbor/.venv. validation-setup.sh has already run `uv sync`, so the
+  harbor package is installed editable with its full dependency tree plus
+  pytest. Tests can `import harbor...` directly.
+- Run scripts with the repo interpreter `/repo/harbor/.venv/bin/python`
+  (the [settings.pytest].python below already points there).
+- DO NOT MODIFY anything under /repo/harbor. The validation orchestrator
+  zeros the score if the source tree changes between setup and verification.
+
+THE HELPER (test_harness.py — `from test_harness import populate, snapshot`)
+- `populate(target_dir, manifest) -> Path` materializes a directory from a
+  manifest dict: `manifest["files"]` is a list of ROOT file names to create,
+  and `manifest["subdirs"]` maps subdirectory names to lists of file names
+  to create inside them. File contents are irrelevant — only which paths
+  exist matters.
+- `snapshot(target_dir) -> {"root_files": sorted[str], "subdirs": sorted[str]}`
+  reads back the sorted names of regular files in the ROOT and the sorted
+  names of immediate subdirectories. NOTE: a MISSING directory reads back as
+  two empty lists, so `snapshot` alone cannot tell "deleted" from "empty" —
+  use `os.path.isdir(...)` when a story must assert the directory still exists.
+- The harness applies NO retention itself and imports NO harbor symbol. YOU
+  write the steps that drive the solution's behavior (see below).
+
+WHAT YOU ARE TESTING (observable contract — discover the entry points from source)
+- This task adds a launch-time agent-file *retention policy* with three
+  settings, selectable on the run launcher CLI. The agent CHOSE the option
+  name and the three value tokens; they are NOT fixed by this task, so do not
+  assume any particular spelling — DISCOVER them from the solution (below).
+  The discriminating, implementation-independent observable is WHICH files
+  survive in the local agent directory after a policy is applied:
+    * keep-everything   -> nothing is removed (every root file and every
+                           subdirectory survives unchanged); this is the
+                           default in effect when the option is omitted.
+    * trajectories-only -> only the trajectory files that trace export
+                           consumes survive, and ONLY in the root; every
+                           non-trajectory root file and every subdirectory
+                           is removed entirely.
+    * keep-none         -> no agent files survive; the agent directory ends
+                           up empty (but still PRESENT, not deleted).
+
+DISCOVERING THE CLI CONTROL (read the solution; do not assume names)
+- Read the run launcher in the solution source to find the launch-time
+  option that controls agent-file retention and the THREE value tokens it
+  accepts, and how a chosen token maps onto the trial-side environment
+  configuration (the enum / field the launcher writes). The run launcher is
+  the pre-existing `start` command, registered as `harbor run`
+  (`harbor.cli.main.app`); read how the new option is declared and propagated
+  (e.g. in `harbor/cli/jobs.py`) and the trial-side config model it writes to.
+- Example (ILLUSTRATIVE ONLY — NOT the required names; a valid solution may
+  differ): a solution might expose
+      harbor run --agent-file-retention trajectories_only ...
+  backed by a config field that takes one of three tokens. Read the ACTUAL
+  option string and the actual three tokens from the solution and use those;
+  if no such option exists on the run launcher, the contract is unmet and the
+  story must fail.
+- You may exercise the CLI SAFELY via Typer's CliRunner WITHOUT launching a
+  real job: `--help` short-circuits, and an out-of-set choice is rejected
+  during parameter parsing BEFORE the command body runs. Do NOT invoke the
+  option with a VALID value — that proceeds to execute a real job (needs
+  Docker) and will hang or fail. Example skeleton (adapt the discovered
+  option string `<opt>`):
+      from typer.testing import CliRunner
+      from typer.main import get_command
+      from harbor.cli.main import app
+      r = CliRunner().invoke(app, ["run", "--help"], env={"COLUMNS": "1000", "TERM": "dumb"})
+      # r.exit_code == 0 and the discovered option is advertised in r.output
+      run_cmd = get_command(app).commands["run"]
+      param = next(p for p in run_cmd.params if "<opt>" in getattr(p, "opts", []))
+      choices = set(getattr(param.type, "choices", []) or [])   # the three tokens
+      bad = CliRunner().invoke(app, ["run", "<opt>", "definitely-not-a-policy"])
+      # bad.exit_code != 0 and the value is rejected as an invalid choice
+
+AUTHORITATIVE TRAJECTORY-FILE DEFINITION (for the trajectories-only policy)
+- The authoritative definition of a "trajectory file" is the set of names
+  that `harbor/utils/traces_utils.py` discovers in the ROOT of the agent
+  dir: the base `trajectory.json`, numbered continuations
+  `trajectory.cont-<n>.json`, and the three summarization variants
+  `trajectory.summarization-<n>-(summary|questions|answers).json`. Names
+  that merely look similar (e.g. `trajectory.txt`, `trajectory.cont-x.json`
+  with a non-numeric index, `trajectoryjson.json`) are NOT trajectory files
+  and must be removed under trajectories-only. Read `traces_utils.py` to
+  confirm the exact patterns before asserting; the expected file SETS in the
+  stories are fixed by those patterns.
+
+HOW TO DRIVE RETENTION ON A LOCAL DIRECTORY (discover the seam from source)
+- Read the solution to find where a retention policy is applied to a LOCAL
+  agent directory. For environments that mount their logs locally (the
+  default Docker case), the files already sit in the local trial directory,
+  so the policy is applied by an in-place prune during trial finalization —
+  this local prune is the simplest seam to drive over a temp directory. (A
+  solution may instead/also filter during the remote download path; if so,
+  the same file-set rules apply to the resulting local dir.)
+- Drive whatever local-directory retention routine the solution exposes,
+  pointed at a directory YOU populated with `populate(...)`, once per policy
+  under test, using the retention value your CLI discovery mapped to that
+  policy (the trial-side config field's value/enum member for the token).
+  The routine may be a standalone function, a method on a class, or inlined
+  in a finalization method:
+    * If it is a plain function taking a directory and a policy, call it.
+    * If it is a method on a class (e.g. the trial), construct a MINIMAL
+      instance with `object.__new__(<Class>)` and set ONLY the attributes the
+      method actually reads (typically: an environment-like object whose
+      "is mounted" property is True; a config object whose environment-side
+      retention field equals the policy under test; a trial-paths-like object
+      whose agent-directory attribute points at your temp dir; and a logger,
+      e.g. `logging.getLogger("validation")`). Then call the method.
+    * CRITICAL — use PLAIN duck-typed stand-ins for everything the method
+      READS; use `object.__new__` ONLY for the class whose method you call. Do
+      NOT construct the real harbor config models (e.g. `EnvironmentConfig`,
+      `TrialPaths`): most are Pydantic `BaseModel`s, and
+      `object.__new__(SomeBaseModel)` + `setattr` does NOT reliably bind the
+      field (Pydantic v2 routes attribute access through its own machinery),
+      so a retention value set that way can read back as the field's DEFAULT —
+      silently making a non-default policy (keep-nothing / trajectories-only)
+      behave like keep-everything and failing the assertion. Instead define
+      tiny local classes (or `types.SimpleNamespace`) exposing exactly the
+      attributes read, e.g.:
+        class _Env:                 # read off trial._environment
+            is_mounted = True
+        class _EnvCfg:              # read off config.environment
+            def __init__(self, r): self.agent_file_retention = r
+        class _Cfg:
+            def __init__(self, r): self.environment = _EnvCfg(r)
+        class _Paths:               # read off trial._trial_paths
+            def __init__(self, p): self.agent_dir = Path(p)
+        trial = object.__new__(Trial)
+        trial._environment = _Env()
+        trial.config = _Cfg(<discovered enum member for this policy>)
+        trial._trial_paths = _Paths(tmp_dir)
+        trial._logger = logging.getLogger("validation")
+      Read the method first and adapt which attributes/structure it reads; the
+      invariant is that the retention value is a PLAIN attribute you set (the
+      real enum member you discovered — import the enum, don't pass a string),
+      never a Pydantic field set via `object.__new__`.
+  Set the environment's mounted flag to True so the local prune path runs (do
+  NOT exercise a real remote download here — that needs Docker and is out of
+  scope for the mounted stories; the remote path has its own story below).
+- After driving the policy, call `snapshot(tmp)` and assert on the returned
+  `root_files` / `subdirs` lists.
+
+HOW TO DRIVE THE NON-MOUNTED (REMOTE) DOWNLOAD PATH (one story only)
+- One story exercises the remote/non-mounted seam instead of the mounted
+  local prune. For non-mounted environments the agent files are pulled back
+  from the environment during trial finalization, and the retention policy
+  is applied as part of that pull-back. Read the solution to find where
+  finalization decides whether to download and how the policy narrows what
+  lands locally.
+- The robust, implementation-agnostic seam is the PRE-EXISTING trial
+  finalization method that downloads agent logs for non-mounted
+  environments (the one that early-returns when the environment reports it
+  is mounted, and otherwise pulls the agent directory back). Every valid
+  solution wires the retention policy into that method. Drive it like the
+  mounted stories drive the local-prune method, but with the mounted flag
+  set to FALSE so the download branch runs:
+    * Define a minimal non-mounted environment by subclassing the abstract
+      environment base class. Implement its abstract members minimally and
+      make its "is mounted" property return False. Implement its
+      directory-download method so that, given a source path and a local
+      target path, it materializes the SAME files locally that a real
+      remote pull would produce — i.e. copy a directory YOU populated with
+      `populate(...)` (the simulated remote agent dir) into the target
+      path. This stands in for the wire transfer; the solution's policy
+      logic still decides what survives.
+    * Construct a MINIMAL trial with `object.__new__(<TrialClass>)` and set
+      ONLY the attributes the finalization-download method reads: the
+      environment instance above; the readiness/already-downloaded flags it
+      checks (so the download branch is taken — environment "ready" True,
+      "already downloaded" False); a config whose environment-side
+      retention field equals the trajectories-only token; and a logger
+      (`logging.getLogger("validation")`). Then `await` the
+      finalization-download method, passing the simulated remote source path
+      and a fresh local target path.
+    * The method is async, so define your test function as
+      `async def test_...(inputs, expected)` — pytest-asyncio (auto mode) is
+      enabled in the repo venv and will await it.
+  After driving the download, call `snapshot(target)` on the LOCAL target
+  directory and assert on `root_files` / `subdirs`.
+
+INPUT USAGE
+- Each story's `inputs` provides `manifest_json`: a JSON string encoding the
+  manifest dict described above. Parse it with
+  `manifest = json.loads(inputs["manifest_json"])` and pass it to
+  `populate(...)`.
+
+TEST AUTHORING CONVENTION
+- Each story's procedure defines exactly ONE pytest test function that takes
+  `inputs` and `expected` as fixture arguments (the driver parametrizes them
+  from the story's test cases).
+- Always populate a FRESH temp directory (e.g. `tempfile.mkdtemp()`) for each
+  policy you drive, so policies do not interfere.
+- Compare snapshot lists directly against the expected lists (both are
+  already sorted). Run only the assertions described in the procedure — do
+  not add extra exploratory assertions that may differ across valid
+  implementations.
+"""
+
+[settings]
+va_max_turns = 60
+va_timeout_sec = 1500
+script_timeout_sec = 600
+
+[settings.pytest]
+python = "/repo/harbor/.venv/bin/python"
+
+
+[[story]]
+id = "trajectories_only_pruning"
+driver = "pytest"
+description = """
+When a user opts to keep only trajectory files, the agent directory is
+pruned down to exactly the trajectory files in its root.
+"""
+procedure = """
+- Import `json`, `tempfile`, and `from test_harness import populate, snapshot`.
+- FIRST, confirm the launcher contract (see "DISCOVERING THE CLI CONTROL").
+  Discover the run-launcher retention option from the solution source and:
+    * assert `run --help` exits 0 and advertises the discovered option;
+    * assert the option accepts EXACTLY three tokens (its discovered choice
+      set has three members), one per retention policy; and
+    * assert an out-of-set value (e.g. `definitely-not-a-policy`) is rejected
+      as an invalid choice (non-zero exit), NOT merely an unknown option.
+  If the run launcher exposes no such retention option, the contract is unmet
+  — fail the test here.
+- Parse `manifest = json.loads(inputs["manifest_json"])`.
+- Create a fresh temp directory and call `populate(tmp, manifest)`.
+- Drive the solution's trajectories-only retention over `tmp` (see "HOW TO
+  DRIVE RETENTION ON A LOCAL DIRECTORY": mounted flag True, retention field
+  set to the trajectories-only token you discovered).
+- Call `snap = snapshot(tmp)`.
+- EXPECTED: `snap["root_files"]` equals `expected["root_files"]` (only the
+  trace-export trajectory files that were regular files in the root remain,
+  sorted; non-trajectory and look-alike root files are gone).
+- EXPECTED: `snap["subdirs"]` equals `expected["subdirs"]` (no subdirectory
+  remains, regardless of its name or contents).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+manifest_json = '{"files": ["trajectory.json", "trajectory.cont-1.json", "trajectory.summarization-0-summary.json", "trajectory.summarization-0-questions.json", "trajectory.summarization-0-answers.json", "agent.log", "result.json", "stdout.txt"], "subdirs": {"nested": ["foo.json"], "logs": ["debug.txt"]}}'
+[story.test_case.expected]
+root_files = ["trajectory.cont-1.json", "trajectory.json", "trajectory.summarization-0-answers.json", "trajectory.summarization-0-questions.json", "trajectory.summarization-0-summary.json"]
+subdirs = []
+
+[[story.test_case]]
+[story.test_case.inputs]
+manifest_json = '{"files": ["trajectory.json", "trajectory.cont-2.json", "trajectory.cont-10.json", "trajectory.summarization-1-summary.json", "trajectory.txt", "trajectory.cont-x.json", "trajectoryjson.json", "notes.md", "metadata.json"], "subdirs": {"artifacts": ["a.json"]}}'
+[story.test_case.expected]
+root_files = ["trajectory.cont-10.json", "trajectory.cont-2.json", "trajectory.json", "trajectory.summarization-1-summary.json"]
+subdirs = []
+
+[[story.test_case]]
+[story.test_case.inputs]
+manifest_json = '{"files": ["trajectory.json", "trajectory.summarization-0-summary.json", "build.log"], "subdirs": {"trajectory.cont-1.json": ["inner.json"], "data": ["trajectory.json"]}}'
+[story.test_case.expected]
+root_files = ["trajectory.json", "trajectory.summarization-0-summary.json"]
+subdirs = []
+
+[[story.test_case]]
+[story.test_case.inputs]
+manifest_json = '{"files": ["agent.log", "result.json", "stdout.txt"], "subdirs": {"nested": ["trajectory.json"]}}'
+[story.test_case.expected]
+root_files = []
+subdirs = []
+
+
+[[story]]
+id = "all_and_none_retention_policies"
+driver = "pytest"
+description = """
+When a user opts for keep-everything policy, everything should work like it
+does today. For keep nothing, the directory should be present but empty.
+"""
+procedure = """
+- Import `json`, `os`, `tempfile`, and
+  `from test_harness import populate, snapshot`.
+- Parse `manifest = json.loads(inputs["manifest_json"])`.
+- KEEP-EVERYTHING (current default): create a fresh temp directory, call
+  `populate(tmp_all, manifest)`, then drive the solution's keep-everything
+  retention over `tmp_all` (mounted flag True, retention field set to the
+  keep-everything token — this is the policy in effect when the launch option
+  is omitted, so it must leave the directory untouched).
+- Call `snap_all = snapshot(tmp_all)`.
+- EXPECTED: `snap_all["root_files"]` equals `expected["all_root_files"]` (the
+  full original root file set survives, sorted).
+- EXPECTED: `snap_all["subdirs"]` equals `expected["all_subdirs"]` (the full
+  original subdirectory set survives, sorted).
+- KEEP-NOTHING: create a SECOND fresh temp directory, call
+  `populate(tmp_none, manifest)`, then drive the solution's keep-nothing
+  retention over `tmp_none`.
+- Call `snap_none = snapshot(tmp_none)`.
+- EXPECTED: `snap_none["root_files"]` equals `expected["none_root_files"]`
+  (empty — no files retained).
+- EXPECTED: `snap_none["subdirs"]` equals `expected["none_subdirs"]` (empty).
+- EXPECTED: after keep-nothing, the directory still EXISTS — assert
+  `os.path.isdir(tmp_none)` is true. Keep-nothing must leave an empty but
+  PRESENT directory, not a missing one (a solution that deletes the directory
+  outright violates this).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+manifest_json = '{"files": ["trajectory.json", "agent.log", "result.json"], "subdirs": {"nested": ["foo.json"]}}'
+[story.test_case.expected]
+all_root_files = ["agent.log", "result.json", "trajectory.json"]
+all_subdirs = ["nested"]
+none_root_files = []
+none_subdirs = []
+
+[[story.test_case]]
+[story.test_case.inputs]
+manifest_json = '{"files": ["trajectory.json", "trajectory.cont-1.json", "stdout.txt", "stderr.txt", "cmd.json"], "subdirs": {"logs": ["a.txt"], "tmp": []}}'
+[story.test_case.expected]
+all_root_files = ["cmd.json", "stderr.txt", "stdout.txt", "trajectory.cont-1.json", "trajectory.json"]
+all_subdirs = ["logs", "tmp"]
+none_root_files = []
+none_subdirs = []
+
+
+[[story]]
+id = "trajectories_only_on_remote_download_path"
+driver = "pytest"
+description = """
+The retention options work for remote environments as well.
+"""
+procedure = """
+- Import `json`, `tempfile`, `logging`, and
+  `from test_harness import populate, snapshot`.
+- Parse `manifest = json.loads(inputs["manifest_json"])`.
+- Create a fresh temp directory `remote_src` and call
+  `populate(remote_src, manifest)` — this stands in for the agent directory
+  inside the remote environment.
+- Following the "HOW TO DRIVE THE NON-MOUNTED (REMOTE) DOWNLOAD PATH"
+  guidance in the shared instructions, define a minimal non-mounted
+  environment subclass whose "is mounted" property is False and whose
+  directory-download method copies `remote_src` into the given local target
+  path. Construct a minimal trial that uses this environment, with the
+  environment-side retention field set to the trajectories-only token and the
+  readiness/already-downloaded flags set so the download branch runs.
+- Create a fresh temp directory `local_target` and `await` the trial
+  finalization-download method with the remote source path and
+  `local_target` as the local destination. Define the test function as
+  `async def`.
+- Call `snap = snapshot(local_target)`.
+- EXPECTED: `snap["root_files"]` equals `expected["root_files"]` (only the
+  trace-export trajectory files remain in the local root, sorted).
+- EXPECTED: `snap["subdirs"]` equals `expected["subdirs"]` (no subdirectory
+  remains locally).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+manifest_json = '{"files": ["trajectory.json", "trajectory.cont-1.json", "trajectory.summarization-0-summary.json", "agent.log", "result.json"], "subdirs": {"nested": ["foo.json"], "logs": ["debug.txt"]}}'
+[story.test_case.expected]
+root_files = ["trajectory.cont-1.json", "trajectory.json", "trajectory.summarization-0-summary.json"]
+subdirs = []
+
+[[story.test_case]]
+[story.test_case.inputs]
+manifest_json = '{"files": ["trajectory.json", "trajectory.cont-2.json", "trajectory.txt", "notes.md"], "subdirs": {"artifacts": ["a.json"]}}'
+[story.test_case.expected]
+root_files = ["trajectory.cont-2.json", "trajectory.json"]
+subdirs = []

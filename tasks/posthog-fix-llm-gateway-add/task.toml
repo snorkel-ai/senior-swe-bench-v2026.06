@@ -1,0 +1,252 @@
+version = "1.0"
+
+[environment]
+base_image = "posthog-fix-llm-gateway-add:latest"
+build_timeout_sec = 1500.0
+cpus = 2
+memory = "4G"
+storage = "10G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "posthog"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "posthog"
+
+[metadata]
+family = "posthog-fix-llm-gateway-add"
+variant = "hard"
+segment = "investigate"
+repo = "posthog"
+tags = ["posthog", "python-service"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Twig (PostHog's desktop AI assistant) traces in PostHog project 2 are
+being spammed with thousands of identical $ai_generation events that
+look like noise — same one-character output, same "count" input. The
+LLM-Analytics team measured 74,765 spam events over seven days
+(~$91 of wasted Anthropic spend, 1,131 affected traces, peaks of
+4,653 events/hour, worst single trace 983 spam events). Every spam
+event has the same fingerprint:
+
+  $ai_input  = [{"content": "count", "role": "user"}]
+  $ai_output_tokens = 1
+  $ai_output_choices.choices[0].message.content = "I"
+  $ai_output_choices.choices[0].finish_reason = "length"
+  $ai_input_tokens varies (574 → 15,528) — a tell that the variation
+  is driven by tool definitions of varying size.
+
+The events drown out real LLM usage in the LLM-Analytics product and
+make it impossible to debug actual Twig regressions. Find the root
+cause and fix the gateway so these spam events stop being captured.
+"""
+context = """The PostHog LLM Gateway lives at services/llm-gateway/. It is a
+FastAPI proxy that fronts Anthropic, OpenAI, and Gemini for first-
+party PostHog products (Twig, Wizard, Max). All requests pass through
+litellm; every successful or failed litellm call fires a
+PostHogCallback that captures one $ai_generation event per LLM call.
+That is the canonical instrumentation for LLM Analytics.
+
+Twig is the PostHog desktop app. Its agent loop runs the Claude Agent
+SDK (@anthropic-ai/claude-agent-sdk), which sets ANTHROPIC_BASE_URL
+to gateway.{region}.posthog.com/twig so all Anthropic API calls flow
+through the gateway. Twig session tracing depends on $ai_generation
+events being a faithful record of REAL model calls.
+
+Spam-event fingerprint analysis (above) and the call-stack reconstruction
+in the LLM-Analytics dashboard pin the source to a specific Claude
+Agent SDK code path: countTokensWithFallback. The SDK uses this
+function whenever it needs to estimate the prompt token count for
+context-window planning, which it does once per agent loop iteration
+(and additionally per tool definition reload). Behavior of
+countTokensWithFallback (in @anthropic-ai/claude-agent-sdk) is two-tier:
+  1. PRIMARY strategy: POST /v1/messages/count_tokens. Anthropic exposes
+     a free count_tokens endpoint that returns just an `input_tokens`
+     integer. If the SDK's request to that endpoint succeeds, the SDK
+     reads `input_tokens` from the response and is done.
+  2. FALLBACK strategy: if the primary endpoint returns ANY non-success
+     status (including 404), the SDK falls back to making a real
+     completion call with `max_tokens=1` and
+     `messages=[{"role":"user", "content":"count"}]`, then reads
+     `response.usage.input_tokens`. This is the source of the spam
+     events: the fallback completion goes to /{product}/v1/messages on
+     the gateway → litellm → PostHogCallback → $ai_generation event
+     captured. Tool definitions inflate the input token count, which
+     is why the spam-event $ai_input_tokens varies while
+     $ai_output_tokens is always 1.
+
+The pre-fix gateway has no /v1/messages/count_tokens route at all. The
+SDK's primary strategy gets a 404 every time, so the fallback fires
+on every count attempt — this is the root cause.
+
+Investigation evidence (from the PR body and impact analysis):
+- The spam events have an unusually narrow signature ($ai_output_tokens
+  always 1, output content always "I", finish_reason always "length",
+  ai_product always twig). That's a strong signal these aren't real
+  user messages — they're synthetic.
+- "I" with finish_reason="length" comes from a max_tokens=1 completion;
+  Claude reliably starts almost any response with the token "I".
+- $ai_input_tokens varying from 574 to 15,528 with no $ai_output_tokens
+  variation is consistent with tool definitions being passed as part
+  of the prompt to a count-style call.
+- The Claude Agent SDK is the only Twig component that talks to
+  Anthropic, and its source is publicly auditable (npm package
+  @anthropic-ai/claude-agent-sdk).
+
+Architecture (relevant pieces inside services/llm-gateway/):
+- src/llm_gateway/api/anthropic.py — current /v1/messages and
+  /{product}/v1/messages handlers. Both go through
+  _handle_anthropic_messages which calls litellm.anthropic_messages
+  via handle_llm_request.
+- src/llm_gateway/api/handler.py — the shared handle_llm_request
+  pipeline. Calls litellm, fires Prometheus metrics, propagates
+  HTTPException. Critically, every successful call fires
+  PostHogCallback via litellm's callback chain (set up in
+  src/llm_gateway/callbacks/__init__.py:init_callbacks).
+- src/llm_gateway/callbacks/posthog.py — the PostHogCallback that
+  captures $ai_generation events on every successful litellm call.
+- src/llm_gateway/api/routes.py — the top-level router that includes
+  anthropic_router, openai_router, models_router. Any new route must
+  end up registered through this aggregator.
+- src/llm_gateway/products/config.py — validate_product for
+  /{product}/* paths. Twig, Wizard, claude-code, etc. live here.
+- src/llm_gateway/dependencies.py — RateLimitedUser is the standard
+  auth+rate-limit dep used by every existing route.
+- src/llm_gateway/models/anthropic.py — AnthropicMessagesRequest
+  pydantic model for the existing /v1/messages route.
+- tests/test_anthropic.py — pre-existing tests for /v1/messages,
+  including the canonical
+  @patch("llm_gateway.api.anthropic.litellm.anthropic_messages") mock
+  pattern. tests/conftest.py exposes authenticated_client (mocked DB
+  pool, valid `Bearer phx_test_key` auth).
+
+Red herrings agents commonly latch onto:
+  1. Filtering $ai_generation events at the PostHogCallback level
+     (e.g., "skip events with $ai_output_tokens == 1"). This breaks
+     legitimate short completions and doesn't address the wasted
+     Anthropic spend.
+  2. Adding rate-limiting to /{product}/v1/messages for
+     `ai_product=twig`. The gateway already has user_cost_limits for
+     Twig — they're not triggering because each individual call is
+     cheap. Plus, rate-limiting blocks LEGITIMATE Twig traffic too.
+  3. Updating the PostHogCallback to dedupe events with identical
+     payloads. Tool-definition-driven $ai_input_tokens varies per call
+     so the payloads aren't actually identical; dedup wouldn't catch
+     them.
+  4. Trying to "fix" the Claude Agent SDK. It is third-party code; the
+     fix has to land in the gateway.
+
+Reproduction surface for the verifier:
+- The bug reproduces deterministically with no live Anthropic / network
+  access: the pre-existing authenticated_client TestClient fixture
+  (services/llm-gateway/tests/conftest.py) runs the FastAPI app in-
+  process. Without the fix, POST /v1/messages/count_tokens returns
+  404. With a half-fix that re-uses _handle_anthropic_messages,
+  litellm.anthropic_messages is called (catchable by patching it).
+  With a real fix, the route exists and never invokes litellm.
+"""
+solution = """Canonical fix (reference example):
+
+Add a new pair of routes at /v1/messages/count_tokens and
+/{product}/v1/messages/count_tokens. Both must:
+
+  1. Be registered on the gateway's existing FastAPI app (typically by
+     adding handlers to llm_gateway.api.anthropic.anthropic_router, but
+     any router that ends up included in llm_gateway.api.routes.router
+     is fine).
+  2. Validate the request body shape (model + messages required, extra
+     fields allowed for tool-definition forwarding).
+  3. Authenticate via the existing RateLimitedUser dependency (matches
+     the pre-existing /v1/messages contract).
+  4. Validate product alias for the /{product}/ variant via
+     validate_product().
+  5. NOT invoke litellm.anthropic_messages, litellm.acompletion, or any
+     other litellm function that fires the callback chain. Instead,
+     proxy the request directly to
+     https://api.anthropic.com/v1/messages/count_tokens via raw HTTP
+     (httpx, aiohttp, urllib, or the anthropic SDK's own client) using
+     settings.anthropic_api_key for auth.
+  6. Return 503 if the gateway has no Anthropic API key configured (or
+     any equivalent error shape that doesn't pretend to succeed).
+  7. Forward Anthropic's error responses unchanged (status code +
+     response body) so the SDK gets a real error rather than the
+     gateway's 502.
+
+Alternative valid fixes (the verifier accepts all):
+
+  1. Use httpx.AsyncClient (the simplest, since httpx>=0.28.0 is already
+     in the gateway's pyproject dependencies).
+  2. Use aiohttp.ClientSession or another async HTTP client.
+  3. Use the official Anthropic Python SDK (`anthropic` is in the dev
+     group, so the wheel is available, but a real prod fix may want to
+     move it to runtime deps).
+  4. Place the handler in src/llm_gateway/api/anthropic.py (alongside
+     the existing /v1/messages handler) OR in a new module
+     src/llm_gateway/api/anthropic_count_tokens.py with its own router.
+  5. Name the request model AnthropicCountTokensRequest,
+     CountTokensRequest, MessagesCountTokensBody, etc.
+
+Non-optimal "fixes" the verifier rejects:
+
+  - Re-using _handle_anthropic_messages with max_tokens=1 (or any
+    litellm-routed shape). This still fires PostHogCallback → still
+    spams $ai_generation events. The verifier's discriminator
+    `count_tokens_does_not_invoke_litellm` patches
+    litellm.anthropic_messages and asserts not_called.
+  - Returning a hardcoded {"input_tokens": 0} (or any constant). The
+    Claude Agent SDK uses the count to plan context windows; a fake
+    count would cause real prompt-overflow errors. The LLM-judge rubric
+    flags this.
+  - Adding a route that returns a 200 with an empty body. The SDK
+    reads response.json()["input_tokens"]; an empty body would crash
+    the SDK client.
+  - Filtering at the PostHogCallback level. The verifier's
+    discriminator doesn't directly catch this, but the LLM-judge
+    rubric does — and the agent has access to the spam-event
+    fingerprint from the symptom description, so the litellm/proxy
+    split is the only fix that actually addresses the wasted Anthropic
+    spend.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["python-service"]
+runtime_dependence = "runtime-essential"
+skills = ["fault-localization", "cross-service-reasoning", "framework-fluency", "logic-fix", "log-interpretation", "codebase-exploration", "dependency-research"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 90
+files = 2
+hunks = 3
+scope = "broad"
+
+[metadata.origin]
+repo = "PostHog/posthog"
+pr_numbers = [49099]
+base_commit = "423e9cf5e34736e945e06b1dfd1f87d156126089"
+base_commit_date = "2026-02-25"
+merged_at = "2026-02-27"
+
+
+
+

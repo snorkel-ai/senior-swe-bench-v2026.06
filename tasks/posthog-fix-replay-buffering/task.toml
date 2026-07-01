@@ -1,0 +1,258 @@
+version = "1.0"
+
+[environment]
+base_image = "posthog-fix-replay-buffering:latest"
+build_timeout_sec = 1500.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1800.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "posthog"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "posthog"
+
+[metadata]
+family = "posthog-fix-replay-buffering"
+variant = "hard"
+segment = "investigate"
+repo = "posthog"
+tags = ["posthog", "typescript-frontend"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Customer-support is reporting that PostHog session replays sometimes get
+stuck on the "Buffering..." spinner forever and never start playing.
+The reproduction is a recording URL with an out-of-bounds `?t=<seconds>`
+parameter — typically a URL that someone shared after exporting the
+recording, where the timestamp lands past the end of the recording's
+playable range. The fix in #53686 (a one-character `>=` → `>` change) was
+shipped, monitored, and clearly didn't cover all the cases: the "stuck
+buffering" still reproduces on the same URL shape.
+
+Two follow-up symptoms are observed:
+1. On initial load with a past-end `?t=` URL, the player never leaves
+   BUFFER state. The spinner sits forever and the rrweb player is never
+   created.
+2. Even after the page has loaded once, clicking "back to start" can
+   leave the player stuck buffering at the start of the recording —
+   which suggests something gets memoised at "still buffering" when the
+   underlying state has actually moved on.
+
+The replay player team needs a fix that fully resolves both symptoms.
+"""
+context = """The session-replay player runs entirely in the browser. The pre-fix
+codebase is the one shipped with #53686 already merged — that fix
+exists, but the buffering-stuck symptom still reproduces.
+
+Architecture (relevant pieces):
+- `common/replay-shared/src/snapshot-store/SnapshotStore.ts` — the data
+  store that holds the timestamp ranges of each blob source, plus
+  whether each source has been loaded. Public API includes
+  `getSourceIndexForTimestamp(ts)`, `canPlayAt(ts)`,
+  `findNearestFullSnapshot(ts)`. Lives outside Kea — mutations don't
+  reach selectors automatically.
+- `frontend/src/scenes/session-recordings/player/snapshot-store/LoadingScheduler.ts`
+  — three-mode state machine (`buffer_ahead`, `seek`, `load_all`). Picks
+  which source-blob batch to fetch next. Also lives outside Kea.
+- `frontend/src/scenes/session-recordings/player/snapshotDataLogic.tsx`
+  — the Kea logic that connects the store + scheduler to the player.
+  Owns `cache.store`, `cache.scheduler`, the `setTargetTimestamp`
+  listener (decides between seek and buffer_ahead), the
+  `loadNextSnapshotSource` listener (drives the scheduler), and the
+  `isWaitingForPlayableFullSnapshot` selector (the player consults
+  this to decide whether to keep buffering).
+- `frontend/src/scenes/session-recordings/player/sessionRecordingPlayerLogic.ts`
+  — the top-level player Kea logic. Reads `isWaitingForPlayableFullSnapshot`
+  inside `checkBufferingCompleted` to decide whether to leave BUFFER
+  state. `syncSnapshotsWithPlayer` calls `checkBufferingCompleted` on
+  every snapshot mutation.
+- `frontend/src/scenes/session-recordings/player/utils/segment-kind-conversion.ts`
+  — converts segment kinds (buffer ↔ gap) based on whether the underlying
+  store has those sources loaded.
+
+Reactivity boundary (the load-bearing fact):
+- `cache.store` and `cache.scheduler` are plain objects living in the
+  Kea logic's `cache`. Their internal mutations are invisible to Kea
+  selectors. The codebase's existing pattern is the `storeUpdated`
+  action + `storeUpdateCount` reducer + `storeVersion` selector: any
+  listener that mutates the store dispatches `storeUpdated()` so
+  selectors that read store/scheduler state re-evaluate.
+- The PR #53686 attempt focused on the `>=` → `>` end-clamp inside
+  `seekToTimestamp` in `sessionRecordingPlayerLogic.ts`. That helped
+  one half of the symptom (the player stopping at exactly `end` and
+  never starting). It is intentionally NOT reverted by the new fix —
+  it remains correct for what it covers.
+
+Investigation evidence available:
+- `frontend/src/scenes/session-recordings/player/snapshotDataLogic.store.test.ts`
+  shows how the team tests the store/scheduler interaction in jest:
+  mount `snapshotDataLogic`, drive `setTargetTimestamp`, observe
+  `isWaitingForPlayableFullSnapshot`. These existing test patterns are
+  the right surface for the new regression tests.
+- `__mocks__/test-setup.ts` exports `setupSessionRecordingTest` which
+  wires `useMocks` + `initKeaTests` + a default snapshot-source mock.
+  That harness is reused by every existing test in the dir and is the
+  recommended starting point for any new test.
+- The blob-shape that reproduces in production has a trailing
+  "heartbeat" blob (one rrweb event, no FullSnapshot, after a long
+  inactivity gap). When the agent seeks to a timestamp past this
+  blob's range, the scheduler's anchor lands on that heartbeat, and
+  `canPlayAt` is forever false because no FullSnapshot precedes it.
+
+Red herrings agents commonly latch onto:
+1. Reverting #53686 or fiddling with the end-clamp in
+   `seekToTimestamp`. That's not where the new symptom comes from —
+   the new symptom triggers BEFORE the end-clamp ever runs.
+2. Adding a timeout that forces the player out of BUFFER after N seconds.
+   This is a band-aid: it masks the missing reactivity signal but
+   doesn't fix the underlying memoisation/empty-store issues, and it
+   regresses real long-buffer scenarios.
+3. Touching `convertSegmentKinds` first. Segment-kind conversion has
+   the same null-handling shape but is downstream of the actual bug.
+4. Mocking the rrweb decompression worker harder. The bug is real
+   even with mock data — it's not about decoding.
+
+Reproduction surface for the verifier:
+- The bugs reproduce reliably under jest using `setupSessionRecordingTest`
+  + `snapshotDataLogic`. No real recording data is needed.
+- The two distinct trigger paths are: (a) `setTargetTimestamp` against
+  an empty store (sources not yet loaded — initial-load race), and
+  (b) `LoadingScheduler.getNextBatch` silently exiting `seek` mode
+  during step 5 (backward-search exhausted) with no store mutation.
+"""
+solution = """Canonical fix (oracle):
+
+There are two underlying defects that interact to produce the stuck-
+buffer symptom. Both must be fixed.
+
+DEFECT A — empty-store sentinel ambiguity (data-layer bug):
+- `SnapshotStore.getSourceIndexForTimestamp` returns `0` when the store
+  has no sources at all. That `0` is indistinguishable from the valid
+  result "the timestamp falls in source 0".
+- Inside `setTargetTimestamp`, the optimisation
+  `if (targetIndex === 0 && currentMode.kind === 'buffer_ahead') return`
+  trips on the empty-store case and skips `scheduler.seekTo`. The
+  scheduler stays in `buffer_ahead`, anchors on the eventual trailing
+  heartbeat blob, and the player never enters seek mode.
+- Oracle changes `getSourceIndexForTimestamp`'s return type to
+  `number | null` and returns `null` for the empty-store case.
+  Callers (`canPlayAt`, `LoadingScheduler.getSeekBatch`,
+  `LoadingScheduler.getBufferAheadBatch`, `setTargetTimestamp`,
+  `convertSegmentKinds`) handle `null` explicitly. The
+  empty-store branch then naturally falls through to
+  `scheduler.seekTo` and the seek-flow runs as intended.
+
+DEFECT B — selector memoisation across pure-mode transitions (reactivity
+bug):
+- `LoadingScheduler.getSeekBatch` step 5 (backward-search exhausted) and
+  step 2 (`canPlayAt` becomes true mid-batch) silently flip
+  `cache.scheduler.currentMode` from `seek` to `buffer_ahead` without
+  mutating `cache.store` and without any Kea action.
+- The pre-fix `isWaitingForPlayableFullSnapshot` selector depends on
+  `storeVersion`, which only bumps when store data changes. A pure-mode
+  transition leaves `storeVersion` unchanged, so the selector remains
+  memoised at its old value (`true`). The next call to
+  `seekToTimestamp` reads the stale `true`, takes the buffer branch,
+  and the player is stuck again.
+- Oracle dispatches `storeUpdated()` from within `loadNextSnapshotSource`
+  whenever `getNextBatch` flips out of `seek` mode, AND switches the
+  `isWaitingForPlayableFullSnapshot` selector to depend on
+  `storeUpdateCount` (the action counter that bumps on every
+  `storeUpdated`) instead of `storeVersion` (which only tracks data
+  mutations).
+- Oracle also dispatches `storeUpdated()` from `setTargetTimestamp`
+  after the explicit `cache.scheduler.seekTo(...)` call, since that
+  also mutates scheduler state outside Kea.
+- A subscription on `isWaitingForPlayableFullSnapshot` in
+  `sessionRecordingPlayerLogic.ts` calls `checkBufferingCompleted()`
+  on `true → false` transitions — a safety net for players already
+  parked in BUFFER state when the scheduler gives up on seek without
+  delivering new snapshots.
+
+Both halves are independently necessary and the symptom is masked
+unless both are fixed.
+
+Alternative valid fixes (the verifier accepts any combination that
+makes the observable behaviour correct):
+
+1. Empty-store handling can live in the data layer
+   (`getSourceIndexForTimestamp` returns null) OR at the call site
+   (`setTargetTimestamp` checks `cache.store.sourceCount === 0` and
+   skips the optimisation). Either fully solves Defect A. Mixing
+   strategies across call sites is also fine.
+2. Defect B's reactivity wiring can be done by:
+   - Switching the selector dependency to `storeUpdateCount` and
+     dispatching `storeUpdated()` in the listeners that mutate
+     scheduler state (oracle approach), OR
+   - Making the selector recompute on every action instead of
+     memoising (e.g., depending on a non-memoised input, or removing
+     the selector caching), OR
+   - Moving `currentMode` into Kea state so it bumps storeVersion
+     directly. This is a heavier refactor but valid.
+3. The subscription safety net in `sessionRecordingPlayerLogic.ts`
+   can be omitted if the agent's selector-reactivity fix is strong
+   enough that the safety net isn't needed (it covers the case
+   where the player is already in BUFFER when the scheduler gives
+   up). The verifier doesn't directly require the subscription —
+   it requires that the observable buffering state recovers.
+
+Non-optimal "fixes" the verifier rejects:
+
+- Reverting #53686 or moving the end-clamp around in
+  `seekToTimestamp`. Doesn't address either defect; the verifier
+  exercises the seek-on-empty-store and silent-clear paths
+  directly.
+- Forcing `BUFFER → PLAY` after a wall-clock timeout. The verifier
+  asserts on `isWaitingForPlayableFullSnapshot` immediately after
+  the relevant action chain, before any timeout could fire.
+- Fixing `convertSegmentKinds` only. That's a downstream symptom
+  surface; the upstream reactivity break still leaves the player
+  stuck.
+- Fixing only Defect A (empty-store) — the silent-clear test fails.
+- Fixing only Defect B (selector reactivity) — the empty-store test
+  fails because the optimisation still trips.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["typescript-frontend"]
+runtime_dependence = "runtime-helpful"
+skills = ["state-management", "framework-fluency", "fault-localization", "logic-fix", "codebase-exploration", "test-execution"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 109
+files = 9
+hunks = 17
+scope = "broad"
+
+[metadata.origin]
+repo = "PostHog/posthog"
+pr_numbers = [53893]
+base_commit = "feabc5c164f0d16b4a9fc72b1a7055cdb606af8d"
+base_commit_date = "2026-04-09"
+merged_at = "2026-04-10"
+
+
+
+

@@ -1,0 +1,217 @@
+version = "1.0"
+
+[environment]
+base_image = "prefect-feat-dbt-per-node-hardening:latest"
+build_timeout_sec = 1200.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1200.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "prefect"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "prefect"
+
+[metadata]
+family = "prefect-feat-dbt-per-node-hardening"
+variant = "hard"
+segment = "design"
+repo = "prefect"
+tags = ["prefect", "python-lib"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """PrefectDbtOrchestrator runs a dbt project through Prefect, and its PER_NODE
+execution mode submits every dbt node as its own Prefect task run. Four rough
+edges in that per-node orchestration need hardening, and they all live on the
+same orchestrator surface:
+
+1. Failure escalation. `run_build()` returns a results dict that includes
+   `{"status": "error"}` entries when dbt nodes fail — but the enclosing
+   Prefect flow run still completes *successfully*. A failing dbt build should
+   fail the flow by default, while leaving an escape hatch for callers that
+   want to inspect partial-failure results, and without discarding the
+   post-run summary artifacts.
+
+2. Caching correctness under the immediate test strategy. Per-node cross-run
+   caching already exists. But under the immediate test strategy, a model that
+   has an upstream data test never becomes "cached" on an identical second run
+   — it re-executes forever — because a scheduling-only edge leaks into the
+   model's cache-key derivation.
+
+3. Clean preview output. `plan()` is a dry-run preview, yet dbt's own console
+   logger prints progress noise ("Registered adapter", "Found N models", …) to
+   stdout during the internal selector-resolution and source-freshness calls,
+   polluting anything that wants to print the plan. The console output must be
+   silenced without hiding genuine warnings or errors.
+
+4. Graph edges. In PER_NODE mode the orchestrator already enforces the correct
+   execution order, but it never persists those dependencies onto the task
+   runs, so the flow-run graph renders a wall of disconnected nodes. The real
+   dependency edges should show up in the graph without changing scheduling and
+   without inventing phantom edges.
+"""
+context = """Surface area for the implementation (one integration package):
+- src/integrations/prefect-dbt/prefect_dbt/core/_orchestrator.py — the
+  PrefectDbtOrchestrator class. `run_build()` and `plan()` are the public
+  entry points. PER_NODE execution lives in `_execute_per_node`, which submits
+  each node via `runner.submit(...)`. Per-node caching is configured through a
+  pre-existing `CacheConfig` and the `cache=` constructor kwarg; cache options
+  for a node are assembled in `_build_cache_options_for_node`. The immediate
+  test strategy augments the scheduling DAG via `_augment_immediate_test_edges`.
+- src/integrations/prefect-dbt/prefect_dbt/core/_manifest.py — `resolve_selection`
+  runs `dbt ls` to turn selectors into node ids; this is invoked by `plan()`.
+- src/integrations/prefect-dbt/prefect_dbt/core/_freshness.py —
+  `run_source_freshness` runs `dbt source freshness`, also reachable from the
+  preview path.
+
+Pre-existing, stable interfaces a valid solution leans on:
+- `PrefectDbtOrchestrator.run_build()` / `.plan()` (public methods).
+- The results dict status values `"success"` / `"cached"` / `"error"` /
+  `"skipped"` returned by `run_build()`.
+- `CacheConfig(result_storage=, key_storage=)` plus the `cache=` kwarg.
+- The Prefect graph API: a task run's `task_inputs["wait_for"]` (read via
+  `prefect.client.orchestration.get_client().read_task_runs(...)`) and the
+  `/flow_runs/{id}/graph-v2` endpoint, which derives `parents`/`children`
+  edges from `wait_for` metadata. `wait_for` is the canonical Prefect way to
+  declare a non-data dependency between task runs.
+- ThreadPoolTaskRunner / ProcessPoolTaskRunner for PER_NODE submission.
+
+What a senior implementation gets right that a sloppy one misses:
+- The failure escalation happens AFTER post-execution artifacts are written, so
+  the summary markdown / run_results are still available on a failing run; and
+  the raised error exposes which nodes failed versus were skipped downstream.
+- The opt-out preserves the exact legacy dict (errors + skips) for callers that
+  inspect results rather than relying on exceptions.
+- Cache-key derivation uses the canonical executable-node dependency set, not
+  the augmented scheduling graph, so scheduling-only test edges injected under
+  the immediate strategy do not disable caching for the dependent model.
+- Silencing the console logger does not silence the file logger, and warnings /
+  errors are still re-surfaced (selector mismatches, per-source runtime errors,
+  partial-failure freshness) so a silent no-op is still observable.
+- Persisting upstream dependencies as task-run metadata is a pure metadata
+  operation: by the time a node is submitted its upstreams are already complete,
+  so it does not re-block and eager scheduling is preserved. Non-submitted
+  upstreams (sources) and skipped downstreams never produce phantom edges.
+
+Existing test infrastructure to lean on:
+- tests/core/conftest.py provides `_make_node`, `_make_mock_executor_per_node`,
+  `_make_mock_settings`, `write_manifest`, `write_sql_files`, and manifest
+  fixtures (`linear_manifest_data`, `diamond_manifest_data`).
+- tests/core/test_orchestrator_per_node.py and test_orchestrator_cache.py show
+  the canonical PER_NODE and caching construction patterns
+  (ThreadPoolTaskRunner, mock executor with counted execute_node).
+- tests/core/test_orchestrator_integration.py drives the bundled DuckDB project
+  (tests/dbt_test_project) end-to-end with a real dbtRunner — the model for any
+  console-output assertion via capfd.
+- A session-scoped prefect_test_harness gives `@flow` invocations an ephemeral
+  Prefect server.
+"""
+solution = """The reference example's design (production changes only; tests were stripped
+from the patch):
+
+- _orchestrator.py
+  - Adds `class DbtBuildFailed(RuntimeError)` storing the full `results` dict
+    and exposing `failed_node_ids` / `skipped_node_ids`, with a summary message
+    like "dbt build failed for N node(s): ...".
+  - Adds `raise_on_failure: bool = True` to `__init__` (stored as
+    `_raise_on_failure`). After `_create_artifacts(...)` in `run_build()`,
+    raises `DbtBuildFailed(execution_results)` when `_raise_on_failure` and any
+    node has `status == "error"`. Applies to both PER_WAVE and PER_NODE (the
+    check runs on the final results dict).
+  - Threads `all_executable_nodes` into `_build_cache_options_for_node`. When a
+    canonical executable-node exists for `node.unique_id`, derives `depends_on`
+    from it (no injected test edges) instead of the augmented node's
+    `depends_on`, so cache keys are built correctly for models with injected
+    test edges under IMMEDIATE.
+  - In `_execute_per_node`, tracks `node_futures: dict[str, Any]`; for each
+    submitted node, gathers `upstream_futures = [node_futures[dep] for dep in
+    node.depends_on if dep in node_futures]` and passes `wait_for=
+    upstream_futures or None` to `runner.submit(...)`, then records the new
+    future in `node_futures`. This persists `task_inputs["wait_for"]` so the
+    graph renders edges.
+  - In `run_build()`, forwards `log_level_file = str(settings.log_level.value)`
+    to `resolve_selection(...)` so file logging follows the user level while the
+    console is silenced.
+
+- _manifest.py
+  - `resolve_selection(...)` gains `log_level_file: str = "none"`, adds
+    `--log-level none --log-level-file <log_level_file>` to the `dbt ls` args,
+    and installs a `dbtRunner(callbacks=[_surface_event])` that re-emits
+    WARN/ERROR events to the Python logger (so a "selection criterion does not
+    match any enabled nodes" warning is still visible).
+
+- _freshness.py
+  - `run_source_freshness(...)` adds `--log-level none --log-level-file
+    <settings.log_level.value>` to the `dbt source freshness` args, installs the
+    same WARN/ERROR `_surface_event` callback, surfaces the dbt exception when
+    sources.json is missing, and warns "results ... may be partial" when the run
+    reports failure but still wrote sources.json.
+
+Alternative valid fixes (verifier and stories must accept all):
+- The exception class may be named differently; tests assert that an exception
+  propagates and that it references the failed node id, never the class name.
+- The opt-out kwarg may be named `fail_on_error`, `strict`, `suppress_failures`,
+  etc.; the default-raise behavior is the load-bearing signal, and opt-out
+  discovery is substring-based and skips on miss.
+- The graph-edge tracking structure may differ; the only observable contract is
+  `task_inputs["wait_for"]`, the sole Prefect edge-rendering mechanism.
+- Console silencing may use a different mechanism (`--quiet`, a log-level enum,
+  Python-level stdout suppression); tests check the stdout is clean, not the flag.
+- The canonical dependency derivation may filter test nodes from `depends_on`
+  rather than consulting `all_executable_nodes`; tests check that the dependent
+  model becomes "cached".
+
+Non-optimal fixes that might game verification:
+- Returning the dict but never raising on error. (Story
+  `failure_raises_and_fails_flow` discriminates — base does not raise.)
+- Asserting dbt flag strings instead of clean stdout would over-couple; the
+  story uses real dbt + capfd to stay mechanism-agnostic.
+- Fixing scheduling edges but not cache-key derivation. (Story
+  `immediate_test_edge_model_caches` discriminates — mid stays "success".)
+- Adding edges via a side channel that the graph API cannot read. (Story
+  `per_node_graph_edges_persisted` discriminates — wait_for stays empty.)
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-lib"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "framework-fluency", "interface-design", "fault-localization", "test-execution"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 168
+files = 3
+hunks = 24
+scope = "broad"
+
+[metadata.origin]
+repo = "PrefectHQ/prefect"
+pr_numbers = [21654, 21656, 21653, 21659]
+base_commit = "94da2fa7e90dcabfd64b4e32372bc469fb5a2bdc"
+base_commit_date = "2026-04-22"
+merged_at = "2026-04-22"
+
+
+
+

@@ -1,0 +1,222 @@
+version = "1.0"
+
+[environment]
+base_image = "turborepo-perf-reuse-input-hashes:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "30G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1800.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "turborepo"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "turborepo"
+
+[metadata]
+family = "turborepo-perf-reuse-input-hashes"
+variant = "hard"
+segment = "investigate"
+repo = "turborepo"
+tags = ["turborepo", "rust", "cli"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """A user reports that `turbo run build` against their large monorepo feels
+slower than it should — runs complete correctly, but a noticeable chunk
+of wall-clock is spent before any task even starts executing. They
+profiled with `--profile=trace.json` and shared the warm-cache trace: a
+meaningful slice sits inside file hashing for packages that pin explicit
+`inputs` in `turbo.json`, and there's also some allocator-shaped time
+hanging around the lockfile parser. They want the pre-task work trimmed
+without changing what `turbo` actually does.
+"""
+context = """The PR investigates and addresses two distinct hotspots that show up in a
+warm-cache `turbo run` profile against a moderately large pnpm monorepo:
+
+(1) Redundant hashing of clean tracked files matched by explicit `inputs`.
+`crates/turborepo-scm/src/package_deps.rs::get_package_file_hashes_from_inputs`
+and its `_and_index` sibling for the mixed default+inputs path each walk
+the filesystem to expand glob patterns, then unconditionally feed every
+matched path through `crates/turborepo-scm/src/hash_object.rs::hash_objects`.
+`hash_objects` reads each file's contents and computes the blob OID via
+in-process gix-index streaming. But the workspace already maintains a
+`RepoGitIndex` (`crates/turborepo-scm/src/repo_index.rs`) — populated up
+front from `.git/index` via `gix-index` — that knows the blob OID for
+every clean tracked file. Reading the file contents and recomputing the
+same OID is pure waste for the common case where the matched files are
+clean tracked. Pre-fix, the public `SCM::get_package_file_hashes` already
+takes a `repo_index: Option<&RepoGitIndex>` argument, but the explicit-
+input branches drop it on the floor.
+
+(2) Allocator churn in pnpm lockfile parsing.
+`crates/turborepo-lockfiles/src/pnpm/data.rs::PnpmLockfile::build_dependency_index`
+initializes a fresh `HashMap` and grows it as it iterates over the
+`snapshots` and `packages` maps. `PackageSnapshotV7::dependencies` does
+the same — collects an iterator chain of `dependencies + optional_dependencies`
+into a `HashMap` with default capacity. Both paths know the upper bound
+on size in advance; presizing the HashMaps avoids the double-and-rehash
+growth pattern that shows up in profile traces as allocator-shaped time
+around `parse_lockfile`.
+
+Profiling evidence the agent should reproduce/mirror:
+- Baseline (pre-fix), warm cache: `get_package_file_hashes_from_inputs`
+  ~13ms total, with `hash_objects` ~4.5ms inside it; `parse_lockfile` ~18.6ms.
+- Post-fix: `get_package_file_hashes_from_inputs` ~8-9ms; `hash_objects`
+  no longer in the warm hotspot table at all; `parse_lockfile`
+  ~14.6-16.7ms.
+
+Red herrings the agent will likely investigate first:
+1. The globwalk path itself (`crates/turborepo-globwalk`) — looks
+   expensive in traces because it does the directory walk, but it's
+   O(matched files) and not the bottleneck for the input-hashing case.
+2. `hash_object.rs::hash_file` — looks like the obvious place for a
+   "make hashing faster" fix (e.g., bigger BUF_SIZE, rayon thread
+   tuning), but the real win is to *not call hash_file at all* for files
+   we already know.
+3. `git_ls_tree` / `git_status` subprocess invocation — pre-fix code
+   inside `repo_index.rs` already populates the index from `.git/index`
+   directly via gix-index, so the git subprocess overhead is already
+   eliminated. The remaining waste is on the per-package input path,
+   not in index construction.
+4. The `tracing` instrumentation overhead — looks like a possible
+   wall-clock contributor in `--profile` output, but tracing is near-
+   free when no subscriber is attached.
+5. `pnpm` lockfile YAML parsing (`serde_yaml` / `yaml-rust`) — looks
+   expensive but the parser library itself is fine; the waste is in
+   the post-parse index build, which the HashMap presize addresses.
+
+The shipped image installs the workspace's pinned nightly Rust toolchain
+(`nightly-2026-01-16` per `rust-toolchain.toml`), Node 22 + corepack,
+`protoc 26.x`, `capnp`, `lld`, and pre-warms the cargo registry via
+`cargo fetch`. The first `cargo check`/`cargo test` invocation pays the
+~30s compile cost for `turborepo-scm`'s test target; subsequent runs are
+incremental. `tests/test-setup.sh` pre-warms the test targets for both
+`turborepo-scm` and `turborepo-lockfiles` so the verifier's measurements
+aren't paying compile time.
+"""
+solution = """Canonical fix (the merged PR):
+
+1. `crates/turborepo-scm/src/repo_index.rs`: add a public method on
+   `RepoGitIndex` that takes an iterator of git-root-relative paths and
+   returns `(Vec<(path, OidHash)>, Vec<path>)` — the first vector is
+   paths that are clean tracked (in ls_tree, NOT in status), so the OID
+   can be reused; the second vector is paths that need real hashing
+   (modified, deleted, untracked, or absent from the index). Status
+   entries always win over ls-tree entries — modified tracked files
+   conservatively re-hash instead of reusing stale blob IDs.
+
+2. `crates/turborepo-scm/src/package_deps.rs`: thread `repo_index`
+   through `get_package_file_hashes_from_inputs` (the
+   `!include_default_files` branch — pre-fix this method ignores the
+   public-API's `repo_index` argument). After globwalk produces matched
+   candidate paths, call the new partition method to split candidates
+   into "known OID" and "needs hashing"; insert known OIDs directly into
+   the result, then hand only the residual to `hash_objects`. Apply the
+   same pattern at the two call sites in
+   `get_package_file_hashes_from_inputs_and_index` (the literal-paths
+   branch and the glob-paths branch). Add a small helper to translate
+   git-root-relative paths back to package-relative for insertion into
+   `GitHashes`.
+
+3. `crates/turborepo-lockfiles/src/pnpm/data.rs`: presize two
+   `HashMap`s — the workspace dependency index sized as
+   `snapshots.len() + packages.len()`, and the per-snapshot
+   `dependencies + optional_dependencies` combined map sized as the sum
+   of those two child counts.
+
+Equally valid alternative fixes the verifier accepts:
+- Different name for the partition helper
+  (`split_paths_known_vs_pending`, `resolve_known_oids`,
+  `partition_clean_tracked`, etc.) — the verifier tests through
+  `SCM::get_package_file_hashes` and never references the helper by name.
+- Inlining the partition logic in `package_deps.rs` instead of extracting
+  a helper on `RepoGitIndex` — works identically.
+- Reusing the pre-existing `RepoGitIndex::get_package_hashes` (which
+  returns `(GitHashes, Vec<path>)` for a package prefix) as the starting
+  point and intersecting with the input glob match set — different shape,
+  same behavior.
+- Different pnpm presize formula (e.g. `snapshots.len()` only, or
+  `snapshots.len() * 2`) — the rubric only checks that the HashMap is
+  presized, not the exact formula.
+- Any of the above with non-English identifiers, refactored module
+  placement, or different control flow.
+
+Wrong / non-optimal fixes the verifier and rubric reject:
+- Caching `hash_objects` results across calls — would help on warm
+  second-call but doesn't fix the cold-cache case the PR targets, and
+  introduces cache-invalidation complexity that the existing
+  `RepoGitIndex` already handles.
+- Skipping `hash_objects` for ALL files in the explicit-input match set
+  (no status check) — silently uses stale OIDs for modified files.
+  The correctness regression test (`with_index == without_index` for
+  inputs that mix tracked, untracked, and parent-directory files)
+  catches this.
+- Removing `hash_objects` entirely or replacing it with a stub — breaks
+  the case where the matched files are NOT in the index (untracked,
+  gitignored-but-explicitly-included, etc.). Existing
+  `git_index_regression_tests` (e.g.
+  `test_inputs_explicit_include_finds_gitignored_files`) catch this.
+- Bumping `hash_object.rs::BUF_SIZE` from 64KB or tuning rayon thread
+  counts — produces a marginal speedup but doesn't address the
+  "we already have the answer" insight. The behavioral verifier (which
+  measures bytes read by the process during the hashing call) still
+  fails because the file contents are still being read.
+- Only fixing the `_and_index` path (the `include_default_files=true`
+  branch) and ignoring the explicit-input + no-defaults branch — the
+  common-case explicit-input setup hits the no-defaults branch, and
+  that's the path the behavioral verifier exercises. Partial fix;
+  verifier fails.
+
+Red herrings the agent may chase:
+- The globwalk path itself. It's O(matched files) and not the bottleneck.
+- The hash_objects buffer size and rayon thread count. Tuning these
+  produces a marginal speedup but doesn't address the redundant work.
+- The git subprocess overhead. Pre-fix code already eliminates it via
+  gix-index.
+- `tracing` overhead. Near-free when no subscriber is attached.
+- The pnpm YAML parser. The library is fine; the post-parse index
+  construction is what allocates.
+"""
+
+[metadata.taxonomy]
+task_type = "performance"
+stack = ["rust", "cli"]
+runtime_dependence = "runtime-essential"
+skills = ["codebase-exploration", "fault-localization", "performance-measurement", "performance-optimization", "framework-fluency", "build-tooling", "test-execution"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 137
+files = 3
+hunks = 9
+scope = "broad"
+
+[metadata.origin]
+repo = "vercel/turborepo"
+pr_numbers = [12199]
+base_commit = "9b0c199c06aed93ff40d3282e97247e912d06d1b"
+base_commit_date = "2026-03-08"
+merged_at = "2026-03-08"
+
+
+
+

@@ -1,0 +1,19 @@
+{
+  "files": [
+    "lib/services/matchers.go",
+    "lib/services/local/presence.go",
+    "lib/kube/utils/utils.go",
+    "tool/tsh/common/kube.go"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "tsh_surfaces_scope",
+      "description": "Now that an unscoped user can see several kube clusters that share a name but live in different scopes, `tsh kube ls` must make each cluster's scope visible so the duplicates are distinguishable. Award PASS if the listing exposes the scope across BOTH its text output forms (the default/listing table — and, where the command has them, the verbose and quiet/names-only forms should still let a user tell same-named clusters apart) AND its structured serialization (the JSON/YAML output carries a scope value per cluster). The exact mechanism is an implementation choice and ALL reasonable shapes are acceptable: a dedicated 'Scope' column, the scope appended to or combined with the name, or a separate per-row annotation — do not require any specific column header, field name, or format. Award FAIL only if a user looking at `tsh kube ls` output still cannot tell two same-named clusters in different scopes apart (e.g. scope is dropped entirely from the text table, or absent from the JSON/YAML), or if the scope is surfaced for one output form but silently missing from the structured serialization."
+    },
+    {
+      "name": "tsh_selection_handles_duplicates",
+      "description": "`tsh kube ls` marks the currently-selected cluster (e.g. with a '*'). Once a cluster name can be ambiguous — more than one listed cluster shares that name — marking a single arbitrary row as 'the selected one' is misleading. Award PASS if, when the selected name is ambiguous, the listing does NOT tag one arbitrary row as selected (it may suppress the marker for all rows sharing that ambiguous name, mark none, or otherwise avoid implying a single specific cluster is selected when the name alone cannot identify it). Unambiguous selection (a name that appears once) should still be marked as before. The exact suppression mechanism is implementation-flexible. Award FAIL if the code still marks exactly one row as selected purely by matching the selected name, so that an arbitrary same-named cluster gets the selected marker."
+    }
+  ],
+  "pass_to_pass": []
+}

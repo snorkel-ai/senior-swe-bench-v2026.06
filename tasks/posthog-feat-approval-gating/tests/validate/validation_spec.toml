@@ -1,0 +1,613 @@
+instructions = """
+This task uses TWO validation drivers:
+
+1. "pytest" stories — Django backend tests. Import the harness first
+   (it handles Django setup):
+
+     import sys; sys.path.insert(0, "/tests")
+     from test_harness import (
+         get_team_and_user,
+         create_feature_flag,
+         create_approval_policy,
+         get_authenticated_client,
+     )
+
+   Available helpers:
+     - get_team_and_user() -> (team, user)
+       Creates Org -> Project -> Team + User chain. Fresh each call.
+     - create_feature_flag(team, key=..., filters=..., rollout_percentage=...) -> FeatureFlag
+       Convenience wrapper — pass either rollout_percentage (which becomes
+       a single groups[] entry) or filters (a fully-formed filters dict).
+     - create_approval_policy(team, user, action_key=<discovered>,
+                              conditions=..., team_scope=True) -> ApprovalPolicy
+       The action_key is required — discover it from the agent's
+       implementation (e.g. inspect the registry or the actions/ directory;
+       the natural name is "feature_flag.update" — try that first).
+       Sets approver_config with quorum=1 for you. Pass team_scope=False
+       to create an org-level (team=None) policy.
+     - get_authenticated_client(user) -> DRF APIClient with force_login
+
+   The @approval_gate decorator only fires when the org has the
+   "approvals" feature flag enabled. In tests, mock this to True:
+
+     from unittest.mock import patch
+     with patch("posthog.approvals.decorators._is_approvals_enabled", return_value=True):
+         resp = client.patch(...)
+
+   IMPORTANT: the action registry is populated lazily on first lookup,
+   but tests that build a fresh registry-aware code path benefit from
+   forcing registration up front:
+
+     from posthog.approvals.actions.registry import register_actions
+     register_actions()
+
+   The conditions schema you pass to create_approval_policy is the
+   shape your implementation's PolicyEngine understands — there is no
+   prescribed schema. Use whatever JSON shape your engine evaluates.
+
+2. "jest" stories with jest_config_key = "jest_frontend" — React/TS
+   tests run inside frontend/ with the project Jest config.
+
+   CRITICAL — EVERY .test.tsx file MUST have these as its FIRST TWO LINES
+   (before any import statements):
+
+     // @ts-nocheck
+     jest.mock('@posthog/hogvm', () => ({}), { virtual: true })
+
+   Without these, the test will fail to compile or crash on import.
+   NEVER put any imports before these two lines. Do NOT add any other
+   jest.mock() calls — especially not for 'posthog-js' (the test
+   infra already provides the correct mock; overriding it breaks
+   initKeaTests).
+
+   A TypeScript test harness is available at ./jest_test_harness (copied
+   alongside the test files automatically). It exports:
+     - discoverNewActionKey(): finds the new key beyond enable/disable
+     - renderPolicyEditModal(conditionsObj): renders ApprovalPolicies
+       with a mocked policy, opens the edit modal, returns the modal
+       DOM element. Handles all mock setup and UI interaction.
+   The harness uses lazy imports so the test file's jest.mock calls
+   take effect first.
+Multi-database marker (PostHog framework mechanics): mark EVERY pytest test with
+``@pytest.mark.django_db(transaction=True, databases="__all__")``. A plain
+``@pytest.mark.django_db`` or a non-transactional ``databases="__all__"`` can
+ERROR at setup with ``OperationalError: Temporary failure in name resolution`` —
+PostHog configures auxiliary databases (persons, visual_review) on a host that is
+not reachable in this backend-only environment, and a non-transactional
+all-databases marker eagerly connects to them. The transactional form connects
+lazily (only the default database is touched) and the conftest tolerates the
+cross-database teardown.
+
+"""
+
+[settings]
+va_max_turns = 80
+va_timeout_sec = 2400
+script_timeout_sec = 600
+
+[settings.pytest]
+python = "uv run python"
+django_settings = "posthog.settings"
+
+[settings.jest_frontend]
+config_dir = "frontend"
+test_parent = "frontend/src"
+command = "pnpm exec jest"
+test_path_flag = "--testPathPattern"
+
+
+# =============================================================================
+# Backend stories (pytest)
+# =============================================================================
+
+[[story]]
+id = "threshold_gating"
+driver = "pytest"
+description = """
+A policy that gates rollout-percentage changes when the new value
+crosses a numeric threshold (e.g. "gate when rollout > 50%") holds the
+PATCH for approval; PATCHes that do not cross the threshold update the flag immediately.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        create_feature_flag,
+        create_approval_policy,
+        get_authenticated_client,
+    )
+    from posthog.approvals.actions.registry import register_actions
+    from posthog.approvals.models import ChangeRequest
+    from unittest.mock import patch
+
+Call ``register_actions()`` once before any policy is created so the
+agent's lazy registry is populated.
+
+Steps:
+
+1. Get a fresh team and user: ``team, user = get_team_and_user()``.
+
+2. Discover the action key the agent registered for rollout-change gating.
+   Inspect the registry (e.g. ``posthog/approvals/actions/``) — try
+   ``"feature_flag.update"`` first; if not registered, find the actual key.
+   Store it as ``action_key``.
+
+3. Create a feature flag for the team with the initial rollout from inputs:
+   ``flag = create_feature_flag(team, rollout_percentage=inputs["initial_rollout"])``.
+
+4. Build a conditions dict whose semantics are: "gate the change when the
+   NEW ``rollout_percentage`` value satisfies (operator threshold)". Use
+   whatever JSON shape your PolicyEngine understands. The reference example
+   uses ``{"type": "before_after", "field": "rollout_percentage", "operator": ">",
+   "value": inputs["threshold"]}`` but other shapes are fine — what matters
+   is that the engine gates iff ``new_value > threshold``.
+
+5. Create the approval policy:
+   ``create_approval_policy(team, user, action_key=action_key, conditions=<your-shape>)``.
+
+6. Get an authenticated DRF client: ``client = get_authenticated_client(user)``.
+
+7. Inside a ``patch("posthog.approvals.decorators._is_approvals_enabled",
+   return_value=True)`` context, PATCH the flag at
+   ``/api/projects/{team.id}/feature_flags/{flag.id}/`` with body
+   ``{"filters": {"groups": [{"properties": [], "rollout_percentage": inputs["new_rollout"]}]}}``
+   and ``format="json"``.
+
+8. Count the gated change requests for this team and action:
+   ``change_request_count = ChangeRequest.objects.filter(team=team, action_key=action_key).count()``.
+
+9. Refresh the flag and read its final rollout:
+   ``flag.refresh_from_db()``;
+   ``final_rollout = flag.filters["groups"][0]["rollout_percentage"]``.
+
+10. If ``inputs`` includes a ``"new_rollout_above"`` key, issue a second PATCH
+    to the same URL with that value as the new ``rollout_percentage``, inside
+    the same ``_is_approvals_enabled`` patch context, then re-read
+    ``change_request_count`` from the same filter query.
+
+- EXPECTED: ``change_request_count`` matches ``expected["change_request_count"]`` exactly.
+- EXPECTED: ``final_rollout`` matches ``expected["final_rollout"]`` exactly.
+
+Return ``{"change_request_count": change_request_count, "final_rollout": final_rollout}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+initial_rollout = 30
+threshold = 50
+new_rollout = 80
+[story.test_case.expected]
+change_request_count = 1
+final_rollout = 30
+
+[[story.test_case]]
+# Below-threshold PATCH (new_rollout=40 ≤ 50) passes through immediately.
+# A second PATCH at new_rollout_above=70 > 50 then crosses the threshold:
+# on the patched codebase the gate fires and count becomes 1; on the NOP
+# codebase there is no gating, so both PATCHes succeed and count stays 0.
+[story.test_case.inputs]
+initial_rollout = 30
+threshold = 50
+new_rollout = 40
+new_rollout_above = 70
+[story.test_case.expected]
+change_request_count = 1
+final_rollout = 40
+
+
+[[story]]
+id = "change_amount_gating"
+driver = "pytest"
+description = """
+A policy that gates rollout-percentage changes whose magnitude
+exceeds a delta threshold (e.g. "gate when the rollout changes by more
+than 10 percentage points") holds large PATCHes for approval; smaller
+PATCHes pass through.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        create_feature_flag,
+        create_approval_policy,
+        get_authenticated_client,
+    )
+    from posthog.approvals.actions.registry import register_actions
+    from posthog.approvals.models import ChangeRequest
+    from unittest.mock import patch
+
+Call ``register_actions()`` once before any policy is created.
+
+Steps:
+
+1. Get a fresh team and user: ``team, user = get_team_and_user()``.
+
+2. Discover the action key (same as ``threshold_gating`` — try
+   ``"feature_flag.update"`` first). Store it as ``action_key``.
+
+3. Create a feature flag for the team with the initial rollout from inputs:
+   ``flag = create_feature_flag(team, rollout_percentage=inputs["initial_rollout"])``.
+
+4. Build a conditions dict whose semantics are: "gate when
+   ``|new - old| > delta_threshold``". Use whatever JSON shape your
+   PolicyEngine understands. The reference example uses
+   ``{"type": "change_amount", "field": "rollout_percentage", "operator": ">",
+   "value": inputs["delta_threshold"]}`` but other shapes are fine.
+
+5. Create the approval policy:
+   ``create_approval_policy(team, user, action_key=action_key, conditions=<your-shape>)``.
+
+6. Get an authenticated DRF client: ``client = get_authenticated_client(user)``.
+
+7. Inside a ``patch("posthog.approvals.decorators._is_approvals_enabled",
+   return_value=True)`` context, PATCH the flag at
+   ``/api/projects/{team.id}/feature_flags/{flag.id}/`` with body
+   ``{"filters": {"groups": [{"properties": [], "rollout_percentage": inputs["new_rollout"]}]}}``
+   and ``format="json"``.
+
+8. Count the gated change requests for this team and action:
+   ``change_request_count = ChangeRequest.objects.filter(team=team, action_key=action_key).count()``.
+
+9. Refresh the flag and read its final rollout:
+   ``flag.refresh_from_db()``;
+   ``final_rollout = flag.filters["groups"][0]["rollout_percentage"]``.
+
+10. If ``inputs`` includes a ``"new_rollout_large_delta"`` key, issue a second
+    PATCH to the same URL with that value as the new ``rollout_percentage``,
+    inside the same ``_is_approvals_enabled`` patch context, then re-read
+    ``change_request_count`` from the same filter query.
+
+- EXPECTED: ``change_request_count`` matches ``expected["change_request_count"]`` exactly.
+- EXPECTED: ``final_rollout`` matches ``expected["final_rollout"]`` exactly.
+
+Return ``{"change_request_count": change_request_count, "final_rollout": final_rollout}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+initial_rollout = 50
+delta_threshold = 10
+new_rollout = 80
+[story.test_case.expected]
+change_request_count = 1
+final_rollout = 50
+
+[[story.test_case]]
+# Small-delta PATCH (55-50=5 ≤ 10) passes through immediately.
+# A second PATCH at new_rollout_large_delta=90 has delta-from-current
+# 35 > 10: on the patched codebase the gate fires and count becomes 1;
+# on the NOP codebase there is no gating, so both PATCHes pass through
+# and count stays 0.
+[story.test_case.inputs]
+initial_rollout = 50
+delta_threshold = 10
+new_rollout = 55
+new_rollout_large_delta = 90
+[story.test_case.expected]
+change_request_count = 1
+final_rollout = 55
+
+
+[[story]]
+id = "multi_location_detection"
+driver = "pytest"
+description = "Rollout-percentage changes are detected wherever a flag's rollout can actually live, not just the common location."
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        create_feature_flag,
+        create_approval_policy,
+        get_authenticated_client,
+    )
+    from posthog.approvals.actions.registry import register_actions
+    from posthog.approvals.models import ChangeRequest
+    from unittest.mock import patch
+
+Call ``register_actions()`` once before any policy is created.
+
+Steps:
+
+1. Get a fresh team and user: ``team, user = get_team_and_user()``.
+
+2. Build INITIAL filters with rollouts populated in every location the
+   data model supports:
+
+       initial_filters = {
+           "groups": [{"properties": [], "rollout_percentage": 50}],
+           "super_groups": [{"properties": [], "rollout_percentage": 50}],
+           "holdout_groups": [{"properties": [], "rollout_percentage": 50}],
+           "multivariate": {"variants": [
+               {"key": "control", "rollout_percentage": 50},
+               {"key": "test", "rollout_percentage": 50},
+           ]},
+       }
+
+3. Discover the action key (same as other stories — try
+   ``"feature_flag.update"`` first). Store it as ``action_key``.
+
+4. Create a feature flag for the team with these initial filters:
+   ``flag = create_feature_flag(team, filters=initial_filters)``.
+
+5. Build a conditions dict that gates ANY change to ``rollout_percentage``.
+   Use whatever JSON shape your engine treats as "gate any change". The
+   reference example uses ``{"type": "any_change", "field": "rollout_percentage"}``
+   but other shapes are fine; many engines treat ``conditions={}`` as gate-all.
+
+6. Create the approval policy:
+   ``create_approval_policy(team, user, action_key=action_key, conditions=<your-shape>)``.
+
+7. Get an authenticated DRF client: ``client = get_authenticated_client(user)``.
+
+8. Build NEW filters based on ``inputs["location_to_change"]``:
+   - ``"groups"``: flip ``groups[0].rollout_percentage`` to 99.
+   - ``"super_groups"``: flip ``super_groups[0].rollout_percentage`` to 99.
+   - ``"holdout_groups"``: flip ``holdout_groups[0].rollout_percentage`` to 99.
+   - ``"multivariate"``: set ``variants`` to
+     ``[{"key": "control", "rollout_percentage": 70}, {"key": "test", "rollout_percentage": 30}]``.
+   - ``"no_change"``: leave ``new_filters`` identical to ``initial_filters``
+     (the first PATCH below will exercise the no-real-change branch; a real
+     change is sent later in step 11).
+
+9. Inside a ``patch("posthog.approvals.decorators._is_approvals_enabled",
+   return_value=True)`` context, PATCH the flag at
+   ``/api/projects/{team.id}/feature_flags/{flag.id}/`` with body
+   ``{"filters": new_filters}`` and ``format="json"``.
+
+10. Count the gated change requests for this team and action:
+    ``change_request_count = ChangeRequest.objects.filter(team=team, action_key=action_key).count()``.
+
+11. If ``inputs["location_to_change"]`` is ``"no_change"``, the first PATCH's
+    body was identical to ``initial_filters`` and so no real change occurred.
+    Send a second PATCH inside the same ``_is_approvals_enabled`` patch
+    context with body
+    ``{"filters": {**initial_filters, "groups": [{"properties": [], "rollout_percentage": 99}]}}``
+    (a real change in ``groups[0].rollout_percentage``) and re-read
+    ``change_request_count`` from the same filter query. A correctly
+    implemented gate fires only on the second (real-change) PATCH and
+    leaves the count at 1; an over-eager "fire-on-any-PATCH" implementation
+    would have counted 2 by this point.
+
+- EXPECTED: ``change_request_count`` matches ``expected["change_request_count"]`` exactly.
+
+Return ``{"change_request_count": change_request_count}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+location_to_change = "groups"
+[story.test_case.expected]
+change_request_count = 1
+
+[[story.test_case]]
+[story.test_case.inputs]
+location_to_change = "super_groups"
+[story.test_case.expected]
+change_request_count = 1
+
+[[story.test_case]]
+[story.test_case.inputs]
+location_to_change = "holdout_groups"
+[story.test_case.expected]
+change_request_count = 1
+
+[[story.test_case]]
+[story.test_case.inputs]
+location_to_change = "multivariate"
+[story.test_case.expected]
+change_request_count = 1
+
+[[story.test_case]]
+# Identical-filters PATCH is sent first (no real change); the procedure
+# follows it with a real-change PATCH. A correct gate fires only on the
+# real change (count=1); a naive "fire-on-any-PATCH" gate would count both
+# (count=2). On the NOP codebase there is no gating at all so count stays 0.
+[story.test_case.inputs]
+location_to_change = "no_change"
+[story.test_case.expected]
+change_request_count = 1
+
+
+[[story]]
+id = "multi_policy_conflict_response"
+driver = "pytest"
+description = """
+When two or more enabled policies for the same action both match the
+same change, the API rejects the request with a 4xx response and does
+NOT create a change request. A single matching policy still gates
+normally (4xx + change request created).
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        create_feature_flag,
+        create_approval_policy,
+        get_authenticated_client,
+    )
+    from posthog.approvals.actions.registry import register_actions
+    from posthog.approvals.models import ChangeRequest, ApprovalPolicy
+    from unittest.mock import patch
+
+Call ``register_actions()`` once before any policy is created.
+
+Steps:
+
+1. Get a fresh team and user: ``team, user = get_team_and_user()``.
+
+2. Discover the action key (same as other stories — try
+   ``"feature_flag.update"`` first). Store it as ``action_key``.
+
+3. Create a feature flag for the team:
+   ``flag = create_feature_flag(team, rollout_percentage=30)``.
+
+4. Create up to two approval policies that gate ANY change. The
+   ``(organization, team, action_key)`` tuple has a UNIQUE constraint
+   on ``ApprovalPolicy``, so two matching policies are obtained by using
+   one team-scoped and one org-scoped:
+
+   - if ``inputs["policy_count"] >= 1``, create a team-scoped policy
+     (``team_scope=True``) with a "gate any change" conditions shape.
+   - if ``inputs["policy_count"] >= 2``, also create an org-scoped policy
+     (``team_scope=False``) with the same conditions shape.
+
+5. Get an authenticated DRF client: ``client = get_authenticated_client(user)``.
+
+6. Inside a ``patch("posthog.approvals.decorators._is_approvals_enabled",
+   return_value=True)`` context, PATCH the flag at
+   ``/api/projects/{team.id}/feature_flags/{flag.id}/`` with body
+   ``{"filters": {"groups": [{"properties": [], "rollout_percentage": 80}]}}``
+   and ``format="json"``. Read ``response.status_code``.
+
+7. Compute observable values:
+   - ``is_4xx = 400 <= response.status_code < 500``.
+   - ``change_request_count = ChangeRequest.objects.filter(team=team, action_key=action_key).count()``.
+
+- EXPECTED: ``is_4xx`` matches ``expected["is_4xx"]`` exactly.
+- EXPECTED: ``change_request_count`` matches ``expected["change_request_count"]`` exactly.
+
+Return ``{"is_4xx": is_4xx, "change_request_count": change_request_count}``.
+"""
+
+[[story.test_case]]
+# Two matching policies → conflict rejection, no change request created.
+[story.test_case.inputs]
+policy_count = 2
+[story.test_case.expected]
+is_4xx = true
+change_request_count = 0
+
+[[story.test_case]]
+# Single matching policy → gated normally, change request created.
+[story.test_case.inputs]
+policy_count = 1
+[story.test_case.expected]
+is_4xx = true
+change_request_count = 1
+
+
+# =============================================================================
+# Frontend stories (jest)
+# =============================================================================
+
+[[story]]
+id = "frontend_update_action_in_catalog"
+driver = "jest"
+jest_config_key = "jest_frontend"
+description = """
+The settings UI shows a new approval action type when creating or editing a policy.
+"""
+procedure = """
+The Jest test file MUST start with these exact two lines (before any
+imports):
+
+    // @ts-nocheck
+    jest.mock('@posthog/hogvm', () => ({}), { virtual: true })
+
+Without these the test will fail to compile or crash on import. Do not
+add any other ``jest.mock(...)`` calls — PostHog's test infrastructure
+already handles ``posthog-js`` and the other expected mocks.
+
+Imports (after the two header lines):
+
+    import { getTestCases } from './validationParams'
+    import { APPROVAL_ACTIONS } from 'scenes/approvals/utils'
+    import { initKeaTests } from '~/test/init'
+
+``APPROVAL_ACTIONS`` is a pre-existing ``Record<string, {label, description}>``
+exported from ``frontend/src/scenes/approvals/utils.ts``. The pre-fix
+object has 2 entries (``enable`` + ``disable``); a valid implementation
+extends it with one or more new entries.
+
+Use ``test.each(getTestCases())`` so every case runs as a separate Jest
+test. Per case:
+
+1. Initialise Kea: ``beforeEach(() => { initKeaTests() })``.
+2. Read the current entry count:
+   ``const optionCount = Object.keys(APPROVAL_ACTIONS).length``.
+3. Compute the growth beyond the pre-fix baseline:
+   ``const beyondBaseline = optionCount - inputs.baseline_option_count``.
+
+- EXPECTED: ``optionCount`` is at least ``expected["min_option_count"]``.
+- EXPECTED: ``beyondBaseline`` is at least ``expected["new_options_min"]``.
+
+Do not import ``ApprovalActionKey`` or check for specific key names like
+``"feature_flag.update"`` — the test must pass for any valid action key
+string the agent chose.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+baseline_option_count = 2
+[story.test_case.expected]
+min_option_count = 3
+new_options_min = 1
+
+
+[[story]]
+id = "frontend_condition_builder_visible"
+driver = "jest"
+jest_config_key = "jest_frontend"
+description = """
+When the policy edit modal opens for an existing rollout-change policy
+that has a condition configured, a condition-builder UI section is
+visible — containing form elements (selects, inputs, buttons) for configuring
+the gate rules.
+"""
+procedure = """
+The Jest test file MUST start with these exact two lines (before any
+imports):
+
+    // @ts-nocheck
+    jest.mock('@posthog/hogvm', () => ({}), { virtual: true })
+
+The harness ``./jest_test_harness`` already wraps all mock setup,
+component rendering, and modal interaction. Do not duplicate that logic
+and do not add other ``jest.mock(...)`` calls — the harness covers
+``initKeaTests``, ``useMocks``, ``render``, ``userEvent``, the API mock
+URLs, the policy shape, the More-button click, the Edit click, and the
+modal-wait.
+
+Imports (after the two header lines):
+
+    import { getTestCases } from './validationParams'
+    import { renderPolicyEditModal } from './jest_test_harness'
+
+Per case (``test.each(getTestCases())``):
+
+1. Build a ``conditionsMock`` value that matches the schema the agent's
+   condition-builder component parses from ``policy.conditions``. Read
+   the agent's source to discover the schema. The reference example uses
+   ``{ field: 'rollout_percentage', type: 'before_after', operator: '>', value: 50 }``
+   but other shapes are valid.
+
+2. Render the edit modal with that mock:
+   ``const modalEl = await renderPolicyEditModal(conditionsMock)``.
+
+3. Count the form-input elements inside the modal:
+   ``const interactiveEls = modalEl.querySelectorAll('button, input, select')``;
+   ``const interactiveElCount = interactiveEls.length``.
+
+- EXPECTED: ``interactiveElCount`` is at least ``expected["min_condition_elements"]``.
+
+The only piece of test code you must supply per case is ``conditionsMock``,
+discovered from the agent's component source.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+test_label = "condition_builder_has_form_elements"
+[story.test_case.expected]
+min_condition_elements = 8

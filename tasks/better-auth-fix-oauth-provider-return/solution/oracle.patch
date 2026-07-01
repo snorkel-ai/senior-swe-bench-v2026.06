@@ -1,0 +1,863 @@
+diff --git a/packages/oauth-provider/src/authorize.ts b/packages/oauth-provider/src/authorize.ts
+index 3b244f792b..a4d7665af7 100644
+--- a/packages/oauth-provider/src/authorize.ts
++++ b/packages/oauth-provider/src/authorize.ts
+@@ -5,6 +5,7 @@ import { generateRandomString, makeSignature } from "better-auth/crypto";
+ import type { Verification } from "better-auth/db";
+ import { APIError } from "better-call";
+ import { oAuthState } from "./oauth";
++import type { OAuthErrorCode, OAuthRedirectOnError } from "./oauth-endpoint";
+ import type {
+ 	OAuthAuthorizationQuery,
+ 	OAuthConsent,
+@@ -22,24 +23,17 @@ import {
+ } from "./utils";
+ 
+ /**
+- * OIDC Error Codes
+- * @see https://openid.net/specs/openid-connect-core-1_0.html#AuthError
+- */
+-type OIDCAuthError =
+-	| "login_required"
+-	| "consent_required"
+-	| "interaction_required"
+-	| "account_selection_required";
+-
+-/**
+- * Formats an error url
++ * Formats an error url. Per OIDC Core 1.0 §5 / RFC 6749 §4.2.2.1, errors on
++ * implicit and hybrid flows are delivered in the URL fragment, not the query.
++ * Callers on the code flow (default) omit `mode` and get query delivery.
+  */
+ export function formatErrorURL(
+ 	url: string,
+-	error: string,
++	error: OAuthErrorCode,
+ 	description: string,
+ 	state?: string,
+ 	iss?: string,
++	mode: "query" | "fragment" = "query",
+ ) {
+ 	const searchParams = new URLSearchParams({
+ 		error,
+@@ -47,9 +41,36 @@ export function formatErrorURL(
+ 	});
+ 	state && searchParams.append("state", state);
+ 	iss && searchParams.append("iss", iss);
++	if (mode === "fragment") {
++		return `${url}#${searchParams.toString()}`;
++	}
+ 	return `${url}${url.includes("?") ? "&" : "?"}${searchParams.toString()}`;
+ }
+ 
++/**
++ * Selects the response mode for an error redirect to the RP. OIDC Core 1.0 §5
++ * defines defaults based on response_type: `code` → query, types containing
++ * `token` / `id_token` → fragment. An explicit `response_mode` overrides.
++ *
++ * When `response_type` is duplicated (array) or absent, we can't trust the
++ * caller's intent, so we default to query — the safer channel for
++ * unrecognized shapes.
++ */
++function deriveResponseMode(
++	raw: Record<string, unknown>,
++): "query" | "fragment" {
++	const responseMode =
++		typeof raw.response_mode === "string" ? raw.response_mode : undefined;
++	if (responseMode === "fragment") return "fragment";
++	if (responseMode === "query") return "query";
++	const responseType =
++		typeof raw.response_type === "string" ? raw.response_type : undefined;
++	if (responseType && /\b(token|id_token)\b/.test(responseType)) {
++		return "fragment";
++	}
++	return "query";
++}
++
+ export const handleRedirect = (ctx: GenericEndpointContext, uri: string) => {
+ 	const fromFetch = isBrowserFetchRequest(ctx.request?.headers);
+ 	const acceptJson = ctx.headers?.get("accept")?.includes("application/json");
+@@ -67,7 +88,7 @@ function redirectWithPromptNoneError(
+ 	ctx: GenericEndpointContext,
+ 	opts: OAuthOptions<Scope[]>,
+ 	query: OAuthAuthorizationQuery,
+-	error: OIDCAuthError,
++	error: OAuthErrorCode,
+ 	description: string,
+ ) {
+ 	return handleRedirect(
+@@ -139,7 +160,7 @@ export function getIssuer(
+  */
+ function getErrorURL(
+ 	ctx: GenericEndpointContext,
+-	error: string,
++	error: OAuthErrorCode,
+ 	description: string,
+ ) {
+ 	const baseURL =
+@@ -148,6 +169,115 @@ function getErrorURL(
+ 	return formattedURL;
+ }
+ 
++/**
++ * Finds the matching entry in a client's registered redirect_uris for a
++ * requested redirect_uri. Honors RFC 8252 §7.3 loopback port variance for
++ * 127.0.0.1 and [::1], matching on scheme+host+path+query and ignoring
++ * port. DNS names like "localhost" are excluded per §8.3.
++ */
++function findRegisteredRedirectUri(
++	registered: readonly string[] | undefined,
++	requested: string | undefined,
++): string | undefined {
++	if (!registered || !requested) return undefined;
++
++	let req: URL | undefined;
++	try {
++		req = new URL(requested);
++	} catch {
++		// malformed requested — only exact-match branch can succeed below
++	}
++
++	// TODO(sync-from-main-9226): swap for isLoopbackIP(req.hostname) once the
++	// helper lands here, to cover the full 127.0.0.0/8 range per RFC 8252 §7.3.
++	const loopbackReq =
++		req?.hostname === "127.0.0.1" || req?.hostname === "[::1]"
++			? req
++			: undefined;
++
++	return registered.find((url) => {
++		if (url === requested) return true;
++		if (!loopbackReq) return false;
++		try {
++			const reg = new URL(url);
++			return (
++				reg.hostname === loopbackReq.hostname &&
++				reg.pathname === loopbackReq.pathname &&
++				reg.protocol === loopbackReq.protocol &&
++				reg.search === loopbackReq.search
++			);
++		} catch {
++			return false;
++		}
++	});
++}
++
++/**
++ * Loads the client, verifies it's enabled, and returns the requested
++ * redirect_uri when it matches a registered entry. Returns null whenever the
++ * RP cannot be safely reached, so callers can fall back to the server error
++ * page (avoiding open-redirect risk on validation failures).
++ */
++async function resolveTrustedRedirectUri(
++	ctx: GenericEndpointContext,
++	opts: OAuthOptions<Scope[]>,
++	clientId: string | undefined,
++	redirectUri: string | undefined,
++): Promise<string | null> {
++	if (!clientId || !redirectUri) return null;
++	let client: Awaited<ReturnType<typeof getClient>> | undefined;
++	try {
++		client = await getClient(ctx, opts, clientId);
++	} catch {
++		return null;
++	}
++	if (!client || client.disabled) return null;
++	const matched = findRegisteredRedirectUri(client.redirectUris, redirectUri);
++	return matched ? redirectUri : null;
++}
++
++/**
++ * `redirectOnError` callback for `/oauth2/authorize`. Per RFC 6749 §4.1.2.1,
++ * authorize errors MUST be delivered to the client's `redirect_uri` with
++ * `error`, `error_description`, `state`, and (RFC 9207) `iss`. The clause
++ * carves out one case: a missing/invalid `redirect_uri` or `client_id` MUST
++ * NOT redirect to the requested URI. We implement the carve-out via
++ * `resolveTrustedRedirectUri`, falling back to the server error page.
++ *
++ * Channel (query vs fragment) follows OIDC Core §5 via `deriveResponseMode`.
++ */
++export function authorizeRedirectOnError(
++	opts: OAuthOptions<Scope[]>,
++): OAuthRedirectOnError<GenericEndpointContext> {
++	return async ({ error, error_description, ctx }) => {
++		const raw = (ctx.query ?? {}) as Record<string, unknown>;
++		const clientId =
++			typeof raw.client_id === "string" ? raw.client_id : undefined;
++		const redirectUriRaw =
++			typeof raw.redirect_uri === "string" ? raw.redirect_uri : undefined;
++		const trusted = await resolveTrustedRedirectUri(
++			ctx,
++			opts,
++			clientId,
++			redirectUriRaw,
++		);
++		if (trusted) {
++			return handleRedirect(
++				ctx,
++				formatErrorURL(
++					trusted,
++					error,
++					error_description,
++					typeof raw.state === "string" ? raw.state : undefined,
++					getIssuer(ctx, opts),
++					deriveResponseMode(raw),
++				),
++			);
++		}
++		return handleRedirect(ctx, getErrorURL(ctx, error, error_description));
++	};
++}
++
+ export async function authorizeEndpoint(
+ 	ctx: GenericEndpointContext,
+ 	opts: OAuthOptions<Scope[]>,
+@@ -260,24 +390,10 @@ export async function authorizeEndpoint(
+ 		);
+ 	}
+ 
+-	const redirectUri = client.redirectUris?.find((url) => {
+-		if (url === query.redirect_uri) return true;
+-		try {
+-			const registered = new URL(url);
+-			const requested = new URL(query.redirect_uri);
+-			// RFC 8252 §7.3: loopback IPs match on scheme+host+path+query, ignoring port
+-			if (
+-				(registered.hostname === "127.0.0.1" ||
+-					registered.hostname === "[::1]") &&
+-				registered.hostname === requested.hostname &&
+-				registered.pathname === requested.pathname &&
+-				registered.protocol === requested.protocol &&
+-				registered.search === requested.search
+-			)
+-				return true;
+-		} catch {}
+-		return false;
+-	});
++	const redirectUri = findRegisteredRedirectUri(
++		client.redirectUris,
++		query.redirect_uri,
++	);
+ 	if (!redirectUri || !query.redirect_uri) {
+ 		return handleRedirect(
+ 			ctx,
+diff --git a/packages/oauth-provider/src/index.ts b/packages/oauth-provider/src/index.ts
+index a3f6ff7977..277b36dc10 100644
+--- a/packages/oauth-provider/src/index.ts
++++ b/packages/oauth-provider/src/index.ts
+@@ -6,5 +6,13 @@ export {
+ 	oidcServerMetadata,
+ } from "./metadata";
+ export { getOAuthProviderState, oauthProvider } from "./oauth";
++export type {
++	OAuthEndpointErrorResult,
++	OAuthEndpointRedirectContext,
++	OAuthErrorCode,
++	OAuthFieldErrorCode,
++	OAuthFieldErrorCodeMap,
++	OAuthRedirectOnError,
++} from "./oauth-endpoint";
+ export { checkOAuthClient, oauthToSchema } from "./register";
+ export type * from "./types";
+diff --git a/packages/oauth-provider/src/introspect.ts b/packages/oauth-provider/src/introspect.ts
+index ac92f8ddb8..364d83ec55 100644
+--- a/packages/oauth-provider/src/introspect.ts
++++ b/packages/oauth-provider/src/introspect.ts
+@@ -400,9 +400,18 @@ export async function introspectEndpoint(
+ ) {
+ 	let { token, token_type_hint } = ctx.body as {
+ 		token: string;
+-		token_type_hint?: "access_token" | "refresh_token";
++		token_type_hint?: string;
+ 	};
+ 
++	// RFC 7662 §2.1: unknown hints are ignored and detection falls back to
++	// trying both supported token types.
++	if (
++		token_type_hint !== "access_token" &&
++		token_type_hint !== "refresh_token"
++	) {
++		token_type_hint = undefined;
++	}
++
+ 	const credentials = await extractClientCredentials(
+ 		ctx,
+ 		opts,
+diff --git a/packages/oauth-provider/src/oauth-endpoint.ts b/packages/oauth-provider/src/oauth-endpoint.ts
+new file mode 100644
+index 0000000000..218707a932
+--- /dev/null
++++ b/packages/oauth-provider/src/oauth-endpoint.ts
+@@ -0,0 +1,300 @@
++import type { AuthContext } from "@better-auth/core";
++import { createAuthEndpoint } from "better-auth/api";
++import type {
++	EndpointContext,
++	EndpointOptions,
++	StrictEndpoint,
++} from "better-call";
++import { APIError } from "better-call";
++import * as z from "zod";
++
++/**
++ * Canonical OAuth 2.0 / OpenID Connect error codes. The union is the single
++ * vocabulary for every error-emitting surface in this plugin: token, authorize,
++ * revoke, introspect, register, userinfo, logout, consent, and the redirect
++ * error channel. Entries are grouped by source RFC so the declaration doubles
++ * as a specification map.
++ *
++ * The trailing `(string & {})` keeps the type open for product-specific codes
++ * (e.g. `"invalid_verification"`, `"invalid_user"`) while preserving editor
++ * autocomplete for the listed standard codes. Prefer a standard code whenever
++ * one applies; fall back to a custom string only for states no RFC covers.
++ */
++export type OAuthErrorCode =
++	// RFC 6749 §4.1.2.1, §5.2 core authorization + token errors
++	| "invalid_request"
++	| "invalid_client"
++	| "invalid_grant"
++	| "unauthorized_client"
++	| "unsupported_grant_type"
++	| "unsupported_response_type"
++	| "invalid_scope"
++	| "access_denied"
++	| "server_error"
++	| "temporarily_unavailable"
++	// RFC 6750 §3.1 bearer token / RFC 7662 introspection
++	| "invalid_token"
++	// RFC 7009 §2.2.1 token revocation
++	| "unsupported_token_type"
++	// RFC 7591 §3.2.2 dynamic client registration
++	| "invalid_redirect_uri"
++	| "invalid_client_metadata"
++	| "invalid_software_statement"
++	| "unapproved_software_statement"
++	// RFC 8707 §2 resource indicators
++	| "invalid_target"
++	// RFC 9101 §6 JWT-secured authorization requests (JAR)
++	| "invalid_request_object"
++	// OIDC Core 1.0 §3.1.2.6 authorization error response
++	| "login_required"
++	| "consent_required"
++	| "interaction_required"
++	| "account_selection_required"
++	| "invalid_request_uri"
++	| "request_not_supported"
++	| "request_uri_not_supported"
++	| "registration_not_supported"
++	| (string & {});
++
++export type OAuthFieldErrorCodeMap = {
++	missing?: OAuthErrorCode;
++	invalid?: OAuthErrorCode;
++};
++
++export type OAuthFieldErrorCode = OAuthErrorCode | OAuthFieldErrorCodeMap;
++
++export interface OAuthEndpointErrorResult {
++	error: OAuthErrorCode;
++	error_description: string;
++}
++
++export interface OAuthEndpointRedirectContext<Ctx = unknown> {
++	error: OAuthErrorCode;
++	error_description: string;
++	ctx: Ctx;
++}
++
++export type OAuthRedirectOnError<Ctx = any> = (
++	result: OAuthEndpointRedirectContext<Ctx>,
++) => unknown;
++
++type ValidationErrorHookArgs = {
++	message: string;
++	issues: readonly z.core.$ZodIssue[];
++};
++
++type ValidationErrorHook = (args: ValidationErrorHookArgs) => unknown;
++
++export interface OAuthEndpointExtras {
++	/**
++	 * Invoked when validation fails. Presence switches delivery from a JSON
++	 * `APIError` envelope to this callback, which receives the request
++	 * context so it can compute an RP redirect URL from already-parsed query
++	 * params.
++	 */
++	redirectOnError?: OAuthRedirectOnError;
++	/**
++	 * Forwarded to `better-call` and awaited before the RFC envelope is
++	 * synthesized, so callers can observe or transform issues.
++	 */
++	onValidationError?: ValidationErrorHook;
++	/**
++	 * First-path-segment → RFC code mapping. Nested failures like
++	 * `jwks.keys[0].n` collapse to `jwks`; lift a nested schema to a
++	 * top-level field when per-sub-field codes are required.
++	 */
++	errorCodesByField?: Record<string, OAuthFieldErrorCode>;
++	/**
++	 * RFC code returned when no `errorCodesByField` entry matches or the failure is
++	 * structurally malformed (wrong type, duplicated params, bad format,
++	 * failed refinement).
++	 * @default "invalid_request"
++	 */
++	defaultError?: OAuthErrorCode;
++}
++
++/**
++ * Wraps `createAuthEndpoint` so zod schemas stay the single source of truth
++ * for body/query shape while validation failures serialize as the RFC 6749
++ * §5.2 error envelope `{ error, error_description }`.
++ *
++ * A failing issue is routed by its first path segment via `errorCodesByField`:
++ * - missing required (`invalid_type` + "received undefined") → `.missing`
++ * - unsupported value (`invalid_value`) → `.invalid`
++ * - anything else (wrong type, duplicated params, bad format) → `defaultError`
++ *
++ * For enum fields that need to distinguish missing from unsupported, compose
++ * as `z.string().pipe(z.enum([...]))` so duplicated params fail the outer
++ * `z.string()` as `invalid_type` instead of masquerading as an unsupported
++ * enum value.
++ */
++export function createOAuthEndpoint<
++	Path extends string,
++	Options extends EndpointOptions,
++	R,
++>(
++	path: Path,
++	options: Options & OAuthEndpointExtras,
++	handler: (ctx: EndpointContext<Path, Options, AuthContext>) => Promise<R>,
++): StrictEndpoint<Path, Options, R> {
++	const {
++		redirectOnError,
++		onValidationError: userHook,
++		errorCodesByField,
++		defaultError = "invalid_request",
++		...rest
++	} = options;
++
++	if (!redirectOnError) {
++		const forwarded = {
++			...rest,
++			onValidationError: async (args: ValidationErrorHookArgs) => {
++				if (userHook) await userHook(args);
++				throw new APIError("BAD_REQUEST", {
++					...mapIssuesToOAuthError(
++						args.issues,
++						errorCodesByField,
++						defaultError,
++					),
++				});
++			},
++		} as unknown as Options;
++		return createAuthEndpoint(path, forwarded, handler);
++	}
++
++	// Bind so the non-null narrowing from the guard above survives into `validateSlot`;
++	// TS drops narrowing when crossing into a nested function declaration.
++	const redirect = redirectOnError;
++	const {
++		body: bodySchema,
++		query: querySchema,
++		...forwarded
++	} = rest as typeof rest & {
++		body?: z.ZodTypeAny;
++		query?: z.ZodTypeAny;
++	};
++
++	async function validateSlot(
++		ctx: EndpointContext<Path, Options, AuthContext>,
++		slot: "body" | "query",
++		schema: z.ZodTypeAny | undefined,
++	): Promise<{ ok: true } | { ok: false; response: unknown }> {
++		if (!schema) return { ok: true };
++		const result = await schema.safeParseAsync(ctx[slot] ?? {});
++		if (result.success) {
++			(ctx as Record<string, unknown>)[slot] = result.data;
++			return { ok: true };
++		}
++		if (userHook) {
++			await userHook({
++				message: result.error.message,
++				issues: result.error.issues,
++			});
++		}
++		return {
++			ok: false,
++			response: redirect({
++				...mapIssuesToOAuthError(
++					result.error.issues,
++					errorCodesByField,
++					defaultError,
++				),
++				ctx,
++			}),
++		};
++	}
++
++	return createAuthEndpoint(
++		path,
++		forwarded as unknown as Options,
++		async (ctx) => {
++			const body = await validateSlot(ctx, "body", bodySchema);
++			if (!body.ok) return body.response;
++			const query = await validateSlot(ctx, "query", querySchema);
++			if (!query.ok) return query.response;
++			return handler(ctx);
++		},
++	) as StrictEndpoint<Path, Options, R>;
++}
++
++export function mapIssuesToOAuthError(
++	issues: readonly z.core.$ZodIssue[],
++	errorCodesByField?: Record<string, OAuthFieldErrorCode>,
++	defaultError: OAuthErrorCode = "invalid_request",
++): OAuthEndpointErrorResult {
++	const issue = issues[0];
++	if (!issue) {
++		return {
++			error: defaultError,
++			error_description: "Invalid request.",
++		};
++	}
++
++	const first = issue.path?.[0];
++	const fieldKey = typeof first === "string" ? first : undefined;
++	const mapping = fieldKey ? errorCodesByField?.[fieldKey] : undefined;
++	const field = issue.path?.length ? z.core.toDotPath(issue.path) : "";
++
++	return {
++		error: resolveErrorCode(issue, mapping, defaultError),
++		error_description: describeIssue(issue, field),
++	};
++}
++
++function resolveErrorCode(
++	issue: z.core.$ZodIssue,
++	mapping: OAuthFieldErrorCode | undefined,
++	defaultError: OAuthErrorCode,
++): OAuthErrorCode {
++	if (typeof mapping === "string") return mapping;
++
++	if (isMissingValueIssue(issue)) {
++		return mapping?.missing ?? defaultError;
++	}
++	if (issue.code === "invalid_value") {
++		return mapping?.invalid ?? defaultError;
++	}
++	return defaultError;
++}
++
++/**
++ * Returns `true` for issues that represent an absent required value. Zod v4
++ * strips `input` from published issues, so the signal is the `invalid_type`
++ * code combined with a message suffix of "received undefined". The suffix is
++ * pinned by a regression test so a zod rephrase fails the test instead of
++ * silently reclassifying missing fields.
++ *
++ * Assumes the default zod error map. Consumers that install a localized map
++ * via `z.setErrorMap()` will break this check, collapsing missing-field
++ * failures to `defaultError`.
++ */
++export function isMissingValueIssue(issue: z.core.$ZodIssue): boolean {
++	return (
++		issue.code === "invalid_type" &&
++		issue.message.endsWith("received undefined")
++	);
++}
++
++function describeIssue(issue: z.core.$ZodIssue, field: string): string {
++	if (!field) return issue.message;
++
++	if (issue.code === "invalid_type") {
++		if (issue.message.endsWith("received undefined")) {
++			return `${field} is required`;
++		}
++		if (issue.message.endsWith("received array")) {
++			return `${field} must not appear more than once`;
++		}
++		const expected = (issue as { expected?: string }).expected ?? "valid value";
++		return `${field} must be a ${expected}`;
++	}
++
++	if (issue.code === "invalid_value") {
++		const values = (issue as { values?: readonly unknown[] }).values;
++		if (Array.isArray(values) && values.length > 0) {
++			return `${field} must be one of: ${values.join(", ")}`;
++		}
++	}
++
++	return `${field}: ${issue.message}`;
++}
+diff --git a/packages/oauth-provider/src/oauth.ts b/packages/oauth-provider/src/oauth.ts
+index 1ea7034c05..6757174cee 100644
+--- a/packages/oauth-provider/src/oauth.ts
++++ b/packages/oauth-provider/src/oauth.ts
+@@ -12,12 +12,13 @@ import { parseSetCookieHeader } from "better-auth/cookies";
+ import { mergeSchema } from "better-auth/db";
+ import type { BetterAuthPlugin } from "better-auth/types";
+ import * as z from "zod";
+-import { authorizeEndpoint } from "./authorize";
++import { authorizeEndpoint, authorizeRedirectOnError } from "./authorize";
+ import { consentEndpoint } from "./consent";
+ import { continueEndpoint } from "./continue";
+ import { introspectEndpoint } from "./introspect";
+ import { rpInitiatedLogoutEndpoint } from "./logout";
+ import { authServerMetadata, oidcServerMetadata } from "./metadata";
++import { createOAuthEndpoint } from "./oauth-endpoint";
+ import * as oauthClientEndpoints from "./oauthClient";
+ import * as oauthConsentEndpoints from "./oauthConsent";
+ import { registerEndpoint } from "./register";
+@@ -370,32 +371,45 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
+ 					return metadata;
+ 				},
+ 			),
+-			oauth2Authorize: createAuthEndpoint(
++			oauth2Authorize: createOAuthEndpoint(
+ 				"/oauth2/authorize",
+ 				{
+ 					method: "GET",
+ 					query: z.object({
+-						response_type: z.enum(["code"]).optional(),
++						response_type: z
++							.string()
++							.pipe(z.enum(["code"]))
++							.optional(),
+ 						client_id: z.string(),
+ 						redirect_uri: SafeUrlSchema.optional(),
+ 						scope: z.string().optional(),
+ 						state: z.string().optional(),
+ 						request_uri: z.string().optional(),
+ 						code_challenge: z.string().optional(),
+-						code_challenge_method: z.enum(["S256"]).optional(),
++						code_challenge_method: z
++							.string()
++							.pipe(z.enum(["S256"]))
++							.optional(),
+ 						nonce: z.string().optional(),
+ 						prompt: z
+-							.enum([
+-								"none",
+-								"consent",
+-								"login",
+-								"create",
+-								"select_account",
+-								"login consent",
+-								"select_account consent",
+-							])
++							.string()
++							.pipe(
++								z.enum([
++									"none",
++									"consent",
++									"login",
++									"create",
++									"select_account",
++									"login consent",
++									"select_account consent",
++								]),
++							)
+ 							.optional(),
+ 					}),
++					redirectOnError: authorizeRedirectOnError(opts),
++					errorCodesByField: {
++						response_type: { invalid: "unsupported_response_type" },
++					},
+ 					metadata: {
+ 						openapi: {
+ 							description: "Authorize an OAuth2 request",
+@@ -607,16 +621,20 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
+ 					return continueEndpoint(ctx, opts);
+ 				},
+ 			),
+-			oauth2Token: createAuthEndpoint(
++			oauth2Token: createOAuthEndpoint(
+ 				"/oauth2/token",
+ 				{
+ 					method: "POST",
+ 					body: z.object({
+-						grant_type: z.enum([
+-							"authorization_code",
+-							"client_credentials",
+-							"refresh_token",
+-						]),
++						grant_type: z
++							.string()
++							.pipe(
++								z.enum([
++									"authorization_code",
++									"client_credentials",
++									"refresh_token",
++								]),
++							),
+ 						client_id: z.string().optional(),
+ 						client_secret: z.string().optional(),
+ 						client_assertion: z.string().optional(),
+@@ -628,6 +646,12 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
+ 						resource: z.string().optional(),
+ 						scope: z.string().optional(),
+ 					}),
++					errorCodesByField: {
++						grant_type: {
++							missing: "invalid_request",
++							invalid: "unsupported_grant_type",
++						},
++					},
+ 					metadata: {
+ 						allowedMediaTypes: ["application/x-www-form-urlencoded"],
+ 						openapi: {
+@@ -758,7 +782,7 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
+ 					return tokenEndpoint(ctx, opts);
+ 				},
+ 			),
+-			oauth2Introspect: createAuthEndpoint(
++			oauth2Introspect: createOAuthEndpoint(
+ 				"/oauth2/introspect",
+ 				{
+ 					method: "POST",
+@@ -768,9 +792,10 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
+ 						client_assertion: z.string().optional(),
+ 						client_assertion_type: z.string().optional(),
+ 						token: z.string(),
+-						token_type_hint: z
+-							.enum(["access_token", "refresh_token"])
+-							.optional(),
++						// RFC 7662 §2.1: hint, server MAY ignore. Unknown values are
++						// coerced to undefined in introspectEndpoint so detection falls
++						// back to trying both token types.
++						token_type_hint: z.string().optional(),
+ 					}),
+ 					metadata: {
+ 						allowedMediaTypes: ["application/x-www-form-urlencoded"],
+@@ -798,9 +823,8 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
+ 												},
+ 												token_type_hint: {
+ 													type: "string",
+-													enum: ["access_token", "refresh_token"],
+ 													description:
+-														"Hint about the type of the token submitted for introspection",
++														"Hint about the token type. Recognized values: `access_token`, `refresh_token`.",
+ 												},
+ 												resource: {
+ 													type: "string",
+@@ -901,7 +925,7 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
+ 					return introspectEndpoint(ctx, opts);
+ 				},
+ 			),
+-			oauth2Revoke: createAuthEndpoint(
++			oauth2Revoke: createOAuthEndpoint(
+ 				"/oauth2/revoke",
+ 				{
+ 					method: "POST",
+@@ -911,9 +935,10 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
+ 						client_assertion: z.string().optional(),
+ 						client_assertion_type: z.string().optional(),
+ 						token: z.string(),
+-						token_type_hint: z
+-							.enum(["access_token", "refresh_token"])
+-							.optional(),
++						// RFC 7009 §2.2.1: hint, server MAY ignore. Unknown values are
++						// coerced to undefined in revokeEndpoint; `unsupported_token_type`
++						// in RFC 7009 applies to the token itself, not the hint value.
++						token_type_hint: z.string().optional(),
+ 					}),
+ 					metadata: {
+ 						allowedMediaTypes: ["application/x-www-form-urlencoded"],
+@@ -941,9 +966,8 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
+ 												},
+ 												token_type_hint: {
+ 													type: "string",
+-													enum: ["access_token", "refresh_token"],
+ 													description:
+-														"Hint about the type of the token submitted for revocation",
++														"Hint about the token type. Recognized values: `access_token`, `refresh_token`.",
+ 												},
+ 											},
+ 											required: ["token"],
+@@ -1103,7 +1127,7 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
+ 					return userInfoEndpoint(ctx, opts);
+ 				},
+ 			),
+-			oauth2EndSession: createAuthEndpoint(
++			oauth2EndSession: createOAuthEndpoint(
+ 				"/oauth2/end-session",
+ 				{
+ 					method: "GET",
+@@ -1149,7 +1173,7 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
+ 					return rpInitiatedLogoutEndpoint(ctx, opts);
+ 				},
+ 			),
+-			registerOAuthClient: createAuthEndpoint(
++			registerOAuthClient: createOAuthEndpoint(
+ 				"/oauth2/register",
+ 				{
+ 					method: "POST",
+@@ -1207,6 +1231,12 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
+ 							})
+ 							.optional(),
+ 					}),
++					errorCodesByField: {
++						redirect_uris: "invalid_redirect_uri",
++						post_logout_redirect_uris: "invalid_redirect_uri",
++						software_statement: "invalid_software_statement",
++					},
++					defaultError: "invalid_client_metadata",
+ 					metadata: {
+ 						openapi: {
+ 							description: "Register an OAuth2 application",
+diff --git a/packages/oauth-provider/src/revoke.ts b/packages/oauth-provider/src/revoke.ts
+index 4e63ec3436..75d244c378 100644
+--- a/packages/oauth-provider/src/revoke.ts
++++ b/packages/oauth-provider/src/revoke.ts
+@@ -249,9 +249,18 @@ export async function revokeEndpoint(
+ ) {
+ 	let { token, token_type_hint } = ctx.body as {
+ 		token: string;
+-		token_type_hint?: "access_token" | "refresh_token";
++		token_type_hint?: string;
+ 	};
+ 
++	// RFC 7009 §2.2.1: unknown hints are ignored and the server extends its
++	// search across all supported token types.
++	if (
++		token_type_hint !== "access_token" &&
++		token_type_hint !== "refresh_token"
++	) {
++		token_type_hint = undefined;
++	}
++
+ 	const credentials = await extractClientCredentials(
+ 		ctx,
+ 		opts,
+diff --git a/packages/oauth-provider/src/token.ts b/packages/oauth-provider/src/token.ts
+index 2ade614286..2a15ce119f 100644
+--- a/packages/oauth-provider/src/token.ts
++++ b/packages/oauth-provider/src/token.ts
+@@ -39,9 +39,9 @@ export async function tokenEndpoint(
+ 	ctx: GenericEndpointContext,
+ 	opts: OAuthOptions<Scope[]>,
+ ) {
+-	const grantType: GrantType | undefined = ctx.body?.grant_type;
++	const grantType: GrantType = ctx.body.grant_type;
+ 
+-	if (opts.grantTypes && grantType && !opts.grantTypes.includes(grantType)) {
++	if (opts.grantTypes && !opts.grantTypes.includes(grantType)) {
+ 		throw new APIError("BAD_REQUEST", {
+ 			error_description: `unsupported grant_type ${grantType}`,
+ 			error: "unsupported_grant_type",
+@@ -55,16 +55,6 @@ export async function tokenEndpoint(
+ 			return handleClientCredentialsGrant(ctx, opts);
+ 		case "refresh_token":
+ 			return handleRefreshTokenGrant(ctx, opts);
+-		case undefined:
+-			throw new APIError("BAD_REQUEST", {
+-				error_description: "missing required grant_type",
+-				error: "unsupported_grant_type",
+-			});
+-		default:
+-			throw new APIError("BAD_REQUEST", {
+-				error_description: `unsupported grant_type ${grantType}`,
+-				error: "unsupported_grant_type",
+-			});
+ 	}
+ }
+ 

@@ -1,0 +1,16 @@
+{
+  "files": [
+    "server/src/enum.ts",
+    "server/src/dtos/time-bucket.dto.ts",
+    "server/src/utils/database.ts",
+    "server/src/repositories/asset.repository.ts",
+    "server/src/controllers/timeline.controller.ts"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "order_selector_is_a_validated_query_dto_field",
+      "description": "The recently-added (upload-date) selector is declared as an optional, validated field on the timeline-bucket query DTO/schema (e.g. TimeBucketDto / TimeBucketAssetDto), so it is bound and accepted by NestJS @Query() validation rather than rejected or silently stripped as an unknown parameter. Accept any selector name/shape the implementation chose (an ordering enum value, a dedicated query field, or a flag) — what matters is that it is a real declared/validated query parameter, not an undeclared key the validation layer would drop, so the feature is reachable through the HTTP endpoints and not only through the service method."
+    }
+  ],
+  "pass_to_pass": []
+}

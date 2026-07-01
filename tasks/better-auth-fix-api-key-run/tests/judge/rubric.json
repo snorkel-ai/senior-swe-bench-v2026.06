@@ -1,0 +1,13 @@
+{
+  "files": [
+    "packages/api-key/src/adapter.ts",
+    "packages/api-key/src/routes/list-api-keys.ts"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "route_parallel_storage_groups",
+      "description": "In packages/api-key/src/routes/list-api-keys.ts, when the list route groups the registered api-key configs by storage backend and queries each group, the per-backend storage-group queries are issued concurrently (for example a Promise.all or Promise.allSettled fan-out over the groups) rather than awaited strictly one group after another, and the merged result still de-duplicates keys by id. Credit any concurrent fan-out that preserves correct merging; do not require a specific concurrency primitive or a bounded concurrency cap."
+    }
+  ],
+  "pass_to_pass": []
+}

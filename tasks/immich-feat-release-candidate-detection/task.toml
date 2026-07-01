@@ -1,0 +1,163 @@
+version = "1.0"
+
+[environment]
+base_image = "immich-feat-release-candidate-detection:latest"
+build_timeout_sec = 2400.0
+cpus = 4
+memory = "8G"
+storage = "16G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "immich"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "immich"
+
+[metadata]
+family = "immich-feat-release-candidate-detection"
+variant = "hard"
+segment = "design"
+repo = "immich"
+tags = ["immich", "typescript-service"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Immich's server periodically polls an upstream release endpoint to learn
+whether a newer server version has been published. When it finds one it
+records the result and broadcasts an `on_new_release` notification to connected
+clients over the websocket; on every websocket connection it also sends the
+running server's version via `on_server_version`. Until now the check only
+understood plain stable releases.
+
+Immich has started publishing release candidates (pre-release builds such as
+`3.0.1-rc.0`). The task is to add a release CHANNEL to the new-version-check
+feature so an admin can opt in to being notified about pre-releases. A "stable"
+channel (the default) must keep ignoring pre-releases, while a
+"release candidate" channel is additionally notified about them. The version
+information the server reports to clients must also start carrying the
+pre-release number (so a client can render `v3.0.1-rc.2`), and the new-release
+notification must describe the kind of release that was found.
+"""
+context = """Setting:
+- `VersionService` (`server/src/services/version.service.ts`) owns the version
+  check. `handleVersionCheck()` reads the `newVersionCheck` config, calls
+  `ServerInfoRepository.getLatestRelease()` for the latest upstream release,
+  decides whether it is newer than `serverVersion` (from
+  `server/src/constants.ts`, a `SemVer`), and on a positive result broadcasts
+  `on_new_release`. `onWebsocketConnection()` sends `on_server_version` (and a
+  cached release notification if one exists).
+- The new-version-check config currently has a single field (`enabled`),
+  defined in `server/src/dtos/system-config.dto.ts` and mirrored in the
+  `SystemConfig` type + `defaults` in `server/src/config.ts`.
+- The server version response (`ServerVersionResponseDto` in
+  `server/src/dtos/server.dto.ts`) is built from a `SemVer` via a `fromSemVer`
+  helper and currently exposes only `major`/`minor`/`patch`.
+- The websocket `ClientEventMap` (`server/src/repositories/websocket.repository.ts`)
+  types the `on_new_release` payload.
+
+What the feature must do:
+- Add a release-channel setting to the new-version-check config with two
+  options — a stable channel (default) and a release-candidate channel — that
+  round-trips through `PUT /system-config`.
+- Thread the configured channel through to the latest-release lookup.
+- Make "is this release newer/available?" channel-aware: on the stable channel
+  a newer PRE-RELEASE is NOT reported; on the release-candidate channel it IS.
+  A newer STABLE release is reported on both channels; equal/older versions on
+  neither.
+- Expose the pre-release number on the version response (the numeric part of an
+  `-rc.N` suffix, or absent for a stable version), for both the running server
+  version and the versions inside the release notification.
+- Add a release-type descriptor to the new-release notification payload.
+
+Why it is non-trivial:
+- The obvious "is it newer" test — `semver.gt(release, server)` — is WRONG for
+  release candidates: `3.0.1-rc.0` compares as greater than `3.0.0`, so a naive
+  implementation would notify stable-channel users about a pre-release. The
+  channel-aware comparison must treat pre-releases as available ONLY on the
+  release-candidate channel.
+- Extracting the pre-release NUMBER from a `SemVer` is fiddly — the prerelease
+  segment is structured (`['rc', 5]`), and a stable version has none, so the
+  field must be nullable.
+- The new-release payload is consumed by generated client SDKs; turning the old
+  in-process notification interface into a proper DTO has to keep that payload
+  discoverable to the API tooling even though it is only ever pushed over the
+  websocket (no controller references it directly).
+"""
+solution = """Canonical fix (reference example, server-only scope):
+- Add a `ReleaseChannel` enum (`stable` / `releaseCandidate`) in
+  system-config.dto.ts, add a `channel` field to `SystemConfigNewVersionCheckDto`,
+  and add `channel` (defaulting to the stable channel) to the `newVersionCheck`
+  shape in config.ts (type + defaults).
+- `ServerInfoRepository.getLatestRelease(channel)` appends the channel to the
+  upstream version-check URL as a query parameter.
+- In `version.service.ts`, replace the `semver.gt(release, server)` availability
+  test with a channel-aware comparison that counts a newer release as available
+  using `semver.intersects('>'+serverVersion, release, { includePrerelease:
+  channel === ReleaseChannel.ReleaseCandidate })`, so pre-releases only qualify
+  on the release-candidate channel. Pass the channel from the config into the
+  comparison and into `getLatestRelease`.
+- Add a nullable `prerelease` int to `ServerVersionResponseDto` and have
+  `fromSemVer` set it to the numeric prerelease segment (`value.prerelease[1] ??
+  null`).
+- Replace the old `ReleaseNotification` interface with a `ReleaseEventV1` DTO
+  that adds a `type` field (`semver.diff(server, release)`), and register it so
+  the OpenAPI tooling still emits it even though it is only broadcast over the
+  websocket (the reference factors the existing `ExtraModel` registry out of
+  sync.dto.ts into decorators.ts and decorates `ReleaseEventV1` with it).
+- `onWebsocketConnection` sends the version as the response DTO object
+  (`ServerVersionResponseDto.fromSemVer(serverVersion)`) rather than the raw
+  `SemVer`.
+
+Alternative valid implementations (all accepted — see
+alternative_implementations).
+
+Non-optimal implementations the reward rejects:
+- Using `semver.gt` (or any comparison that ignores the channel): stable-channel
+  users get notified about release candidates.
+- Reporting the pre-release tag/string instead of the numeric pre-release index,
+  or omitting the field so stable and pre-release versions are indistinguishable.
+- Failing to default the channel to stable, so existing deployments start
+  receiving release-candidate notifications.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["typescript-service"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "framework-fluency", "api-contract-design", "dependency-research", "logic-fix"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 116
+files = 9
+hunks = 22
+scope = "broad"
+
+[metadata.origin]
+repo = "immich-app/immich"
+pr_numbers = [28665, 28701, 28746]
+base_commit = "d120444a878bee655ed09de9f675d05ec36df297"
+base_commit_date = "2026-06-01"
+merged_at = "2026-06-01"
+
+
+
+

@@ -1,0 +1,17 @@
+{
+  "files": [
+    "options/locale/locale_en-US.json",
+    "routers/api/v1/repo/pull.go",
+    "routers/web/repo/pull.go",
+    "services/asymkey/sign.go",
+    "services/automerge/automerge.go",
+    "services/pull/check.go"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "scheduled_auto_merge_honors_head_verification",
+      "description": "The scheduled auto-merge path enforces the same head-commit verification as a direct merge: under require-signed-commits with no instance signing key, a fast-forward-only pull request whose head is unverified is NOT silently auto-merged once its other checks pass — it is refused/held for the unverified-head reason, just as a direct merge would be. Any implementation that routes the auto-merge path through the shared merge pre-check (rather than re-implementing or skipping the signing/verification gate) satisfies this; the exact structure is not graded."
+    }
+  ],
+  "pass_to_pass": []
+}

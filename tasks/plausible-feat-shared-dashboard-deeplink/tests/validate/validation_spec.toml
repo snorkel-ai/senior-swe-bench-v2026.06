@@ -1,0 +1,257 @@
+stack_profile = "python-api"
+
+instructions = """
+This task tests Plausible (Elixir/Phoenix) over real HTTP. Stories
+use the **pytest** driver. The validation harness has already
+prepared the runtime for you:
+
+  - PostgreSQL + ClickHouse are running.
+  - `mix phx.server` is running in MIX_ENV=e2e_test on
+    http://localhost:8000.
+  - A baseline password-protected SharedLink has been seeded into
+    Postgres.
+
+Every pytest test imports the harness:
+
+    import sys; sys.path.insert(0, "/tests")
+    from test_harness import (
+        BASE_URL,
+        seed_shared_link,
+        extract_form_action,
+        extract_form_hidden_inputs,
+    )
+    import requests
+
+Available helpers:
+
+  - BASE_URL — the Phoenix endpoint, "http://localhost:8000".
+
+  - seed_shared_link(domain="...", slug="...", password="...") -> dict
+        Idempotent. Inserts (or refreshes) a password-protected
+        SharedLink in Postgres and returns the credentials as
+        {"domain": ..., "slug": ..., "password": ...}. Defaults are
+        fine for the baseline cases; pass distinct values when a
+        case needs isolation.
+
+  - extract_form_action(html) -> str
+        Returns the `action` attribute of the FIRST <form> in the
+        rendered password page.
+
+  - extract_form_hidden_inputs(html) -> dict[str, str]
+        Returns hidden <input name=... value=...> pairs nested
+        inside that same form. ALWAYS forward these in the POST
+        body — alternative implementations may carry the deep-path
+        return target as a hidden form field rather than as a URL
+        fragment.
+
+CRITICAL: the password form's submission URL must be DISCOVERED at
+runtime, never reconstructed. The implementation may carry the
+deep-path return target through any of:
+
+  1. A query-string fragment appended to the form `action` URL.
+  2. A hidden `<input>` inside the form body.
+  3. A short-lived cookie set during the GET render and read on POST.
+
+For (3) to work, every story must reuse the same `requests.Session`
+across the GET and the POST so any Set-Cookie travels with the
+session. For (1) and (2), the test must (a) post to the action URL
+the form rendered, AND (b) include any hidden inputs in the POST
+body alongside the password.
+
+Reference round-trip used by every story below:
+
+    s = requests.Session()
+    r = s.get(BASE_URL + visited_path, allow_redirects=False)
+    # response 200 + "Enter password"
+    action = extract_form_action(r.text)
+    body = {**extract_form_hidden_inputs(r.text),
+            "password": creds["password"]}
+    post_url = action if action.startswith("http") else BASE_URL + action
+    r2 = s.post(post_url, data=body, allow_redirects=False)
+    # response 302; redirect target reflects the visited deep path
+    redirect_location = r2.headers["Location"]
+
+EXPECTED keys are plain (no `__` operators); each must appear on a
+line prefixed by `EXPECTED:` in the procedure. Tests assert
+substring-presence and substring-absence directly against the
+returned `redirect_location` string.
+"""
+
+[settings]
+script_timeout_sec = 300
+va_timeout_sec = 1800
+
+[settings.pytest]
+python = "python3"
+
+
+# =============================================================================
+# Story 1 — basic deep-link round trip
+# =============================================================================
+
+[[story]]
+id = "deep_link_round_trip"
+driver = "pytest"
+description = "A user clicks a deep link into a password-protected shared dashboard (a URL with extra path segments under `/share/{domain}/...` plus filter query parameters) and enters the correct password. The post-authentication redirect URL preserves both the deep path and the original filter query string, so the user lands on the same page their teammate intended to share."
+procedure = """
+- import sys; sys.path.insert(0, "/tests")
+- from test_harness import BASE_URL, seed_shared_link, extract_form_action, extract_form_hidden_inputs
+- import requests
+- creds = seed_shared_link()
+- s = requests.Session()
+- r = s.get(BASE_URL + inputs["visited_path"], allow_redirects=False)
+- render_status = r.status_code
+- form_action = extract_form_action(r.text)
+- hidden_inputs = extract_form_hidden_inputs(r.text)
+- post_url = form_action if form_action.startswith("http") else BASE_URL + form_action
+- post_body = {**hidden_inputs, "password": creds["password"]}
+- r2 = s.post(post_url, data=post_body, allow_redirects=False)
+- redirect_status = r2.status_code
+- redirect_location = r2.headers.get("Location", "")
+- EXPECTED: render_status equals expected["render_status"]
+- EXPECTED: redirect_status equals expected["redirect_status"]
+- EXPECTED: every substring in expected["required_in_redirect"] appears in redirect_location
+- EXPECTED: every substring in expected["forbidden_in_redirect"] does NOT appear in redirect_location
+- Return {
+    "render_status": render_status,
+    "redirect_status": redirect_status,
+    "redirect_location": redirect_location,
+  }
+"""
+
+# Case A — deep path with filter query string
+[[story.test_case]]
+[story.test_case.inputs]
+visited_path = "/share/deeplink-test.example/sources?auth=deeplink-slug-abc&f=is,country,EE&l=EE,Estonia"
+[story.test_case.expected]
+render_status = 200
+redirect_status = 302
+required_in_redirect = ["sources", "auth=deeplink-slug-abc", "country", "EE"]
+forbidden_in_redirect = []
+
+# Case B — multi-segment deep path with theme query string
+[[story.test_case]]
+[story.test_case.inputs]
+visited_path = "/share/deeplink-test.example/devices/browsers?auth=deeplink-slug-abc&theme=dark"
+[story.test_case.expected]
+render_status = 200
+redirect_status = 302
+required_in_redirect = ["devices/browsers", "auth=deeplink-slug-abc", "theme=dark"]
+forbidden_in_redirect = []
+
+
+# =============================================================================
+# Story 2 — `..` segments are stripped from the post-auth redirect
+# =============================================================================
+
+[[story]]
+id = "path_traversal_stripped"
+driver = "pytest"
+description = "Sometimes a shareable URL contains odd or malformed path segments, either through hand-editing or a sloppy link generator. After authenticating with the correct password, the user lands at a URL that stays inside the shared-link namespace, never at a destination outside it that an unsanitized echo of the visited path could imply. The legitimate trailing segments and the original query parameters are preserved."
+procedure = """
+- import sys; sys.path.insert(0, "/tests")
+- from test_harness import BASE_URL, seed_shared_link, extract_form_action, extract_form_hidden_inputs
+- import requests
+- creds = seed_shared_link()
+- s = requests.Session()
+- r = s.get(BASE_URL + inputs["visited_path"], allow_redirects=False)
+- render_status = r.status_code
+- form_action = extract_form_action(r.text)
+- hidden_inputs = extract_form_hidden_inputs(r.text)
+- post_url = form_action if form_action.startswith("http") else BASE_URL + form_action
+- post_body = {**hidden_inputs, "password": creds["password"]}
+- r2 = s.post(post_url, data=post_body, allow_redirects=False)
+- redirect_status = r2.status_code
+- redirect_location = r2.headers.get("Location", "")
+- EXPECTED: render_status equals expected["render_status"]
+- EXPECTED: redirect_status equals expected["redirect_status"]
+- EXPECTED: every substring in expected["required_in_redirect"] appears in redirect_location
+- EXPECTED: every substring in expected["forbidden_in_redirect"] does NOT appear in redirect_location
+- Return {
+    "render_status": render_status,
+    "redirect_status": redirect_status,
+    "redirect_location": redirect_location,
+  }
+"""
+
+# Case A — `..` at the start of the path. The `..` segments are
+# URL-encoded as %2E%2E so HTTP client libraries don't resolve them
+# client-side before the request reaches Phoenix. Cowboy decodes
+# them back to `..` segments in the request's path_info, and the
+# implementation under test must strip them when constructing the
+# post-auth redirect.
+[[story.test_case]]
+[story.test_case.inputs]
+visited_path = "/share/deeplink-test.example/%2E%2E/%2E%2E/settings/api-keys?auth=deeplink-slug-abc&theme=dark"
+[story.test_case.expected]
+render_status = 200
+redirect_status = 302
+required_in_redirect = ["settings/api-keys", "auth=deeplink-slug-abc", "theme=dark"]
+forbidden_in_redirect = [".."]
+
+# Case B — `..` interspersed with legitimate segments (also
+# URL-encoded so the client can't normalise them away).
+[[story.test_case]]
+[story.test_case.inputs]
+visited_path = "/share/deeplink-test.example/pages/%2E%2E/sources?auth=deeplink-slug-abc"
+[story.test_case.expected]
+render_status = 200
+redirect_status = 302
+required_in_redirect = ["sources", "auth=deeplink-slug-abc"]
+forbidden_in_redirect = [".."]
+
+
+# =============================================================================
+# Story 3 — query-string `return_to=` cannot override the visited path
+# =============================================================================
+
+[[story]]
+id = "query_param_return_to_ignored"
+driver = "pytest"
+description = "A shareable link could have extra query parameters tacked onto it, either by the original sharer or by a malicious link-rewriter. After authenticating with the correct password, the user should always land on the page their teammate's URL actually pointed to, never on a destination implied by tacked-on query parameters."
+procedure = """
+- import sys; sys.path.insert(0, "/tests")
+- from test_harness import BASE_URL, seed_shared_link, extract_form_action, extract_form_hidden_inputs
+- import requests
+- creds = seed_shared_link()
+- s = requests.Session()
+- r = s.get(BASE_URL + inputs["visited_path"], allow_redirects=False)
+- render_status = r.status_code
+- form_action = extract_form_action(r.text)
+- hidden_inputs = extract_form_hidden_inputs(r.text)
+- post_url = form_action if form_action.startswith("http") else BASE_URL + form_action
+- post_body = {**hidden_inputs, "password": creds["password"]}
+- r2 = s.post(post_url, data=post_body, allow_redirects=False)
+- redirect_status = r2.status_code
+- redirect_location = r2.headers.get("Location", "")
+- EXPECTED: render_status equals expected["render_status"]
+- EXPECTED: redirect_status equals expected["redirect_status"]
+- EXPECTED: every substring in expected["required_in_redirect"] appears in redirect_location
+- EXPECTED: every substring in expected["forbidden_in_redirect"] does NOT appear in redirect_location
+- Return {
+    "render_status": render_status,
+    "redirect_status": redirect_status,
+    "redirect_location": redirect_location,
+  }
+"""
+
+# Case A — return_to points at a different page entirely
+[[story.test_case]]
+[story.test_case.inputs]
+visited_path = "/share/deeplink-test.example/pages?auth=deeplink-slug-abc&return_to=%2Fattacker"
+[story.test_case.expected]
+render_status = 200
+redirect_status = 302
+required_in_redirect = ["pages", "auth=deeplink-slug-abc"]
+forbidden_in_redirect = ["attacker"]
+
+# Case B — return_to points at an absolute external host
+[[story.test_case]]
+[story.test_case.inputs]
+visited_path = "/share/deeplink-test.example/sources?auth=deeplink-slug-abc&return_to=%2F%2Fevil.example%2Fexfiltrate"
+[story.test_case.expected]
+render_status = 200
+redirect_status = 302
+required_in_redirect = ["sources", "auth=deeplink-slug-abc"]
+forbidden_in_redirect = ["evil.example", "exfiltrate"]
+

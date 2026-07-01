@@ -1,0 +1,26 @@
+{
+  "files": [
+    "elixir/lib/portal_web/components/core_components.ex",
+    "elixir/lib/portal_web/live/clients.ex",
+    "elixir/lib/portal_web/live/clients/components.ex",
+    "elixir/lib/portal_web/live/policies.ex",
+    "elixir/lib/portal_web/live/policies/components.ex",
+    "elixir/lib/portal_web/live/resources.ex",
+    "elixir/lib/portal_web/live/resources/components.ex"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "all_three_panels_consistent",
+      "description": "The recent-policy-authorizations listing is implemented on ALL THREE entity detail pages — Clients, Policies, and Resources — and each panel is keyed to its OWN entity: the client panel keys on the client's device id(s) (initiating/receiving device), the policy panel keys on the policy id, and the resource panel keys on the resource id. A diff that wires the listing on only one or two of the three panels does NOT satisfy this criterion, nor does one that adds a panel keyed on the wrong column (e.g. keying the client panel on the owning actor id instead of the device id, so it shows the wrong rows or none). The three panels need not share identical markup or module structure — an inline section, a tab, or a sub-route are all acceptable — but all three must surface the entity's own recent authorizations. Accept any reasonable structure (an inline query module, a shared context function, per-panel components, non-English identifiers); judge the observable wiring, not the naming."
+    },
+    {
+      "name": "query_is_subject_scoped",
+      "description": "The query that lists policy authorizations for a panel is scoped to the requesting admin's subject/account, so authorizations belonging to other accounts can never appear on a panel. This is satisfied by running the query through the codebase's subject-scoped query path (e.g. Safe.scoped(subject, ...) as the surrounding list/query functions do) or by an explicit account filter tied to the requesting subject (e.g. where account_id == ^subject.account.id). An unscoped global query over the PolicyAuthorization table — one that filters only by the entity id without any subject/account constraint — does NOT satisfy this criterion. Accept any equivalent scoping mechanism; the requirement is that account isolation is enforced on the listing query, not the specific helper used."
+    },
+    {
+      "name": "authorizations_presented_as_a_tab",
+      "description": "The recent-authorizations listing is presented as a tab (or equivalent in-page secondary view) WITHIN each detail page — the preferred layout in this admin UI: the page keeps its pre-existing content as the default view, and the operator switches to a separate 'authorizations' tab to see the listing, the same way other multi-section detail panels in PortalWeb are organized. A tab bar with the authorizations behind a non-default tab satisfies this. An always-visible inline block that dumps the authorizations onto the default detail view alongside the existing content does NOT satisfy this criterion (it is a workable but non-preferred layout), and neither does a fully separate top-level page that navigates the operator away from the detail page. Judge the observable layout, not the markup or the tab's label."
+    }
+  ],
+  "pass_to_pass": []
+}

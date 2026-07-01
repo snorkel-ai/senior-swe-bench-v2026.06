@@ -1,0 +1,39 @@
+{
+  "files": [
+    "src/harbor/environments/docker/docker.py",
+    "src/harbor/environments/docker/__init__.py",
+    "src/harbor/environments/docker/docker_windows.py",
+    "src/harbor/environments/docker/docker_unix.py",
+    "src/harbor/environments/docker/docker-compose-base.yaml",
+    "src/harbor/environments/docker/docker-compose-windows-keepalive.yaml",
+    "src/harbor/environments/base.py",
+    "src/harbor/verifier/verifier.py",
+    "src/harbor/agents/oracle.py",
+    "src/harbor/mappers/terminal_bench.py",
+    "src/harbor/trial/trial.py",
+    "src/harbor/cli/tasks.py"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "os_preflight_error_clarity",
+      "description": "When a Windows task is paired with an agent that cannot run Windows, the pre-setup OS-compatibility preflight fails with a clear, actionable error that identifies the incompatibility — that the chosen agent does not support the task's Windows OS — rather than a bare/opaque exception or a deep crash later in the run. The validation story already confirms an exception is raised before agent setup; this criterion judges only the quality of the message. Accept any wording that names the agent/OS mismatch and points the reader at the cause; flag a terse, generic, or misleading message (e.g. a bare RuntimeError with no OS context). The exception class and exact wording are free choices — do not require a specific class or string."
+    },
+    {
+      "name": "windows_exec_strategy",
+      "description": "The Windows container code path moves files into the container and runs commands in a way that works under Hyper-V isolation, where `docker cp` is unavailable. Accept any working transfer strategy other than `docker cp` (e.g. streaming a tar archive through an exec/attach channel) — do not require a specific helper name. Command invocation for Windows must go through the Windows command interpreter (`cmd /S /C` or `cmd /c`) rather than a Linux shell (`bash -c`). Line-ending handling for batch scripts written into the container must be sane (e.g. CRLF or an explicit, deliberate choice) rather than blindly reusing the Linux text path. Making a script executable before running it is applied where it is needed (shell scripts) and not gratuitously to batch scripts that don't require it. The Linux path must keep using its existing shell/transfer mechanism — i.e. the OS paths are genuinely split, not Windows behaviour bolted onto every container."
+    },
+    {
+      "name": "windows_compose_volumes",
+      "description": "The Windows container/volume configuration mounts volumes in a form that survives the Windows drive-letter colon (`C:`). A naive `host:container` string join breaks on `C:` because the drive colon is mis-read as the host/container separator. Accept any colon-safe arrangement (e.g. long-form compose volume syntax with explicit source/target keys, or an equivalent that does not split on a bare colon). Reject a configuration that joins a `C:`-rooted container path with a bare `:` separator."
+    },
+    {
+      "name": "windows_daemon_preflight",
+      "description": "Before actually running a Windows task, the implementation validates that the environment can serve it — that the Docker daemon's OS (and/or the image's OS) matches the requested task OS — and fails with a clear, actionable error message rather than letting the run crash deep in low-level Docker plumbing. Accept any equivalent validation point as long as it happens before the task is launched and produces an understandable error. A Linux task must not be gratuitously blocked by this check."
+    },
+    {
+      "name": "breadth_consistency",
+      "description": "The OS distinction is threaded consistently through every framework surface that consumes it, not bolted onto one layer while the rest still assume Linux. The consuming surfaces include: the container execution layer (file copy + command exec), the verifier's copy/exec of the test script, the oracle agent's copy/exec of the solve script, and the terminal-bench task mapper. Each of these must select script flavour / paths / shell from the task's declared OS rather than hard-coding `.sh`, POSIX paths, or `bash`. Flag any surface in this list that was left Linux-only (a half-migrated, broken-windows result)."
+    }
+  ],
+  "pass_to_pass": []
+}

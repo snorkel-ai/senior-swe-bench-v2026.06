@@ -1,0 +1,888 @@
+instructions = """
+This task uses TWO validation drivers: "pytest" for the backend stories and one
+"jest" story for the frontend.
+
+The "pytest" stories are Django backend tests driven through the PRE-EXISTING
+DRF subscriptions endpoints and the PRE-EXISTING Temporal delivery
+activities/workflow. Import the harness first (it handles Django setup, the EE
+license, and provides factory + delivery-driver helpers):
+
+     import sys; sys.path.insert(0, "/tests")
+     from test_harness import (
+         get_team_and_user,
+         get_authenticated_client,
+         create_insight,
+         create_slack_integration,
+         create_subscription,
+         mock_temporal_sync_connect,
+         run_process_workflow,
+         run_deliver_activity,
+         run_fetch_due,
+         failed_delivery_count,
+     )
+
+   Available helpers (all load PRE-EXISTING code only — no task-introduced
+   symbol is imported):
+     - get_team_and_user() -> (team, user)
+       Fresh Org -> Project -> Team + User chain with an active enterprise
+       license and the org's product features synced (subscriptions are an
+       EE feature; without a license the endpoints 4xx before any feature
+       logic runs). Unique UUIDs per call, so stories are isolated.
+     - get_authenticated_client(user) -> DRF APIClient with force_login.
+     - create_insight(team, short_id=None, name=...) -> Insight.
+     - create_slack_integration(team, config=None) -> Integration(kind="slack").
+     - create_subscription(team, user, target_type="email",
+         target_value="recipient@test.com", integration_id=None, insight=None,
+         frequency="daily", interval=1, start_date=None, **schedule)
+         -> Subscription
+       Thin wrapper over the pre-existing ``Subscription.objects.create`` that
+       passes ONLY pre-existing model fields. It creates the row at the model's
+       own default lifecycle state (i.e. enabled). It does NOT take an
+       ``enabled`` kwarg and never names the lifecycle field. ``**schedule``
+       forwards pre-existing recurrence fields such as ``until_date`` and
+       ``count``; ``start_date`` defaults to now (pass a past datetime, and a
+       past ``until_date``, to build an exhausted schedule).
+     - mock_temporal_sync_connect() -> context manager
+       Patches the pre-existing ``ee.api.subscription.sync_connect`` so
+       create / update / test-delivery requests don't reach a real Temporal
+       cluster. Each ``with`` block yields a FRESH mock whose
+       ``return_value.start_workflow`` is an AsyncMock starting at
+       ``call_count == 0`` — read ``mock.return_value.start_workflow.call_count``
+       to count workflow triggers for the operation performed inside that block.
+     - run_process_workflow(subscription, *, slack_integration_present=False)
+       -> {"latest_status": str|None, "error_type": str|None,
+            "failed_count": int, "completed_cleanly": bool}
+       Drives the FULL pre-existing ProcessSubscriptionWorkflow end-to-end in
+       an ephemeral time-skipping Temporal environment, with the
+       ClickHouse / export / Slack-integration boundaries mocked exactly as
+       PostHog's own subscription-workflow tests do. This is the highest-level
+       delivery interface, so reading the resulting subscription state through
+       the API afterward is robust to WHERE a solution places its auto-disable
+       check. ``latest_status`` is the most recent ``SubscriptionDelivery.status``
+       value (the FAILED token is the string ``"failed"``). ``error_type`` is
+       the per-recipient ``error.type`` category token on that delivery (read it
+       back — do not assume a spelling). ``failed_count`` is the number of FAILED
+       delivery rows. ``completed_cleanly`` is True when the workflow returned
+       without surfacing an exception (a handled, terminal disable returns
+       cleanly; a workflow that raises the delivery failure out reports False).
+     - run_deliver_activity(subscription, exported_asset_ids)
+       -> {"recipient_results": list, "error_type": str|None,
+            "completed_cleanly": bool}
+       Runs the single pre-existing ``deliver_subscription`` activity via
+       ``ActivityEnvironment``. Pass ids that don't resolve to deliverable
+       assets (e.g. ``[99999999]``) to exercise the transient no-assets path.
+     - run_fetch_due(buffer_minutes=15) -> set[int]
+       Runs the pre-existing ``fetch_due_subscriptions_activity`` and returns
+       the set of subscription ids it yields.
+     - failed_delivery_count(subscription) -> int
+       Counts the subscription's FAILED ``SubscriptionDelivery`` rows
+       (pre-existing model + status enum).
+
+   READING / CHANGING the enabled state — IMPORTANT (no implementation names):
+   The pause/resume lifecycle is exposed on the API as the ``enabled`` field;
+   the task contract fixes that name AT THE API. Where the state physically
+   lives on the model may differ between solutions (it might be a field named
+   ``enabled``, or a differently-named field serialised via DRF ``source=``), so
+   do NOT read or write a model attribute for it. Instead:
+     - To OBSERVE enabled state: GET
+       ``/api/projects/{team.id}/subscriptions/{sub.id}/`` and read
+       ``response.json()["enabled"]``.
+     - To PAUSE/RESUME or create-disabled: PATCH/POST ``{"enabled": <bool>}``
+       through the endpoint (disabling is always accepted; create-disabled and
+       re-enabling go through the serializer). ``create_subscription`` makes an
+       enabled row — PATCH it to pause when a test needs a paused starting state.
+   Pre-existing model fields (``integration``, ``next_delivery_date``,
+   ``until_date``, ``start_date``, ``target_type``) ARE stable — read/set them
+   directly when a test must construct a state the API would reject (e.g. a
+   subscription whose integration was later removed, or a stale next-delivery
+   date).
+
+   Every backend story drives a PRE-EXISTING interface — the DRF endpoints
+   ``/api/projects/{team.id}/subscriptions/...``, ``.../test-delivery/``, or the
+   pre-existing Temporal activities/workflow. Assert on status codes, the API
+   ``enabled`` field, the API error ``attr`` / ``detail``, the delivery
+   ``error.type`` category token (read back, never pinned to a spelling), failed
+   delivery counts, and workflow trigger counts.
+
+   For pytest stories, ``inputs`` and ``expected`` are injected as fixtures.
+
+The single "jest" story (jest_config_key = "jest_frontend",
+script_extension = ".test.tsx") renders a PRE-EXISTING frontend component with
+the project Jest config (jsdom; @testing-library/react + the repo's standard
+setup are available). Its first line MUST be ``// @ts-nocheck`` (kea-typegen
+types are absent in the container). Use ``getTestCases()`` from
+``./validationParams``. Discover the component to import by reading the
+implementing source (the procedure names the natural location as a hint only).
+"""
+
+[settings]
+va_max_turns = 80
+va_timeout_sec = 2400
+script_timeout_sec = 2400
+
+[settings.pytest]
+# venv python directly (NOT "uv run python"): uv run auto-syncs and re-prunes the
+# setuptools that validation-setup.sh installed, breaking pkg_resources at import.
+python = "/repo/posthog/.venv/bin/python"
+django_settings = "posthog.settings"
+
+[settings.jest_frontend]
+config_dir = "frontend"
+test_parent = "frontend/src"
+command = "pnpm exec jest"
+test_path_flag = "--testPathPattern"
+
+
+# =============================================================================
+# Backend API stories (pytest) — pre-existing DRF subscriptions endpoints
+# =============================================================================
+
+[[story]]
+id = "enabled_lifecycle"
+driver = "pytest"
+description = """
+Report subscriptions have an enabled/disabled lifecycle that is independent of
+the soft-delete flag: enabled by default, can be created already paused, and can
+be paused or resumed without being deleted. A create/update only kicks off a
+delivery when the subscription is left enabled. Enabling, re-enabling, or editing
+an enabled subscription each trigger exactly one delivery, while disabling
+triggers none.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        create_insight,
+        create_subscription,
+        mock_temporal_sync_connect,
+    )
+
+This story drives the PRE-EXISTING subscriptions endpoints. The enabled state
+is read from the API response / a GET; workflow triggers are counted via the
+mock yielded by ``mock_temporal_sync_connect()``. Each measured create/update is
+performed inside its OWN ``with mock_temporal_sync_connect() as temporal:`` block
+so ``temporal.return_value.start_workflow.call_count`` reflects only that
+operation (any setup PATCH used to reach a paused starting state is done in a
+SEPARATE earlier ``with`` block and its count ignored).
+
+Steps (branch on ``inputs["case_label"]``):
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+
+2. Reach the case's STARTING state and perform the MEASURED operation, reading
+   ``workflow_call_count`` inside the measured block:
+
+   - ``get_default``: ``sub = create_subscription(team, user)``; then
+     ``response = client.get(f"/api/projects/{team.id}/subscriptions/{sub.id}/")``;
+     ``workflow_call_count = 0`` (a GET triggers nothing).
+   - ``create_disabled``: ``insight = create_insight(team)``; inside a measured
+     block POST ``{"insight": insight.id, "target_type": "email",
+     "target_value": "owner@test.com", "frequency": "daily", "interval": 1,
+     "start_date": "2022-01-01T00:00:00", "title": "paused on create",
+     "enabled": False}``.
+   - ``pause_active``: ``sub = create_subscription(team, user)``; inside a
+     measured block PATCH ``{"enabled": False}``.
+   - ``edit_while_enabled``: ``sub = create_subscription(team, user)``; inside a
+     measured block PATCH ``{"title": "renamed"}``.
+   - ``enable_paused``: ``sub = create_subscription(team, user)``; in a SETUP
+     block PATCH ``{"enabled": False}``; then in a measured block PATCH
+     ``{"enabled": True}``.
+   - ``redundant_enable``: ``sub = create_subscription(team, user)``; in a
+     measured block PATCH ``{"enabled": True}`` (already enabled).
+   - ``redundant_disable``: ``sub = create_subscription(team, user)``; in a SETUP
+     block PATCH ``{"enabled": False}``; then in a measured block PATCH
+     ``{"enabled": False}`` (already disabled).
+
+   Use ``format="json"`` on POST/PATCH. POST path is
+   ``f"/api/projects/{team.id}/subscriptions"``; the detail path is
+   ``f"/api/projects/{team.id}/subscriptions/{sub.id}/"``.
+
+3. Read back the resulting state via the API:
+   - ``status_code = response.status_code`` (of the measured operation).
+   - GET the subscription and read ``body = get.json()``:
+     ``enabled = body.get("enabled")``; ``deleted = body.get("deleted")``.
+     (For ``get_default`` the measured response already IS the GET.)
+
+- EXPECTED: ``status_code`` equals ``expected["status_code"]``.
+- EXPECTED: ``enabled`` equals ``expected["enabled"]``.
+- EXPECTED: ``deleted`` equals ``expected["deleted"]`` (pausing never deletes).
+- EXPECTED: ``workflow_call_count`` equals ``expected["workflow_call_count"]``.
+
+Return ``{"status_code": status_code, "enabled": enabled, "deleted": deleted, "workflow_call_count": workflow_call_count}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "get_default"
+[story.test_case.expected]
+status_code = 200
+enabled = true
+deleted = false
+workflow_call_count = 0
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "create_disabled"
+[story.test_case.expected]
+status_code = 201
+enabled = false
+deleted = false
+workflow_call_count = 0
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "pause_active"
+[story.test_case.expected]
+status_code = 200
+enabled = false
+deleted = false
+workflow_call_count = 0
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "edit_while_enabled"
+[story.test_case.expected]
+status_code = 200
+enabled = true
+deleted = false
+workflow_call_count = 1
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "enable_paused"
+[story.test_case.expected]
+status_code = 200
+enabled = true
+deleted = false
+workflow_call_count = 1
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "redundant_enable"
+[story.test_case.expected]
+status_code = 200
+enabled = true
+deleted = false
+workflow_call_count = 1
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "redundant_disable"
+[story.test_case.expected]
+status_code = 200
+enabled = false
+deleted = false
+workflow_call_count = 0
+
+
+[[story]]
+id = "safe_re_enable_reschedules"
+driver = "pytest"
+description = """
+Resuming a paused subscription schedules the next delivery in the future and
+triggers exactly one confirmation delivery.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        create_subscription,
+        mock_temporal_sync_connect,
+    )
+    from datetime import timedelta
+    from django.utils import timezone
+    from posthog.models.subscription import Subscription
+
+Steps (branch on ``inputs["case_label"]``):
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+
+2. Build the paused starting state, then resume inside a measured block:
+
+   - ``reset_stale_date``:
+     ``sub = create_subscription(team, user)``; in a SETUP block PATCH
+     ``{"enabled": False}``; force a stale (past) next-delivery date on the
+     pre-existing field:
+     ``Subscription.objects.filter(pk=sub.id).update(next_delivery_date=timezone.now() - timedelta(days=3))``;
+     then in a measured block:
+     ``response = client.patch(detail, {"enabled": True}, format="json")``.
+
+   - ``extend_exhausted``:
+     ``sub = create_subscription(team, user, start_date=timezone.now() - timedelta(days=10), until_date=timezone.now() - timedelta(days=1))``
+     (an already-exhausted schedule); in a SETUP block PATCH
+     ``{"enabled": False}``; then in a measured block re-enable AND extend:
+     ``response = client.patch(detail, {"enabled": True, "until_date": (timezone.now() + timedelta(days=30)).isoformat()}, format="json")``.
+
+   ``detail = f"/api/projects/{team.id}/subscriptions/{sub.id}/"``. Read
+   ``workflow_call_count = temporal.return_value.start_workflow.call_count``
+   inside the measured block.
+
+3. Capture:
+   - ``status_code = response.status_code``.
+   - GET the subscription; ``enabled = get.json().get("enabled")``.
+   - ``sub.refresh_from_db()``;
+     ``next_date_is_future = sub.next_delivery_date is not None and sub.next_delivery_date > timezone.now()``
+     (``next_delivery_date`` is a pre-existing field).
+
+- EXPECTED: ``status_code`` equals ``expected["status_code"]``.
+- EXPECTED: ``enabled`` equals ``expected["enabled"]``.
+- EXPECTED: ``next_date_is_future`` equals ``expected["next_date_is_future"]``.
+- EXPECTED: ``workflow_call_count`` equals ``expected["workflow_call_count"]``.
+
+Return ``{"status_code": status_code, "enabled": enabled, "next_date_is_future": next_date_is_future, "workflow_call_count": workflow_call_count}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "reset_stale_date"
+[story.test_case.expected]
+status_code = 200
+enabled = true
+next_date_is_future = true
+workflow_call_count = 1
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "extend_exhausted"
+[story.test_case.expected]
+status_code = 200
+enabled = true
+next_date_is_future = true
+workflow_call_count = 1
+
+
+[[story]]
+id = "unsafe_re_enable_rejected"
+driver = "pytest"
+description = """
+If a subscription is in a state where it can't deliver (e.g. a Slack integration
+that's gone, or an unsupported delivery channel), resuming it is rejected up
+front, attributed to the enabled field. Same for when the recurrence schedule has
+already run out.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        create_slack_integration,
+        create_subscription,
+        mock_temporal_sync_connect,
+    )
+    from datetime import timedelta
+    from django.utils import timezone
+    from posthog.models.subscription import Subscription
+
+This story drives the PRE-EXISTING PATCH endpoint. Every case reaches a PAUSED
+subscription whose resume would be unsafe, then attempts to resume it. The
+resume must be rejected (4xx, attributed to the enabled field) and must NOT be a
+partial write — the subscription is still disabled afterward (read via the API).
+
+Steps (branch on ``inputs["case_label"]``):
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+   ``detail = f"/api/projects/{team.id}/subscriptions/{sub.id}/"``.
+
+2. Build the paused-but-unsafe state:
+
+   - ``slack_integration_missing``:
+     ``integration = create_slack_integration(team)``;
+     ``sub = create_subscription(team, user, target_type="slack", target_value="C1234|#general", integration_id=integration.id)``;
+     in a SETUP ``with mock_temporal_sync_connect():`` PATCH ``{"enabled": False}``;
+     then remove the integration on the pre-existing field:
+     ``Subscription.objects.filter(pk=sub.id).update(integration=None)``.
+
+   - ``unsupported_webhook``:
+     ``sub = create_subscription(team, user, target_type="webhook", target_value="https://example.com/hook")``;
+     in a SETUP ``with mock_temporal_sync_connect():`` PATCH ``{"enabled": False}``.
+
+   - ``exhausted_no_extend``:
+     ``sub = create_subscription(team, user, start_date=timezone.now() - timedelta(days=10), until_date=timezone.now() - timedelta(days=1))``;
+     in a SETUP ``with mock_temporal_sync_connect():`` PATCH ``{"enabled": False}``.
+
+3. Attempt to resume (no target/schedule fix in the body):
+   ``response = client.patch(detail, {"enabled": True}, format="json")``.
+
+4. Capture:
+   - ``status_code = response.status_code``.
+   - ``body = response.json()``; ``attr = body.get("attr")``.
+   - GET the subscription; ``enabled = get.json().get("enabled")``.
+
+- EXPECTED: ``status_code`` equals ``expected["status_code"]``.
+- EXPECTED: ``attr`` equals ``expected["attr"]`` (rejection attributed to the enabled field).
+- EXPECTED: ``enabled`` equals ``expected["enabled"]`` (still paused — rejected pre-write).
+
+Return ``{"status_code": status_code, "attr": attr, "enabled": enabled}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "slack_integration_missing"
+[story.test_case.expected]
+status_code = 400
+attr = "enabled"
+enabled = false
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "unsupported_webhook"
+[story.test_case.expected]
+status_code = 400
+attr = "enabled"
+enabled = false
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "exhausted_no_extend"
+[story.test_case.expected]
+status_code = 400
+attr = "enabled"
+enabled = false
+
+
+[[story]]
+id = "exhaustion_rejected_on_write"
+driver = "pytest"
+description = """
+A create or edit that would leave a subscription with no future delivery (an
+exhausted recurrence schedule) is rejected, while an equivalent write whose
+schedule still has a future occurrence succeeds.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        create_insight,
+        create_subscription,
+        mock_temporal_sync_connect,
+    )
+    from datetime import timedelta
+    from django.utils import timezone
+
+All cases write through the endpoint inside ``with mock_temporal_sync_connect():``.
+
+Steps (branch on ``inputs["case_label"]``):
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+
+2. - ``create_exhausted``: ``insight = create_insight(team)``; POST
+     ``f"/api/projects/{team.id}/subscriptions"`` with
+     ``{"insight": insight.id, "target_type": "email", "target_value": "owner@test.com",
+       "frequency": "daily", "interval": 1, "start_date": "2020-01-01T00:00:00",
+       "until_date": "2020-01-02T00:00:00", "title": "exhausted"}``.
+
+   - ``patch_into_exhaustion``: ``sub = create_subscription(team, user, start_date=timezone.now() - timedelta(days=10))``;
+     PATCH ``f"/api/projects/{team.id}/subscriptions/{sub.id}/"`` with
+     ``{"until_date": (timezone.now() - timedelta(days=1)).isoformat()}``.
+
+   - ``create_valid_control``: ``insight = create_insight(team)``; POST with the
+     same shape as ``create_exhausted`` but a live schedule
+     ``{"insight": insight.id, "target_type": "email", "target_value": "owner@test.com",
+       "frequency": "daily", "interval": 1, "start_date": "2022-01-01T00:00:00",
+       "title": "valid"}`` (no past until_date).
+
+   Use ``format="json"``.
+
+3. Capture ``status_code = response.status_code``.
+
+- EXPECTED: ``status_code`` equals ``expected["status_code"]``.
+
+Return ``{"status_code": status_code}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "create_exhausted"
+[story.test_case.expected]
+status_code = 400
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "patch_into_exhaustion"
+[story.test_case.expected]
+status_code = 400
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "create_valid_control"
+[story.test_case.expected]
+status_code = 201
+
+
+[[story]]
+id = "test_delivery_when_disabled"
+driver = "pytest"
+description = """
+Triggering a manual test delivery on a paused subscription is rejected, and the
+user is told to resume it first. An enabled subscription accepts the test
+delivery.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        create_subscription,
+        mock_temporal_sync_connect,
+    )
+
+Steps (branch on ``inputs["case_label"]``):
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+2. ``sub = create_subscription(team, user)`` (email target, enabled by default).
+3. If ``inputs["case_label"] == "disabled"``: in a SETUP
+   ``with mock_temporal_sync_connect():`` PATCH
+   ``f"/api/projects/{team.id}/subscriptions/{sub.id}/"`` with ``{"enabled": False}``.
+4. Inside ``with mock_temporal_sync_connect():`` POST the test delivery:
+   ``response = client.post(f"/api/projects/{team.id}/subscriptions/{sub.id}/test-delivery/")``.
+5. Capture ``status_code = response.status_code``.
+
+- EXPECTED: ``status_code`` is in ``expected["acceptable_status_codes"]``. The
+  contract fixes only that a test delivery on a paused subscription is
+  *rejected with a client error* and that an enabled one is *accepted* — not
+  the exact numeric code — so each case lists the acceptable codes (the
+  reference uses 409 / 202). Assert membership in that list; do not pin a single
+  code. The rejection message's actionability ("resume it first") is judged by
+  the rubric, not here.
+
+Return ``{"status_code": status_code}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "disabled"
+[story.test_case.expected]
+acceptable_status_codes = [400, 409, 422]
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "enabled_control"
+[story.test_case.expected]
+acceptable_status_codes = [200, 202]
+
+
+# =============================================================================
+# Backend delivery-pipeline stories (pytest) — pre-existing Temporal interface
+# =============================================================================
+
+[[story]]
+id = "delivery_classifies_permanent_vs_transient"
+driver = "pytest"
+description = """
+The delivery pipeline distinguishes permanent from transient failure. A
+permanently-broken target (a Slack target with no connected integration, or an
+unsupported delivery channel) auto-disables the subscription and is handled as a
+terminal outcome — the pipeline completes rather than erroring out — so it stops
+retrying forever. A transient failure (no exported assets ready yet) leaves the
+subscription enabled so the next scheduled cycle retries. Each case records a
+failure with a categorised reason.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        create_subscription,
+        run_process_workflow,
+        run_deliver_activity,
+    )
+
+This story drives the PRE-EXISTING delivery pipeline. The resulting ``enabled``
+state is read through the API (the contract-fixed field), so the assertion holds
+regardless of where a solution places its auto-disable check. The failure
+CATEGORY token is read back off the pipeline result — do not pin a spelling; only
+require that a non-empty category is recorded.
+
+Steps (branch on ``inputs["case_label"]``):
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+
+2. Build the subscription and run the pipeline:
+   - ``slack_missing`` (permanent — full workflow):
+     ``sub = create_subscription(team, user, target_type="slack", target_value="C12345|#test-channel", integration_id=None)``;
+     ``result = run_process_workflow(sub)``.
+   - ``unsupported_webhook`` (permanent — full workflow):
+     ``sub = create_subscription(team, user, target_type="webhook", target_value="https://example.com/hook")``;
+     ``result = run_process_workflow(sub)``.
+   - ``no_assets`` (transient — single delivery activity; the bare activity reports
+     the failure in its result rather than persisting a delivery row, so read the
+     category from the activity result):
+     ``sub = create_subscription(team, user, target_type="email", target_value="owner@test.com")``;
+     ``result = run_deliver_activity(sub, [99999999])``.
+
+3. Capture:
+   - GET ``f"/api/projects/{team.id}/subscriptions/{sub.id}/"``;
+     ``enabled = get.json().get("enabled")``.
+   - ``category_present = bool(result.get("error_type"))`` (a non-empty failure category was recorded).
+   - ``completed_cleanly = result["completed_cleanly"]``.
+
+- EXPECTED: ``enabled`` equals ``expected["enabled"]`` (permanent disables; transient stays on).
+- EXPECTED: ``category_present`` equals ``expected["category_present"]``.
+- EXPECTED: ``completed_cleanly`` equals ``expected["completed_cleanly"]`` (handled outcome, not an error).
+
+Return ``{"enabled": enabled, "category_present": category_present, "completed_cleanly": completed_cleanly}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "slack_missing"
+[story.test_case.expected]
+enabled = false
+category_present = true
+completed_cleanly = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "unsupported_webhook"
+[story.test_case.expected]
+enabled = false
+category_present = true
+completed_cleanly = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "no_assets"
+[story.test_case.expected]
+enabled = true
+category_present = true
+completed_cleanly = true
+
+
+[[story]]
+id = "delivery_disable_is_idempotent"
+driver = "pytest"
+description = """
+Once a subscription is auto-disabled, re-running the pipeline (a Temporal
+redispatch) leaves it disabled and records no additional failed delivery.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        create_subscription,
+        run_process_workflow,
+    )
+
+Both cases drive the FULL pre-existing ProcessSubscriptionWorkflow against the
+same permanently-broken (webhook) target; the only difference is how many times
+the pipeline is dispatched. The number of FAILED delivery rows must be the same
+(exactly one) either way — a second dispatch must not record a second failure.
+
+Steps (branch on ``inputs["case_label"]``):
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+2. ``sub = create_subscription(team, user, target_type="webhook", target_value="https://example.com/hook")``.
+3. Run the pipeline:
+   - ``single_dispatch``: ``result = run_process_workflow(sub)`` (once).
+   - ``redispatch``: ``run_process_workflow(sub)`` then ``result = run_process_workflow(sub)`` (twice).
+4. Capture:
+   - GET ``f"/api/projects/{team.id}/subscriptions/{sub.id}/"``;
+     ``enabled = get.json().get("enabled")``.
+   - ``failed_count = result["failed_count"]``.
+   - ``completed_cleanly = result["completed_cleanly"]``.
+
+- EXPECTED: ``enabled`` equals ``expected["enabled"]`` (disabled either way).
+- EXPECTED: ``failed_count`` equals ``expected["failed_count"]`` (exactly one, regardless of dispatch count).
+- EXPECTED: ``completed_cleanly`` equals ``expected["completed_cleanly"]``.
+
+Return ``{"enabled": enabled, "failed_count": failed_count, "completed_cleanly": completed_cleanly}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "single_dispatch"
+[story.test_case.expected]
+enabled = false
+failed_count = 1
+completed_cleanly = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "redispatch"
+[story.test_case.expected]
+enabled = false
+failed_count = 1
+completed_cleanly = true
+
+
+[[story]]
+id = "scheduler_excludes_disabled"
+driver = "pytest"
+description = """
+The due-subscriptions scheduler skips disabled subscriptions but keeps enabled
+ones.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        create_subscription,
+        mock_temporal_sync_connect,
+        run_fetch_due,
+    )
+    from django.utils import timezone
+    from posthog.models.subscription import Subscription
+
+Steps (branch on ``inputs["case_label"]``):
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+2. Create the always-enabled TARGET subscription: ``target = create_subscription(team, user)``.
+3. Create the OTHER subscription: ``other = create_subscription(team, user)``;
+   if ``inputs["case_label"] == "other_disabled"``: in a
+   ``with mock_temporal_sync_connect():`` PATCH
+   ``f"/api/projects/{team.id}/subscriptions/{other.id}/"`` with ``{"enabled": False}``.
+4. Force both into the due window on the pre-existing field:
+   ``Subscription.objects.filter(id__in=[target.id, other.id]).update(next_delivery_date=timezone.now())``.
+5. ``fetched = run_fetch_due(buffer_minutes=15)``.
+6. Capture:
+   - ``target_present = target.id in fetched``.
+   - ``other_present = other.id in fetched``.
+
+- EXPECTED: ``target_present`` equals ``expected["target_present"]``.
+- EXPECTED: ``other_present`` equals ``expected["other_present"]``.
+
+Return ``{"target_present": target_present, "other_present": other_present}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "other_disabled"
+[story.test_case.expected]
+target_present = true
+other_present = false
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "other_enabled"
+[story.test_case.expected]
+target_present = true
+other_present = true
+
+
+# =============================================================================
+# Frontend story (jest) — render the pre-existing subscriptions table
+# =============================================================================
+
+[[story]]
+id = "subscriptions_table_renders_disabled_state"
+driver = "jest"
+jest_config_key = "jest_frontend"
+script_extension = ".test.tsx"
+description = """
+The subscriptions table renders a subscription as inactive only when its enabled
+flag is explicitly false. A row with the flag true, missing, or null renders the
+same as an enabled one, so legacy rows without the flag are not shown as disabled.
+"""
+procedure = """
+The FIRST line of the file MUST be (before any imports):
+
+    // @ts-nocheck
+
+Render the PRE-EXISTING subscriptions table component (discover its export by
+reading the implementing frontend source — the natural location is
+``scenes/subscriptions/components/SubscriptionsTable``, the presentational table
+the component's own Storybook story renders with a row list). Rendering this
+table needs NO Kea/router context: pass a single-row list and a no-op
+``renderRowActions``.
+
+Use ``test.each(getTestCases())``. Vary ONLY the enabled flag per case over a
+fixed baseline row, and compare each case's render to an enabled baseline with a
+signal that is ROBUST to React's per-render dynamic ids — compare the row's TEXT
+content OR its id-normalized HTML (either difference counts), so a disabled
+indicator conveyed by status text, a muted class, an icon, or a switch is all
+detected while identical inputs compare equal:
+
+    import { getTestCases } from './validationParams'
+    import { render, cleanup } from '@testing-library/react'
+    import { SubscriptionsTable } from 'scenes/subscriptions/components/SubscriptionsTable'  // discover actual export
+
+    const BASE = { id: 1, title: 'Weekly report', target_type: 'email', target_value: 'a@b.com', frequency: 'daily', interval: 1 }
+    const noop = () => null
+
+    // Strip per-render dynamic ids (React useId / lemon-ui) so two renders of the
+    // SAME input are equal; real enabled-state differences survive.
+    function normalize(html) {
+      return html
+        .replace(/\\sid="[^"]*"/g, '')
+        .replace(/\\sfor="[^"]*"/g, '')
+        .replace(/\\saria-(labelledby|describedby|controls|owns|activedescendant)="[^"]*"/g, '')
+        .replace(/:r[0-9a-z]+:/gi, '')
+    }
+    function signature(extra) {
+      const { container } = render(<SubscriptionsTable dataSource={[{ ...BASE, ...extra }]} loading={false} renderRowActions={noop} />)
+      const sig = { text: container.textContent, norm: normalize(container.innerHTML) }
+      cleanup()
+      return sig
+    }
+    function fieldFor(v) {
+      return v === 'true' ? { enabled: true } : v === 'false' ? { enabled: false } : v === 'null' ? { enabled: null } : {}
+    }
+
+Per case (``inputs.enabled_value`` ∈ "true" / "false" / "missing" / "null"):
+
+1. ``const baseline = signature({ enabled: true })``.
+2. Anti-vacuous guard: assert ``baseline.text`` contains the row title
+   ('Weekly report'); fail if the table did not render.
+3. ``const sig = signature(fieldFor(inputs.enabled_value))``.
+4. ``const differs_from_enabled = sig.text !== baseline.text || sig.norm !== baseline.norm``.
+
+- EXPECTED: ``differs_from_enabled`` equals ``expected["differs_from_enabled"]``
+  (true ONLY for the explicit-false flag; false for true / missing / null).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "explicit_true"
+enabled_value = "true"
+[story.test_case.expected]
+differs_from_enabled = false
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "explicit_false"
+enabled_value = "false"
+[story.test_case.expected]
+differs_from_enabled = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "missing"
+enabled_value = "missing"
+[story.test_case.expected]
+differs_from_enabled = false
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "null_value"
+enabled_value = "null"
+[story.test_case.expected]
+differs_from_enabled = false

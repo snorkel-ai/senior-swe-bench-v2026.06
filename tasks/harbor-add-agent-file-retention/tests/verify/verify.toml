@@ -1,0 +1,13 @@
+# Verifier runner config for harbor-add-agent-file-retention.
+#
+# The python runner (verify.py) must run under harbor's own uv-managed
+# venv (the image pre-runs `uv sync`, and tests/test-setup.sh prepends
+# /repo/harbor/.venv/bin to PATH). We invoke pytest via that venv's
+# interpreter directly (not via `uv run`) so the timeout kill is a clean
+# single-process kill with no orphaned uv child. cwd is /repo/harbor
+# (set by run_verify.py via REPO_DIR), so `import harbor...` resolves to
+# the editable install.
+
+[pytest]
+command = "/repo/harbor/.venv/bin/python -m pytest"
+timeout = 600

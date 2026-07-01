@@ -1,0 +1,29 @@
+# `verify_auth_middleware_test.go` is injected into tests/integration/,
+# where the package's existing TestMain bootstraps gitea and exposes the
+# helpers (NewRequest / MakeRequest / AddBasicAuth / AddTokenAuth /
+# getUserToken) the injected file relies on.
+
+[go]
+# Package directory relative to /repo/gitea — runner copies the test
+# file here, runs `go test`, then cleans up.
+package = "tests/integration"
+
+# Build tags mirror `make test-sqlite`'s TEST_TAGS. sqlite enables the
+# cgo sqlite3 driver (mattn/go-sqlite3 is the only sqlite driver in
+# go.mod); sqlite_unlock_notify is the matching feature gate the unit-
+# test bootstrap demands. We deliberately omit `bindata` so templates
+# are read from the source tree at runtime — matches how integration
+# tests are invoked when only TEST_TAGS is set.
+build_tags = ["sqlite", "sqlite_unlock_notify"]
+
+# Cold cgo + integration-binary compile is ~60-90s on a wiped cache.
+# The image pre-warms the binary so the typical run is ~10-20s.
+# 600s gives plenty of margin if a `git clean -fdx` wiped the cache.
+timeout = 600
+
+# Environment overrides. CGO_ENABLED=1 mandatory (sqlite3 link).
+# GOEXPERIMENT=jsonv2 mirrors gitea's Makefile default. GOTOOLCHAIN=local
+# locks the toolchain to the bundled 1.26 we installed in the image.
+# GITEA_TEST_CONF tells setting.SetupGiteaTestEnv where to find
+# tests/sqlite.ini (required for I_AM_BEING_UNSAFE_RUNNING_AS_ROOT).
+env = { CGO_ENABLED = "1", GOEXPERIMENT = "jsonv2", GOTOOLCHAIN = "local", GITEA_TEST_CONF = "tests/sqlite.ini" }

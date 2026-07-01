@@ -1,0 +1,41 @@
+{
+  "files": [
+    "src/documents/models.py",
+    "src/documents/signals/handlers.py",
+    "src/documents/tasks.py",
+    "src/documents/consumer.py",
+    "src/documents/data_models.py",
+    "src/documents/barcodes.py",
+    "src/documents/bulk_edit.py",
+    "src/documents/sanity_checker.py",
+    "src/documents/workflows/actions.py",
+    "src/documents/permissions.py",
+    "src/documents/management/commands/document_create_classifier.py",
+    "src/documents/management/commands/document_llmindex.py",
+    "src/documents/management/commands/document_sanity_checker.py",
+    "src/paperless/models.py",
+    "src/paperless/views.py",
+    "src/paperless/settings/custom.py",
+    "src/paperless_ai/indexing.py",
+    "src/paperless_mail/mail.py"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "structured_consume_results",
+      "description": "The document-consumption task returns structured/typed results that distinguish the success, duplicate, and stopped outcomes (rather than an opaque result string), carrying the relevant document id(s) so the lifecycle layer can interpret them. Critically, a detected duplicate is recorded as a FAILURE of the tracked task, not a success — the lifecycle treats a duplicate consumption as a failed task. The consume task no longer creates or mutates tracking rows by hand; its structured return value is what the signal-driven lifecycle layer reads to set status and result data. Any structuring approach (TypedDicts, dataclasses, or plain dicts with a discriminator) satisfies this as long as the three outcomes are distinguishable and a duplicate flips the task to failure."
+    },
+    {
+      "name": "celery_calls_standardized",
+      "description": "Celery task dispatch is standardized across the codebase from bare .delay(...) to .apply_async(...) carrying a trigger_source header, so the publish signal handler can attribute every job's origin (scheduled, web UI, upload, folder, e-mail, system, manual). This sweep covers the dispatch sites across the documents app (barcodes, bulk edit, sanity checker, workflows, management commands), the AI indexing module, and the mail module, plus the scheduled (beat) schedule which tags its periodic jobs with the scheduled source. The conversion is consistent: a call site left on .delay() without a trigger source would leave that job mis-attributed."
+    },
+    {
+      "name": "legacy_model_fields_removed",
+      "description": "The old thin-design PaperlessTask columns (the legacy task name, task file name, type, and the opaque result text field) no longer exist on the model — the redesign REPLACES them with the structured status/timing/input/result fields rather than keeping the legacy columns alongside the new ones. A solution that leaves the old columns in place (silently shadowing the redesign while still satisfying the v9 reconstruction) fails this criterion. Note: the internal naming of the NEW structured fields is the implementer's choice; only the removal of the legacy columns is judged here (the v9/v10 API field names are the external contract verified by the validation stories)."
+    },
+    {
+      "name": "permission_rename",
+      "description": "The monitoring permission is renamed from the pre-existing view_system_status to a clearly monitoring-scoped codename of the implementer's choice (e.g. view_monitoring or view_system_monitoring) and that rename is applied consistently across the codebase: the model Meta permission definition, an accompanying migration that renames/replaces the old permission, any permission-checking helper, and every view that gates on it (including the task monitoring summary endpoint and the system-status view). No stale references to the old view_system_status codename remain in the gating logic, so the gate is driven entirely by the single renamed permission. The exact new codename is not prescribed — judge consistency, not a specific string."
+    }
+  ],
+  "pass_to_pass": []
+}

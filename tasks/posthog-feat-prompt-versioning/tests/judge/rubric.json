@@ -1,0 +1,24 @@
+{
+  "files": [
+    "posthog/api/llm_prompt.py",
+    "posthog/api/llm_prompt_serializers.py",
+    "posthog/api/services/llm_prompt.py",
+    "posthog/models/llm_prompt.py",
+    "posthog/migrations/",
+    "posthog/storage/llm_prompt_cache.py",
+    "posthog/storage/llm_prompt_cache_keys.py",
+    "posthog/storage/llm_prompt_cache_payloads.py"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "prompts_remain_immutable_after_publish",
+      "description": "The implementation treats prompts as immutable per version: changing a prompt's content goes through a deliberate publish flow that creates a new versioned row (or new version record in a parent/child layout) representing the new version, rather than mutating an existing version's content in place. The previous version's content remains retrievable after a publish; both rows coexist in the database. Specifically, look for: (a) the publish flow inserts a new row via `objects.create(...)` with the new content and an incremented version number, rather than calling `.save()` on the existing row after mutating its `prompt` field; (b) the previous version is no longer surfaced as the current one after publish — for example by flipping a marker flag on the prior row, or by updating a parent pointer in a two-table layout — inside the same transaction, so the 'exactly one current version per (team, name)' invariant is preserved; (c) concurrent publishes cannot both succeed against the same name — for example via `select_for_update`/row locking on the current latest row, or via a partial-unique-constraint with `IntegrityError` handling, so the latest-version invariant survives a race at the database level."
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "existing_rows_remain_unmodified_after_publish",
+      "description": "After a publish, fetching any pre-existing version row by its original identifier returns the original content unchanged. No existing row's prompt field was mutated in place. Verify that the implementation does NOT call `.save()` on an existing row after changing its `prompt` field as a shortcut for 'publishing' — the original version's content must be bit-for-bit identical after a publish that was supposed to create a new version."
+    }
+  ]
+}

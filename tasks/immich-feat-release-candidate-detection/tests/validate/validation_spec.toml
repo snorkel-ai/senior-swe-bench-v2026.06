@@ -1,0 +1,420 @@
+stack_profile = "typescript-service"
+
+[settings]
+script_timeout_sec = 600
+va_timeout_sec = 1800
+
+# Jest-driver settings, immich server UNIT tier (Vitest + `newTestService`,
+# ALL repositories mocked — no Postgres, Redis, or live server).
+#
+# config_dir = "server" → the driver runs vitest from /repo/immich/server,
+# where `tests/test-setup.sh` has already written `server/vitest.config.mjs`
+# (auto-resolved by vitest since no --config is passed): swc + tsconfigPaths
+# plugins, globals, TZ=UTC, and an `include` that matches specs placed under
+# src/__validation__/. No globalSetup — there is no database.
+#
+# test_parent = "server/src" → the driver copies each generated spec to
+# server/src/__validation__/<story-id>.spec.ts (it appends "__validation__"),
+# which matches the config's include (src/**/*.spec.ts) and whose `src/...` /
+# `test/...` alias imports resolve via the server tsconfig paths — exactly the
+# location and resolution the pre-existing version.service.spec.ts relies on.
+[settings.jest]
+runner = "vitest"
+config_dir = "server"
+test_parent = "server/src"
+command = "pnpm exec vitest run --reporter=verbose"
+
+instructions = """
+This task validates the immich SERVER new-version-check feature at immich's
+UNIT test tier — repositories are MOCKED via `newTestService`, there is NO
+database. You write a TypeScript spec that exercises the pre-existing
+`VersionService.handleVersionCheck()` and observes the broadcast it makes
+through the MOCKED websocket repository, exactly as the repo's own
+`server/src/services/version.service.spec.ts` does.
+
+## What the feature does
+
+The new-version check gained a release CHANNEL. On the "release candidate"
+channel the server is additionally notified about newer PRE-RELEASE builds
+(e.g. `3.0.1-rc.0`); on the default "stable" channel pre-releases are ignored.
+When a newer release qualifies, `handleVersionCheck()` broadcasts an
+`on_new_release` event over the websocket. That event payload now carries, for
+each version it reports, the numeric PRE-RELEASE index, plus a field describing
+the KIND of release that was found.
+
+## Discover the channel value and the payload field names (do NOT hard-code)
+
+The release-candidate channel identifier and the new-release payload field
+names are DESIGNED BY THE IMPLEMENTATION — the task does not fix them. Before
+asserting, read the implementing source to find them:
+
+- `src/dtos/system-config.dto.ts` — the new-version-check config gained a
+  `channel` field; find the enum / value that selects the release-candidate
+  channel.
+- `src/config.ts` — `defaults.newVersionCheck` shows the channel's default
+  (stable) and its shape.
+- `src/dtos/server.dto.ts` — the new-release event DTO: the per-version object
+  that exposes the numeric pre-release index, and the field that names the
+  release type.
+
+The canonical shape the reference implementation uses is a `ReleaseChannel`
+enum with a `releaseCandidate` member, a version object
+`{ major, minor, patch, prerelease }` (prerelease is the numeric `-rc.N`
+index, or null for a stable version), and an `on_new_release` payload
+`{ isAvailable, checkedAt, serverVersion, releaseVersion, type }`. **Treat that
+only as a hint — assert against whatever the actual code declares.** Import the
+real channel enum into your spec (e.g.
+`import { ReleaseChannel } from 'src/dtos/system-config.dto'`) and use the
+discovered release-candidate member; read the actual payload field names from
+the release-event DTO. A differently named channel or differently named fields
+are fine — use exactly what the code declares.
+
+## How to put the version check on the release-candidate channel
+
+`handleVersionCheck()` reads the merged system config via `getConfig`. In the
+unit tier you drive that by mocking the system-metadata read so the
+new-version-check config is enabled AND on the release-candidate channel:
+
+```ts
+mocks.systemMetadata.get.mockResolvedValue({
+  newVersionCheck: { enabled: true, channel: <discovered release-candidate value> },
+});
+```
+
+You observe the broadcast through the MOCKED websocket repository — the same
+observation point the upstream spec uses:
+
+```ts
+const call = mocks.websocket.clientBroadcast.mock.calls.find((c) => c[0] === 'on_new_release');
+```
+
+## File names and the workspace
+
+For each story create a file named `<story-id>.spec.ts` in the scripts
+directory the validator placed you in. The driver copies it to:
+
+  /repo/immich/server/src/__validation__/<story-id>.spec.ts
+
+and runs `pnpm exec vitest run --reporter=verbose <path> --testTimeout=...`
+from /repo/immich/server. The server `vitest.config.mjs` is auto-resolved (do
+NOT pass --config, do NOT create your own config). It enables globals, swc,
+and tsconfig path aliases, sets TZ=UTC, and runs no database.
+
+## Pre-existing imports (use these EXACT module paths — do NOT invent names)
+
+```ts
+import { describe, it, expect, beforeAll, afterAll, vitest } from 'vitest';
+import { DateTime } from 'luxon';
+import { SemVer } from 'semver';
+import { VersionService } from 'src/services/version.service';
+import { newTestService } from 'test/utils';
+// discovered from the implementation — the real channel enum:
+import { ReleaseChannel } from 'src/dtos/system-config.dto';
+
+import { getTestCases } from './validationParams';
+```
+
+## Required test-file skeleton
+
+Base every spec on this skeleton. Keep the `'case %#'` title in `it.each` —
+under vitest `%#` interpolates to the case index so the rendered titles are
+"case 0", "case 1", … which is exactly what the driver matches per-case on.
+(Do NOT use `$#`; vitest leaves that literal, so the driver would match no
+case. The `%#` printf token is the correct vitest index placeholder.)
+`getTestCases()`
+returns the immutable, driver-injected `{ inputs, expected }` array; never
+hard-code or recompute the expected values.
+
+`serverVersion` is mocked to `3.0.0` (exactly as the upstream spec does) so the
+stable/pre-release boundary is deterministic and timezone-independent.
+
+Note: the `ReleaseChannel` import and the release-candidate-channel mock are
+needed wherever a story puts the check on the release-candidate channel. The
+per-channel story drives both routes from one `it.each` via an `inputs.channel`
+flag ("rc" ⇒ mock the system-config read onto the discovered release-candidate
+channel; "stable" ⇒ leave the DEFAULT config, whose channel is stable). The
+connect story drives `onWebsocketConnection` on the release-candidate channel.
+`newTestService` resets the merged-config cache for every case, so cases on
+different channels do not bleed. Adapt the per-story body accordingly; keep the
+constants mock in every spec.
+
+Expected-value conventions for these stories: `broadcast_count` is a plain count.
+`reported_prerelease` is the numeric pre-release index of the reported release,
+OR the string `"__null__"` — TOML cannot express null, so interpret `"__null__"`
+as "assert the reported release's pre-release field is null". The cases share one
+expected key set; branch the assert logic on input vars (`inputs.channel`, and
+the optional `inputs.ignored_version` which drives a same-config negative check
+that a release this channel must ignore produces no broadcast).
+
+```ts
+// @ts-nocheck
+import { describe, it, expect, beforeAll, afterAll, vitest } from 'vitest';
+import { DateTime } from 'luxon';
+import { SemVer } from 'semver';
+import { VersionService } from 'src/services/version.service';
+import { newTestService } from 'test/utils';
+import { ReleaseChannel } from 'src/dtos/system-config.dto'; // discovered enum
+
+import { getTestCases } from './validationParams';
+
+beforeAll(() => {
+  vitest.mock(import('src/constants.js'), async () => ({
+    ...(await vitest.importActual<typeof import('src/constants.js')>('src/constants.js')),
+    serverVersion: new SemVer('v3.0.0'),
+  }));
+});
+
+afterAll(() => {
+  vitest.unmock(import('src/constants.js'));
+});
+
+describe('version_check_reports_per_channel', () => {
+  const cases = getTestCases();
+  it.each(cases)('case %#', async ({ inputs, expected }) => {
+    const { sut, mocks } = newTestService(VersionService);
+    mocks.cron.create.mockResolvedValue();
+    mocks.cron.update.mockResolvedValue();
+
+    // inputs.channel selects the route: 'rc' puts the check on the DISCOVERED
+    // release-candidate channel; 'stable' leaves the default config (stable).
+    if (inputs.channel === 'rc') {
+      mocks.systemMetadata.get.mockResolvedValue({
+        newVersionCheck: { enabled: true, channel: ReleaseChannel.ReleaseCandidate },
+      });
+    }
+    mocks.serverInfo.getLatestRelease.mockResolvedValue({
+      version: inputs.release_version,
+      published_at: DateTime.utc().toISO(),
+    });
+
+    await sut.handleVersionCheck();
+
+    // ... assert on the on_new_release broadcast count + payload — see procedure ...
+  });
+});
+```
+
+## CRITICAL — never modify /repo
+
+Do NOT edit, create, or delete any file under /repo/immich except your own spec
+file (the driver places it under src/__validation__/). The runner diffs the
+repo against a baseline after validation; any other change zeros the score.
+Exercise the implementation honestly — if the behavior is missing, let the
+assertion fail; never weaken a test or implement the feature yourself.
+"""
+
+
+# =============================================================================
+# Story 1: one flow, two channel routes (the channel is the input setting). The
+# release-candidate channel reports a newer pre-release (with the numeric
+# pre-release index + a release-type descriptor); the default stable channel
+# reports a newer stable release but ignores pre-releases.
+# =============================================================================
+
+[[story]]
+id = "version_check_reports_per_channel"
+driver = "jest"
+script_extension = ".spec.ts"
+description = """
+When the new-version check is set to the release-candidate channel, a newer
+pre-release build is reported as available. The notification that goes out names
+how far ahead the release is and exposes the pre-release number of the version
+it found. On the default channel, an admin is only told about newer stable
+releases — a newer pre-release is silently ignored.
+"""
+procedure = """
+Drive one `it.each` over both channel routes, selected by `inputs.channel`
+("rc" / "stable") — see the instructions block. On the "rc" route mock the
+system-metadata read so `newVersionCheck` is enabled on the DISCOVERED
+release-candidate channel; on the "stable" route leave the default config
+(default channel is stable). Stub the latest upstream release to
+`inputs.release_version`, call `handleVersionCheck()`, then inspect the
+`on_new_release` broadcasts made through the mocked websocket repository.
+
+Per-case body (inside it.each), after the skeleton's channel-aware setup:
+
+```ts
+const onRc = inputs.channel === 'rc';
+
+const broadcasts = mocks.websocket.clientBroadcast.mock.calls.filter((c) => c[0] === 'on_new_release');
+// A newer pre-release broadcasts ONLY on the rc channel; a newer stable release
+// broadcasts on either channel; a pre-release on the stable channel does not
+// broadcast at all.
+expect(broadcasts.length).toBe(expected.broadcast_count); // EXPECTED: broadcast_count
+
+// On the rc route the DISCOVERED channel must be threaded through to the
+// upstream release lookup (the fetch is channel-aware), not merely read locally
+// for the availability comparison.
+if (onRc) {
+  expect(mocks.serverInfo.getLatestRelease).toHaveBeenCalledWith(ReleaseChannel.ReleaseCandidate);
+}
+
+if (expected.broadcast_count > 0) {
+  // Discover the release-event field names from server.dto.ts (canonically:
+  // releaseVersion — a version object — and a release-type field).
+  const payload = broadcasts[0][1];
+
+  // `reported_prerelease` is the NUMERIC pre-release index (0 for `-rc.0`,
+  // 2 for `-rc.2`), or the sentinel "__null__" for a stable release ⇒ assert
+  // the field is null. Never the 'rc' tag, never absent for a pre-release.
+  const expPre = expected.reported_prerelease === '__null__' ? null : expected.reported_prerelease;
+  if (expPre === null) {
+    expect(payload.releaseVersion.prerelease).toBeNull();
+  } else {
+    expect(payload.releaseVersion.prerelease).toBe(expPre); // EXPECTED: reported_prerelease
+  }
+  // The running server version (mocked 3.0.0) always carries a null prerelease,
+  // proving the version-object shape carries the nullable index server-side too.
+  expect(payload.serverVersion.prerelease).toBeNull();
+  // Release-type DIRECTION: the descriptor's value begins with "pre" iff the
+  // reported release has a pre-release number (e.g. semver.diff's
+  // `prepatch`/`preminor` vs `patch`/`minor`). Never assert an exact taxonomy
+  // string.
+  expect(payload.type).toBeTruthy();
+  expect(String(payload.type).toLowerCase().startsWith('pre')).toBe(expPre !== null);
+}
+
+// Negative half (only the stable route supplies `inputs.ignored_version`): on
+// the SAME channel config, a release this channel must ignore produces no
+// broadcast. Clear the recorded broadcasts, re-stub the upstream release, and
+// re-run — proving the channel discriminates within one isolated setup.
+if (inputs.ignored_version) {
+  mocks.websocket.clientBroadcast.mockClear();
+  mocks.serverInfo.getLatestRelease.mockResolvedValue({
+    version: inputs.ignored_version,
+    published_at: DateTime.utc().toISO(),
+  });
+  await sut.handleVersionCheck();
+  const ignored = mocks.websocket.clientBroadcast.mock.calls.filter((c) => c[0] === 'on_new_release');
+  expect(ignored.length).toBe(0);
+}
+```
+
+On the stable route the case proves BOTH halves in one config: a newer stable
+release reports (with a null pre-release and a non-pre `type`), and a newer
+pre-release is ignored (no broadcast). A channel-blind `semver.gt` build
+broadcasts for the ignored pre-release too, so the negative half fails. A build
+that reports the pre-release tag string instead of the numeric index, or omits
+the field, fails the `reported_prerelease` assertion on the rc cases. A build
+that mislabels the release kind (a pre-release reported as a non-pre `type`, or
+vice versa) fails the direction assertion. A build that reads the channel only
+for the local availability comparison but never threads it to `getLatestRelease`
+fails the rc called-with assertion.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "rc_channel_reports_prerelease_zero"
+channel = "rc"
+release_version = "3.0.1-rc.0"
+[story.test_case.expected]
+broadcast_count = 1
+reported_prerelease = 0
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "rc_channel_reports_prerelease_two"
+channel = "rc"
+release_version = "3.1.0-rc.2"
+[story.test_case.expected]
+broadcast_count = 1
+reported_prerelease = 2
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "stable_channel_reports_stable_ignores_prerelease"
+channel = "stable"
+release_version = "3.0.1"
+ignored_version = "3.0.1-rc.0"
+[story.test_case.expected]
+broadcast_count = 1
+reported_prerelease = "__null__"
+
+
+# =============================================================================
+# Story 2: a connecting client is re-sent the already-known release, with the
+# new structured payload (pre-release number + release type).
+# =============================================================================
+
+[[story]]
+id = "connect_resends_known_release"
+driver = "jest"
+script_extension = ".spec.ts"
+description = """
+When a client connects and the server has already recorded a newer release, the
+server re-sends that release notification to the connecting client. The re-sent
+notification uses the same structured shape as a live notification — it exposes
+the found version's pre-release number and the kind of release it is.
+"""
+procedure = """
+Drive `onWebsocketConnection` (NOT `handleVersionCheck`). Put the version check
+on the DISCOVERED release-candidate channel (so the cached pre-release is a
+genuinely-available newer release), and make the recorded last-version-check
+state return a previously-found pre-release. `onWebsocketConnection` reads the
+system config and then the recorded version-check state through the SAME mocked
+`systemMetadata.get`, distinguished by their metadata KEY. Mock by key (NOT by
+call order) so the spec is robust regardless of how many reads the service
+makes or any config caching across `it.each` cases: return the recorded
+version-check state for the version-check-state key, and the enabled
+release-candidate-channel config for everything else (the system-config read).
+Then inspect the `on_new_release` message sent through the mocked websocket
+repo's per-client send.
+
+Import the metadata-key enum alongside the other pre-existing imports:
+`import { SystemMetadataKey } from 'src/enum';` (the `ReleaseChannel` import
+from the skeleton is also needed here).
+
+Single-case body (inside it.each):
+
+```ts
+const { sut, mocks } = newTestService(VersionService);
+mocks.cron.create.mockResolvedValue();
+mocks.cron.update.mockResolvedValue();
+
+// Key-based mock (NOT order-based): the recorded version-check state carries
+// the cached release; every other metadata read (the system config) returns
+// the enabled config on the DISCOVERED release-candidate channel — so the
+// cached pre-release counts as a genuinely-available newer release.
+mocks.systemMetadata.get.mockImplementation(async (key) =>
+  key === SystemMetadataKey.VersionCheckState
+    ? { checkedAt: DateTime.utc().toISO(), releaseVersion: inputs.cached_release }
+    : { newVersionCheck: { enabled: true, channel: ReleaseChannel.ReleaseCandidate } },
+);
+
+await sut.onWebsocketConnection({ userId: '7' });
+
+// clientSend(event, userId, payload): find the re-sent release notification.
+const call = mocks.websocket.clientSend.mock.calls.find((c) => c[0] === 'on_new_release');
+expect(call).toBeDefined();
+const payload = call[2];
+
+// Discover the release-version object + pre-release field from server.dto.ts.
+// The re-sent payload exposes the cached release's numeric prerelease.
+expect(payload.releaseVersion.prerelease).toBe(expected.release_prerelease); // EXPECTED: release_prerelease
+// The re-sent payload uses the same structured shape as a live notification:
+// the release-type descriptor reflects the PRE-RELEASE step (value begins with
+// "pre"). Assert the DIRECTION, never an exact taxonomy string.
+expect(payload.type).toBeTruthy();
+expect(String(payload.type).toLowerCase().startsWith('pre')).toBe(true);
+```
+
+A build that still sends the raw cached value (no structured version object, no
+numeric pre-release, no release type) leaves `payload.releaseVersion.prerelease`
+undefined and `payload.type` absent, so both expected checks fail. A build that
+constructs the structured payload on the live broadcast path but re-sends the
+raw cached value on connect also fails — the re-send must use the same shape.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "connect_resends_prerelease_three"
+cached_release = "3.0.1-rc.3"
+[story.test_case.expected]
+release_prerelease = 3
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "connect_resends_prerelease_one"
+cached_release = "3.2.0-rc.1"
+[story.test_case.expected]
+release_prerelease = 1

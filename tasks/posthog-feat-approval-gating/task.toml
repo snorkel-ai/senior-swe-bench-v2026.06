@@ -1,0 +1,150 @@
+version = "1.0"
+
+[environment]
+base_image = "posthog-feat-approval-gating:latest"
+build_timeout_sec = 1200.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 2400.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "posthog"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "posthog"
+
+[metadata]
+family = "posthog-feat-approval-gating"
+variant = "hard"
+segment = "design"
+repo = "posthog"
+tags = ["posthog", "python-service", "typescript-frontend"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Extend the existing approval-gating system for feature flags so that
+changes to a flag's rollout percentage (across all the places it can
+appear in a flag's filter configuration) can be gated by an approval
+policy. Today only enable/disable transitions are gated; we want admins
+to require approval when, e.g., a rollout crosses 50%, or a single
+change moves the rollout by more than 10 percentage points.
+
+The policy engine must support a small condition vocabulary so that
+admins can pick between three styles of rule (always gate any change,
+gate when the new value is on one side of a threshold, gate when the
+change amount itself is on one side of a threshold), and the system
+must reject the ambiguous case where two enabled policies for the same
+action both match the same change. The settings UI must let admins
+build these rules through the policy create/edit modal.
+"""
+context = """The approvals subsystem already lives at posthog/approvals/ and includes:
+ApprovalPolicy / ChangeRequest models, a PolicyEngine that decides
+ALLOW / DENY / REQUIRE_APPROVAL, an ACTION_REGISTRY of BaseAction
+subclasses (feature_flag.enable, feature_flag.disable already exist),
+and a `@approval_gate(...)` DRF decorator wrapping
+FeatureFlagSerializer.update. The pre-existing ApprovalPolicy.conditions
+JSONField is currently treated as opaque by the engine (it always
+returns REQUIRE_APPROVAL when the policy is enabled) — making it
+semantic is part of this task.
+
+A feature flag's rollout percentage can sit in four nested locations
+inside `filters`: groups[*], super_groups[*], holdout_groups[*], and
+multivariate.variants[*]. A naive implementation only watches groups[*]
+and silently lets changes to the other three slip past the gate.
+
+The frontend lives at frontend/src/scenes/settings/organization/Approvals/
+ApprovalPolicies.tsx (the modal + table) and frontend/src/scenes/approvals/
+utils.ts (the action key catalog).
+
+Red herrings:
+- The notifications subsystem (posthog/approvals/notifications.py) is
+  unrelated to this feature; agents who try to refactor it are pulled
+  away from the task.
+- FeatureFlagActionBase exists for enable/disable; agents may try to
+  inherit it for the update action, which subtly forces a single-field
+  intent_fields shape that doesn't fit the multi-path rollout
+  extraction. Both subclassing and freshly subclassing BaseAction are
+  valid paths.
+- The PolicyEngine's `policy_snapshot` dict is what gets stored on the
+  ChangeRequest — agents must remember to extend it with the new
+  conditions field if they want the snapshot to be fully self-describing.
+"""
+solution = """The reference oracle introduces an UpdateFeatureFlagAction (key
+"feature_flag.update") that owns multi-path rollout extraction, a
+PolicyEngine._evaluate_conditions(...) dispatch over three condition
+modes (any_change / before_after / change_amount), a
+get_all_matching_policies(...) helper for conflict detection, a
+"policy_conflict" GateResult action emitted by _evaluate_gate(...), and
+an HTTP 400 response in _result_to_response(...) that surfaces the
+conflicting policies. The existing @approval_gate(...) decorator on
+FeatureFlagSerializer.update now also lists "feature_flag.update". The
+frontend ApprovalPolicies modal renders a condition-builder block that
+only appears for the update action and produces a `conditions` payload
+with `{type, field, operator?, value?}`.
+
+Valid alternatives we accept:
+- The condition mode names ("any_change", "before_after",
+  "change_amount") are conventions; alternative names are fine as long
+  as the same three semantics are supported.
+- Internal helpers can live in policies.py, a new conditions.py, or
+  inside the action class itself.
+- Conflict detection can return either HTTP 400 or 409 with a body that
+  identifies the conflict; we test for "policy_conflict" appearing in
+  the body, not for an exact JSON envelope.
+- Path enumeration vs. recursive deep-diff are both valid for detecting
+  multi-location rollout changes.
+- The new action class can subclass FeatureFlagActionBase or BaseAction
+  directly.
+
+What naive implementations get wrong:
+- Watching only groups[*] and ignoring super_groups, holdout_groups,
+  multivariate.variants.
+- Triggering the update gate on a request that flips active=true and
+  also includes filters (an enable+update collision — enable should win).
+- Returning an unhelpful 500 or 403 on the multi-policy conflict case
+  instead of a structured response.
+- Forgetting to extend the policy_snapshot with the policy's conditions
+  so the audit trail is complete.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-service", "typescript-frontend"]
+runtime_dependence = "runtime-helpful"
+skills = ["interface-design", "framework-fluency", "data-model-design", "api-contract-design", "codebase-exploration"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 602
+files = 7
+hunks = 31
+scope = "extensive"
+
+[metadata.origin]
+repo = "PostHog/posthog"
+pr_numbers = [45439]
+base_commit = "8c8cb8cdf6d3d08528d1ee380b8493e80f18bcbb"
+base_commit_date = "2026-01-20"
+merged_at = "2026-01-26"
+
+
+
+

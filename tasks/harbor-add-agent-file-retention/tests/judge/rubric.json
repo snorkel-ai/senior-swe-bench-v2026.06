@@ -1,0 +1,19 @@
+{
+  "files": [
+    "src/harbor/cli/jobs.py",
+    "src/harbor/models/trial/config.py",
+    "src/harbor/environments/base.py",
+    "src/harbor/trial/trial.py"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "dual_environment_handling",
+      "description": "Retention is wired into BOTH environment kinds. For mounted environments (e.g. the default local Docker case, where agent files already sit in the local trial directory and nothing is downloaded), the policy is applied by pruning the local agent directory during trial finalization. For non-mounted/remote environments (where the agent directory is pulled back over the wire), the policy ensures that after finalization the local agent directory holds only the retained files — whether achieved by filtering during the download itself or by pruning locally after the download completes. A solution that only wires the CLI/config without changing what files survive in the local agent dir must NOT pass; similarly, a solution that only handles mounted environments and leaves all files in place for the common Docker case must NOT pass. Award credit only when both environment kinds produce a correctly-pruned local agent dir for each policy (all / trajectories_only / none)."
+    },
+    {
+      "name": "trajectory_patterns_match_trace_export",
+      "description": "The notion of a 'trajectory file' used by the trajectories_only filter matches EXACTLY the set of filenames that trace export (harbor/utils/traces_utils.py) consumes from the ROOT of the agent directory: the base trajectory.json, numbered continuations trajectory.cont-<n>.json, and the three summarization variants trajectory.summarization-<n>-(summary|questions|answers).json. A predicate that recognizes only the base trajectory.json (dropping continuation and/or summarization files that downstream trace export still needs), or that matches by a looser rule that would also keep clearly non-trajectory files, must NOT pass. Award credit only when the predicate covers the full traces_utils name set and no more (root-only, the recognized variants included)."
+    }
+  ],
+  "pass_to_pass": []
+}

@@ -1,0 +1,238 @@
+version = "1.0"
+
+[environment]
+base_image = "prefect-fix-subflow-cancellation:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1800.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "prefect"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "prefect"
+
+[metadata]
+family = "prefect-fix-subflow-cancellation"
+variant = "hard"
+segment = "design"
+repo = "prefect"
+tags = ["prefect", "python-service", "python-lib", "cli"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """When a Prefect flow that calls another flow in the same process (an
+in-process nested subflow) is cancelled by the user, the cancellation is
+currently treated as a crash inside the running subprocess: both the
+outer flow and the nested subflow end up CRASHED, and neither runs its
+on_cancellation hook. Build the runtime support that makes this work the
+way users expect — when the user cancels a flow run that owns an
+in-process nested subflow, both the outer flow and the nested subflow
+should reach the Cancelled state and run their on_cancellation hooks.
+The fix should be runtime-only: it changes how an already-running flow
+process interprets the runner's termination, and does not need to add
+any new startup-time graceful-cancellation guarantee.
+"""
+context = """Touchpoints (a valid implementation will modify some subset of these,
+not necessarily all of them):
+- The runner side that issues termination to a child flow run process,
+  most relevantly the path that goes through `Runner.cancel_run_state`
+  and the `ProcessManager` / `CancellationManager` it delegates to under
+  `src/prefect/runner/`.
+- The child-side flow engine entrypoints, including the SIGTERM
+  capture/bridge in `src/prefect/flow_engine.py` and the synchronous
+  `src/prefect/engine.py` dispatch.
+- The CLI subcommand that runs the child process: `prefect flow-run
+  execute` (`src/prefect/cli/flow_run.py`) and the engine command builder
+  it uses (`src/prefect/runner/_starter_engine.py`).
+- The bundle and direct subprocess starter paths that prepare the child
+  environment (`src/prefect/runner/_starter_bundle.py`,
+  `src/prefect/runner/_starter_direct.py`,
+  `src/prefect/_experimental/bundles/__init__.py` and `execute.py`).
+- The legacy execute path on `src/prefect/runner/runner.py`'s
+  `execute_flow_run` and the modern `CancellationManager` path on
+  `src/prefect/runner/_cancellation_manager.py`. Both must end up routing
+  to the same finalisation behaviour for already-acked cancels.
+- Process workers that exec `prefect flow-run execute` —
+  `src/prefect/workers/process.py` — so the child-side env contract
+  is consistent with how the runner produces it.
+- Subprocess-env handling in
+  `src/prefect/utilities/processutils.py` and
+  `src/prefect/utilities/engine.py` so that whatever cross-process
+  state the implementation chooses to use is consumed by the immediate
+  child runtime and not leaked into deeper nested subprocesses.
+
+Pre-existing public surfaces a valid implementation MUST keep working:
+- `prefect flow-run execute <flow_run_id>` CLI subcommand.
+- The `PrefectClient.set_flow_run_state(flow_run_id, Cancelling())` API
+  used by `prefect flow-run cancel` and the UI to request cancellation.
+- The `@flow(on_cancellation=[...])` hook contract.
+- `Runner.execute_flow_run`, `Runner.cancel_run_state`, and the modern
+  `CancellationManager` path that the runner uses behind the scenes.
+
+Senior-engineer nuances the PR addresses (a sloppy implementation will
+likely miss at least one):
+1. Pre-startup vs. running cancellation must behave differently.
+   Cancellation that arrives BEFORE the child has installed its SIGTERM
+   bridge / connected to whatever intent channel the implementation uses
+   must fall through to the existing crash-style termination path
+   immediately — no startup-time graceful-cancellation guarantee is
+   added in this work. Cancellation that arrives AFTER the bridge is
+   active must produce a CANCELLED parent + CANCELLED child + both
+   on_cancellation hooks.
+2. Fall-through is unconditional under any failure of the new mechanism.
+   If the child never connects, never acks, or disconnects mid-protocol,
+   the runner must NOT hang or raise — it MUST proceed to the existing
+   kill / crash path. The runner's external termination path is the only
+   guaranteed liveness mechanism; the new intent mechanism is a best-
+   effort enhancement.
+3. Async path needs CancelledError → TerminationSignal normalisation.
+   On the async runtime, `asyncio.CancelledError` propagating out of an
+   inner subflow's `await` after the SIGTERM bridge has been triggered
+   should be normalised back into the engine's TerminationSignal so the
+   intent dispatch fires consistently with the sync path.
+4. Nested subflow ownership must be set BEFORE any cancellation point.
+   When a parent flow opens an inner subflow, ownership of the SIGTERM
+   bridge must be transferred to the inner engine BEFORE the inner
+   engine's `begin_run()` can be interrupted; otherwise an early cancel
+   targets the parent's frame instead of the child's and the dispatch
+   asymmetry causes the child to be marked CRASHED.
+5. Already-finalised flow runs must not be double-finalised. When the
+   child has already persisted its terminal state via the new ack path,
+   the runner's tail-end finalisation must be a no-op for that run —
+   otherwise the runner overwrites the child's CANCELLED with a
+   runner-driven crash state and the on_cancellation marker disappears
+   from the user's view.
+6. One-shot startup data must not leak into nested subprocesses.
+   Whatever ephemeral data the implementation injects into the child env
+   (port, token, file path, fd, etc.) must be consumed by the immediate
+   child runtime and stripped/sanitised before the child spawns its own
+   subprocesses. Otherwise a deeply nested subprocess will attempt to
+   participate in the channel of its grandparent's runner, corrupting
+   intent dispatch.
+7. Reschedule mode must keep raw SIGTERM behaviour. If
+   `PREFECT_FLOW_RUN_EXECUTE_SIGTERM_BEHAVIOR=reschedule` is set, the raw
+   SIGTERM path must still produce a reschedulable state, not get
+   redirected through the new cancel-intent dispatch.
+
+Misdirection: it is tempting to "fix" this by changing the engine's
+SIGTERM handler to always treat termination as Cancel rather than Crash.
+That breaks (a) the legitimate crash signal path (e.g. OOM-kill,
+external SIGTERM that is not a user cancel) and (b) the reschedule-mode
+contract. The right design distinguishes user-driven cancel intent from
+unsolicited termination — by communicating intent across the process
+boundary BEFORE the kill signal arrives.
+"""
+solution = """Oracle's design (one valid solution among several):
+- A loopback control channel: a runner-side TCP listener (`ControlChannel`
+  in `prefect.runner._control_channel`) registers a per-flow-run token,
+  injects `PREFECT__CONTROL_PORT` / `PREFECT__CONTROL_TOKEN` into the
+  child env. The child entrypoint calls
+  `prefect._internal.control_listener.configure_from_env()` early to
+  consume those one-shot vars; the outermost `capture_sigterm()` calls
+  `start()` to connect back. On cancel, the runner writes one byte
+  (`b"c"`) and waits briefly for `b"a"` ack. The child commits intent
+  under the SIGTERM bridge lock, acks, then the runner sends its normal
+  termination.
+- Engine-side: the child SIGTERM handler reads
+  `control_listener.get_intent()` inside `except TerminationSignal:` and
+  dispatches to cancellation handling for `"cancel"`, falling through to
+  crash for `None`. The async runtime adds CancelledError → TerminationSignal
+  normalisation. Reschedule mode is preserved by checking the env behaviour
+  setting before consulting intent.
+- Nested ownership: the inner subflow engine takes the bridge before
+  `begin_run()` so an early cancel hits the right frame.
+- Cancel finalisation is extracted to `prefect.runner._cancel_finalizer`;
+  both the modern CancellationManager path and the legacy
+  `Runner.execute_flow_run` path call it. It includes a guard that skips
+  re-finalisation when the child has already persisted a CANCELLED
+  terminal state.
+- Subprocess env sanitisation strips `PREFECT__CONTROL_*` from the
+  process env immediately after consumption so deeper nested subprocesses
+  do not attempt to connect.
+
+Equally valid alternatives:
+- Unix-domain socket / abstract namespace socket instead of TCP loopback.
+- A pre-fork pipe pair inherited by the child instead of a connect-back
+  channel.
+- A second signal (e.g. SIGUSR1) used as the "intent: cancel" marker,
+  with the engine's SIGTERM handler reading a flag set by the SIGUSR1
+  handler.
+- A per-run intent file under a state directory the runner shares with
+  the child, polled by the engine's termination handler.
+- The intent module(s) can live anywhere: `prefect._internal.*`,
+  `prefect.runner.*`, top-level `prefect.signals`, etc. The validation
+  stories never reference the module name.
+
+Wrong / non-optimal fixes the rubric REJECTS:
+- Always treating SIGTERM as cancel inside the engine — breaks crash
+  detection for unsolicited termination and breaks reschedule mode.
+- Polling the API for the parent's state from inside the child engine
+  before processing a SIGTERM — adds latency, can race with the runner's
+  kill, and doesn't help when the API is unreachable.
+- Wrapping the engine's whole loop in `try/except SystemExit` and always
+  marking CANCELLED — same problem as above plus it overwrites legitimate
+  crash detection.
+- Removing the existing crash detection entirely — non-cancel termination
+  must still be marked CRASHED.
+- Hanging the runner waiting for an ack with no timeout / no fallback —
+  one stuck child blocks the runner's whole liveness.
+
+Red herrings the agent may chase:
+- The raw PR also touches several `tests/runner/` files extensively
+  (test__control_channel.py, test__cancellation_manager.py, etc.) — the
+  curated oracle excludes these so the agent must design their own
+  testing without copying. Their patterns are useful learning material
+  but the agent isn't expected to re-create them.
+- The PR's commit message mentions Windows specifics
+  (_thread.interrupt_main(SIGTERM)). The container is Linux-only;
+  cross-platform symmetry is a rubric concern, not a verifier concern.
+- The reschedule-mode caveat (PREFECT_FLOW_RUN_EXECUTE_SIGTERM_BEHAVIOR)
+  is real and important, but exhaustively testing it would require
+  reschedule fixtures the container doesn't have. The rubric flags
+  implementations that obviously break reschedule (e.g. deleting the
+  raw-SIGTERM code path), but doesn't test it end-to-end.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-service", "python-lib", "cli"]
+runtime_dependence = "runtime-essential"
+skills = ["codebase-exploration", "interface-design", "concurrency-reasoning", "framework-fluency", "cross-service-reasoning", "state-management", "distributed-systems", "logic-fix"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 1576
+files = 19
+hunks = 90
+scope = "extensive"
+
+[metadata.origin]
+repo = "PrefectHQ/prefect"
+pr_numbers = [21477]
+base_commit = "1c970c3bdf8d2674a97eda5f73256fa18258b4e8"
+base_commit_date = "2026-04-08"
+merged_at = "2026-04-15"
+
+
+
+

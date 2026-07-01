@@ -1,0 +1,197 @@
+diff --git a/crates/turborepo-boundaries/src/lib.rs b/crates/turborepo-boundaries/src/lib.rs
+index b4c234dc21..00fc034083 100644
+--- a/crates/turborepo-boundaries/src/lib.rs
++++ b/crates/turborepo-boundaries/src/lib.rs
+@@ -36,6 +36,10 @@ pub trait PackageGraphProvider {
+     fn immediate_dependencies(&self, node: &PackageNode) -> Option<HashSet<&PackageNode>>;
+     fn dependencies(&self, node: &PackageNode) -> Box<dyn Iterator<Item = &PackageNode> + '_>;
+     fn ancestors(&self, node: &PackageNode) -> Box<dyn Iterator<Item = &PackageNode> + '_>;
++    /// Returns strongly connected components with more than one member,
++    /// representing circular dependency chains in the package graph.
++    /// Each inner Vec is ordered to form a cycle path.
++    fn find_cycles(&self) -> Vec<Vec<PackageName>>;
+ }
+
+ impl PackageGraphProvider for PackageGraph {
+@@ -54,6 +58,10 @@ impl PackageGraphProvider for PackageGraph {
+     fn ancestors(&self, node: &PackageNode) -> Box<dyn Iterator<Item = &PackageNode> + '_> {
+         Box::new(self.ancestors(node).into_iter())
+     }
++
++    fn find_cycles(&self) -> Vec<Vec<PackageName>> {
++        self.find_cycles()
++    }
+ }
+
+ pub trait TurboJsonProvider {
+@@ -191,6 +199,8 @@ pub enum BoundariesDiagnostic {
+     },
+     #[error("failed to parse file {0}: {1}")]
+     ParseError(AbsoluteSystemPathBuf, String),
++    #[error("Circular package dependency detected: {cycle_path}")]
++    CircularDependency { cycle_path: String },
+ }
+
+ #[derive(Debug, Error, Diagnostic)]
+@@ -215,6 +225,7 @@ impl BoundariesDiagnostic {
+             Self::ImportLeavesPackage { path, span, .. } => Some((path, *span)),
+             Self::PackageNotFound { path, span, .. } => Some((path, *span)),
+             Self::NotTypeOnlyImport { path, span, .. } => Some((path, *span)),
++            Self::CircularDependency { .. } => None,
+             _ => None,
+         }
+     }
+@@ -411,24 +422,37 @@ impl BoundariesChecker {
+         let packages: Vec<_> = ctx.pkg_dep_graph.packages().collect();
+         let repo: Option<()> = None;
+         let mut result = BoundariesResult::default();
++
++        for cycle in ctx.pkg_dep_graph.find_cycles() {
++            let cycle_path = cycle
++                .iter()
++                .map(|name| name.to_string())
++                .chain(std::iter::once(cycle[0].to_string()))
++                .collect::<Vec<_>>()
++                .join(" -> ");
++            result
++                .diagnostics
++                .push(BoundariesDiagnostic::CircularDependency { cycle_path });
++        }
+         let global_implicit_dependencies = ctx
+             .turbo_json_provider
+             .implicit_dependencies(&PackageName::Root);
+
++        let packages_to_check = packages
++            .into_iter()
++            .filter(|(name, _)| {
++                ctx.filtered_pkgs.contains(name) && !matches!(name, PackageName::Root)
++            })
++            .collect::<Vec<_>>();
++
+         let progress = if show_progress {
+             println!("Checking packages...");
+-            ProgressBar::new(packages.len() as u64)
++            ProgressBar::new(packages_to_check.len() as u64)
+         } else {
+             ProgressBar::hidden()
+         };
+
+-        for (package_name, package_info) in packages.into_iter().progress_with(progress) {
+-            if !ctx.filtered_pkgs.contains(package_name)
+-                || matches!(package_name, PackageName::Root)
+-            {
+-                continue;
+-            }
+-
++        for (package_name, package_info) in packages_to_check.into_iter().progress_with(progress) {
+             Self::check_package(
+                 ctx,
+                 &repo,
+diff --git a/crates/turborepo-query/src/boundaries.rs b/crates/turborepo-query/src/boundaries.rs
+index 87ab9c002c..290611ecd7 100644
+--- a/crates/turborepo-query/src/boundaries.rs
++++ b/crates/turborepo-query/src/boundaries.rs
+@@ -108,6 +108,14 @@ impl From<BoundariesDiagnostic> for Diagnostic {
+                 import: None,
+                 reason: None,
+             },
++            BoundariesDiagnostic::CircularDependency { .. } => Diagnostic {
++                message,
++                path: None,
++                start: None,
++                end: None,
++                import: None,
++                reason: None,
++            },
+         }
+     }
+ }
+diff --git a/crates/turborepo-repository/src/package_graph/mod.rs b/crates/turborepo-repository/src/package_graph/mod.rs
+index 786c698e1f..b3dd39f3da 100644
+--- a/crates/turborepo-repository/src/package_graph/mod.rs
++++ b/crates/turborepo-repository/src/package_graph/mod.rs
+@@ -223,6 +223,84 @@ impl PackageGraph {
+         Ok(())
+     }
+
++    /// Returns strongly connected components with more than one member,
++    /// representing circular dependency chains in the package graph.
++    /// Each inner Vec is ordered to trace a representative cycle path
++    /// through the SCC, rotated so the lexicographically smallest name
++    /// comes first.
++    pub fn find_cycles(&self) -> Vec<Vec<PackageName>> {
++        if !petgraph::algo::is_cyclic_directed(&self.graph) {
++            return Vec::new();
++        }
++
++        let sccs = petgraph::algo::tarjan_scc(&self.graph);
++        let mut cycles: Vec<Vec<PackageName>> = sccs
++            .into_iter()
++            .filter(|scc| scc.len() > 1)
++            .filter_map(|scc| {
++                let scc_set: HashSet<NodeIndex> = scc.into_iter().collect();
++                self.trace_cycle_path(&scc_set)
++            })
++            .collect();
++
++        // Sort for deterministic output
++        cycles.sort();
++        cycles
++    }
++
++    /// Trace a representative cycle path through an SCC by following edges
++    /// deterministically. Starts from the smallest NodeIndex and always
++    /// picks the smallest NodeIndex neighbor to ensure consistent results
++    /// across runs and platforms.
++    fn trace_cycle_path(&self, scc: &HashSet<NodeIndex>) -> Option<Vec<PackageName>> {
++        let start = *scc.iter().min()?;
++        let mut path: Vec<NodeIndex> = Vec::new();
++        let mut visited: HashMap<NodeIndex, usize> = HashMap::new();
++        let mut current = start;
++
++        loop {
++            if let Some(&cycle_start_idx) = visited.get(&current) {
++                let cycle_indices = &path[cycle_start_idx..];
++                let mut names: Vec<PackageName> = cycle_indices
++                    .iter()
++                    .filter_map(|idx| match self.graph.node_weight(*idx)? {
++                        PackageNode::Workspace(name) if !matches!(name, PackageName::Root) => {
++                            Some(name.clone())
++                        }
++                        _ => None,
++                    })
++                    .collect();
++
++                if names.is_empty() {
++                    return None;
++                }
++
++                // Rotate so the lexicographically smallest name comes first
++                if let Some(min_pos) = names
++                    .iter()
++                    .enumerate()
++                    .min_by_key(|(_, name)| (*name).clone())
++                    .map(|(i, _)| i)
++                {
++                    names.rotate_left(min_pos);
++                }
++
++                return Some(names);
++            }
++
++            visited.insert(current, path.len());
++            path.push(current);
++
++            // Pick the smallest NodeIndex neighbor within the SCC for
++            // deterministic traversal
++            current = self
++                .graph
++                .neighbors_directed(current, petgraph::Outgoing)
++                .filter(|n| scc.contains(n))
++                .min()?;
++        }
++    }
++
+     pub fn remove_package_dependencies(&mut self) {
+         let root_index = self
+             .node_lookup

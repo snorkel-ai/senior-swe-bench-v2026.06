@@ -1,0 +1,120 @@
+diff --git a/rust/libs/client-shared/src/eventloop.rs b/rust/libs/client-shared/src/eventloop.rs
+index 5be33c26b1..8574681d3d 100644
+--- a/rust/libs/client-shared/src/eventloop.rs
++++ b/rust/libs/client-shared/src/eventloop.rs
+@@ -539,7 +539,13 @@ impl Eventloop {
+                             .send(UserNotification::GatewayVersionMismatch { resource_id })
+                             .await;
+                     }
+-                    FailReason::NotFound | FailReason::Forbidden | FailReason::Unknown => {}
++                    FailReason::NotFound
++                    | FailReason::Forbidden
++                    | FailReason::Disabled
++                    | FailReason::AmbiguousAddress
++                    | FailReason::MissingAddress
++                    | FailReason::InvalidAddress
++                    | FailReason::Unknown => {}
+                 }
+             }
+             IngressMessages::ClientDeviceAccessAuthorized(ClientDeviceAccessAuthorized {
+diff --git a/rust/libs/connlib/tunnel/src/client.rs b/rust/libs/connlib/tunnel/src/client.rs
+index e6dd910991..29db7d8284 100644
+--- a/rust/libs/connlib/tunnel/src/client.rs
++++ b/rust/libs/connlib/tunnel/src/client.rs
+@@ -319,24 +319,28 @@ impl ClientState {
+     /// 2. When access is revoked after it has been established.
+     pub fn handle_client_device_access_denied(
+         &mut self,
+-        ipv4: Ipv4Addr,
+-        ipv6: Ipv6Addr,
++        ipv4: Option<Ipv4Addr>,
++        ipv6: Option<Ipv6Addr>,
+         reason: FailReason,
+         now: Instant,
+     ) {
+-        tracing::debug!(%ipv4, %ipv6, "Device access denied: {reason:?}");
++        tracing::debug!(?ipv4, ?ipv6, "Device access denied: {reason:?}");
+
+         // The protocol is irrelevant: each member device has exactly one routing-table entry
+         // per address, so the lookup always resolves to that entry regardless of the dummy.
+-        let entry = self
+-            .client_routing_table
+-            .matches(IpAddr::V4(ipv4), Ok(Protocol::Tcp(0)))
+-            .cloned();
+-        let entry = entry.or_else(|| {
+-            self.client_routing_table
+-                .matches(IpAddr::V6(ipv6), Ok(Protocol::Tcp(0)))
+-                .cloned()
+-        });
++        let entry = ipv4
++            .and_then(|ip| {
++                self.client_routing_table
++                    .matches(IpAddr::V4(ip), Ok(Protocol::Tcp(0)))
++                    .cloned()
++            })
++            .or_else(|| {
++                ipv6.and_then(|ip| {
++                    self.client_routing_table
++                        .matches(IpAddr::V6(ip), Ok(Protocol::Tcp(0)))
++                        .cloned()
++                })
++            });
+         let Some(entry) = entry else {
+             return;
+         };
+diff --git a/rust/libs/connlib/tunnel/src/dns/device_stub_resolver.rs b/rust/libs/connlib/tunnel/src/dns/device_stub_resolver.rs
+index 32984e1852..6d5a74491f 100644
+--- a/rust/libs/connlib/tunnel/src/dns/device_stub_resolver.rs
++++ b/rust/libs/connlib/tunnel/src/dns/device_stub_resolver.rs
+@@ -197,6 +197,10 @@ impl DeviceStubResolver {
+                 FailReason::Offline
+                 | FailReason::VersionMismatch
+                 | FailReason::Forbidden
++                | FailReason::Disabled
++                | FailReason::AmbiguousAddress
++                | FailReason::MissingAddress
++                | FailReason::InvalidAddress
+                 | FailReason::Unknown,
+             ) => dns_types::Response::servfail(&pending.query),
+         };
+diff --git a/rust/libs/connlib/tunnel/src/messages/client.rs b/rust/libs/connlib/tunnel/src/messages/client.rs
+index e9c8e2d7f7..abf957dd7b 100644
+--- a/rust/libs/connlib/tunnel/src/messages/client.rs
++++ b/rust/libs/connlib/tunnel/src/messages/client.rs
+@@ -68,6 +68,7 @@ pub struct ResourceDescriptionStaticDevicePool {
+
+ #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+ pub struct DevicePoolMember {
++    #[serde(rename = "client_id", alias = "id")]
+     pub id: ClientId,
+     pub ipv4: Ipv4Network,
+     pub ipv6: Ipv6Network,
+@@ -156,10 +157,15 @@ pub struct ClientDeviceAccessAuthorized {
+     pub ice_role: IceRole,
+ }
+
++/// Portal's denial of a `create_flow` toward a static device pool peer.
++///
++/// Either or both of `ipv4` / `ipv6` may be absent depending on the denial reason.
+ #[derive(Debug, Deserialize, Clone)]
+ pub struct ClientDeviceAccessDenied {
+-    pub ipv4: Ipv4Addr,
+-    pub ipv6: Ipv6Addr,
++    #[serde(default)]
++    pub ipv4: Option<Ipv4Addr>,
++    #[serde(default)]
++    pub ipv6: Option<Ipv6Addr>,
+     pub reason: FailReason,
+ }
+
+@@ -186,6 +192,10 @@ pub enum FailReason {
+     Offline,
+     VersionMismatch,
+     Forbidden,
++    Disabled,
++    AmbiguousAddress,
++    MissingAddress,
++    InvalidAddress,
+     #[serde(other)]
+     Unknown,
+ }

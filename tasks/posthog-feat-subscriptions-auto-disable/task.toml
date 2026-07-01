@@ -1,0 +1,203 @@
+version = "1.0"
+
+[environment]
+base_image = "posthog-feat-subscriptions-auto-disable:latest"
+build_timeout_sec = 1200.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 4800.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "posthog"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "posthog"
+
+[metadata]
+family = "posthog-feat-subscriptions-auto-disable"
+variant = "hard"
+segment = "design"
+repo = "posthog"
+tags = ["posthog", "python-service", "typescript-frontend", "sql-database"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """PostHog report **subscriptions** deliver insights and dashboards to email
+and Slack on a recurring schedule. Today, if a subscription's delivery
+target can never succeed — a Slack integration the workspace has since
+disconnected, or a target type the product no longer supports — the
+delivery pipeline retries it on every cycle forever, producing a confusing
+repeating failure and never telling the owner anything is wrong.
+
+Give subscriptions an enabled/disabled lifecycle. Add the ability to pause
+and resume a subscription, and make the delivery pipeline **auto-disable** a
+subscription when its target is *permanently* broken (disconnected Slack
+integration, unsupported target type) and email the subscription's owner
+once explaining why. Crucially, *transient* failures — the export pipeline
+having no assets ready at delivery time — must NOT disable the subscription:
+the next scheduled cycle should retry. Disabled subscriptions must be
+skipped by the scheduler, must not be deliverable via the test-delivery
+endpoint, and must not trigger the delivery workflow when created or edited.
+
+Re-enabling must be safe: reject re-enabling a subscription whose
+prerequisite is still broken (Slack still disconnected, target still
+unsupported) or whose recurrence schedule has run out, and when a re-enable
+succeeds, reset the now-stale next-delivery date so the scheduler doesn't
+immediately double-fire. Surface the lifecycle in the frontend: let users
+pause/resume from the subscriptions UI and show disabled subscriptions as
+visibly inactive.
+"""
+context = """Subscriptions are an Enterprise (EE) feature. The DRF surface is
+`ee/api/subscription.py` (`SubscriptionSerializer` + `SubscriptionViewSet`),
+mounted at `/api/projects/{team_id}/subscriptions/`, with a custom
+`test-delivery` action. Access requires a current license — tests use
+`APILicensedTest` (`ee/api/test/base.py`).
+
+The `Subscription` model lives in `posthog/models/subscription.py`. It has
+no enabled/disabled concept today (only the inherited soft-delete `deleted`
+flag), and it carries the recurrence fields (`frequency`, `interval`,
+`byweekday`, `bysetpos`, `count`, `start_date`, `until_date`) plus a
+`next_delivery_date` that the scheduler reads. A model helper builds the
+rrule and computes the next occurrence; an exhausted rrule yields no next
+occurrence.
+
+Delivery runs through Temporal. `posthog/temporal/subscriptions/` holds the
+workflow (`ProcessSubscriptionWorkflow`) and its activities
+(`activities.py`): one activity fetches the due subscriptions for the
+scheduler, another performs a single delivery. The delivery activity is
+where target validity is observable — a missing Slack integration or an
+unsupported target type is a permanent condition, whereas "no exported
+assets yet" is transient. `ee/tasks/subscriptions/__init__.py` defines the
+set of supported target types. Temporal tests use
+`WorkflowEnvironment.start_time_skipping()` and `ActivityEnvironment`
+(`posthog/temporal/tests/`).
+
+The frontend subscriptions UI is under
+`frontend/src/lib/components/Subscriptions/` and
+`frontend/src/scenes/subscriptions/`, wired with Kea logics. The shared
+`SubscriptionType` lives in `frontend/src/types.ts`. The generated API
+client (`subscriptionsPartialUpdate` in `~/generated/core/api`) already
+exists and is what a PATCH-from-frontend would call.
+
+Red herrings:
+- `next_delivery_date` is nullable and already used by other code paths; an
+  exhausted schedule that lands it at null is invisible to the scheduler but
+  is not itself the "disabled" state.
+- The soft-delete `deleted` flag looks like it could double as a disabled
+  flag, but pausing must be distinct from deletion (a paused subscription
+  is still listed, editable, and re-enableable).
+- A "no assets" delivery failure looks like a reason to give up, but it is
+  the one failure mode that must stay enabled and retry.
+"""
+solution = """The reference example:
+
+- Adds `enabled = BooleanField(default=True)` to `Subscription` (migration
+  `1146`), and refactors the rrule helpers so an exhausted schedule's next
+  occurrence is computable as `None` and reusable from the serializer.
+- Teaches the delivery activity to distinguish permanent from transient
+  failure: a disconnected Slack integration or an unsupported target type
+  causes the subscription to be disabled (a compare-and-swap update that
+  only fires the owner email when it actually transitions enabled→disabled,
+  so a Temporal redelivery of the same input is idempotent and sends no
+  second email); "no assets" records a delivery failure with a distinct
+  category but leaves the subscription enabled so the next cycle retries.
+  The disable branch returns a normal result (it does not raise) so the
+  delivery is recorded as a successful SLO outcome, and the owner email is
+  best-effort (a send failure does not undo the durable disable nor escape
+  the activity).
+- Adds a workflow-level validation step so the subscription is checked and
+  short-circuited before the heavy export pipeline runs.
+- Filters the scheduler's "fetch due subscriptions" query to `enabled=True`
+  so disabled subscriptions are skipped.
+- Exposes `enabled` on the serializer and enforces re-enable preconditions:
+  re-enabling a Slack subscription whose integration is missing → 400
+  (message names the Slack reconnect requirement); re-enabling an
+  unsupported target → 400 (message says the channel is not currently
+  supported); re-enabling (or creating, or editing into) a subscription
+  whose schedule is exhausted → 400 (message says the schedule has reached
+  its end date). A `null` integration explicitly sent in the PATCH body must
+  fall through to validation rather than coalescing to the stored value. A
+  successful re-enable resets the stale `next_delivery_date` to the next
+  future occurrence.
+- Skips triggering the delivery workflow when a create/update leaves the
+  subscription disabled, and triggers it when it leaves it enabled. The
+  test-delivery action rejects a disabled subscription with a 4xx client
+  error (409 in the reference).
+- Emails the owner once on auto-disable using a per-call-unique campaign key
+  (so the messaging-dedup layer can't drop duplicates) and a template that
+  states the disable reason.
+- Frontend: a `toggleSubscriptionEnabled(id, enabled)` helper that PATCHes
+  via the generated client and surfaces a success/error toast; an
+  `isSubscriptionEnabled(sub)` predicate (`sub.enabled !== false`) used to
+  render disabled rows as visibly inactive; pause/resume affordances wired
+  through the Kea logics.
+
+Valid alternatives:
+- Where the auto-disable check physically lives (the per-delivery activity,
+  a dedicated pre-delivery validation activity, or both) is irrelevant as
+  long as running the full delivery workflow against a permanently-broken
+  target ends with the subscription disabled and the owner notified.
+- The internal helper/dataclass/activity names, the exact disable-reason
+  description strings, and whether the next-date reset goes through `save()`
+  or an explicit helper are all free, as long as the observable API/DB
+  behaviour and the user-facing strings the task commits to are preserved.
+- The model field may be named differently internally as long as the API
+  exposes it as `enabled`.
+
+What naive implementations get wrong:
+- Auto-disabling on the transient "no assets" failure, so a subscription
+  that would have recovered next cycle is permanently turned off.
+- Re-firing the owner email (and analytics) when Temporal redelivers an
+  input for an already-disabled subscription — the disable must be a
+  compare-and-swap that no-ops on the second pass.
+- Re-enabling without resetting the stale `next_delivery_date`, so the
+  scheduler immediately fires a second delivery.
+- Letting the auto-disable branch raise, recording a delivery/SLO failure
+  for what is actually a successful "handled" outcome.
+- Coalescing an explicitly-null integration in the PATCH body to the stored
+  value, so a re-enable that should be rejected silently succeeds.
+- Forgetting to exclude disabled subscriptions from the scheduler or the
+  test-delivery action.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-service", "typescript-frontend", "sql-database"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "framework-fluency", "api-contract-design", "data-model-design", "concurrency-reasoning", "event-driven-design", "state-management"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 595
+files = 23
+hunks = 79
+scope = "extensive"
+
+[metadata.origin]
+repo = "PostHog/posthog"
+pr_numbers = [56727]
+base_commit = "6e38fc69280a255ef6d80fa4b5c2449e99a54102"
+base_commit_date = "2026-05-01"
+merged_at = "2026-05-01"
+
+
+
+

@@ -1,0 +1,9 @@
+{
+  "files": [
+    "Cargo.toml",
+    "crates/turborepo-lib/src/commands/prune.rs",
+    "crates/turborepo-repository/src/package_manager/pnpm.rs"
+  ],
+  "fail_to_pass": [],
+  "pass_to_pass": []
+}

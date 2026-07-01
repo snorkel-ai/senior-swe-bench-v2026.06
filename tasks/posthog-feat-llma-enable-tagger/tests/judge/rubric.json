@@ -1,0 +1,7 @@
+{
+  "files": [
+    "products/llm_analytics/backend/api/taggers.py"
+  ],
+  "fail_to_pass": [],
+  "pass_to_pass": []
+}

@@ -1,0 +1,22 @@
+{
+  "files": [
+    "services/llm-gateway/src/llm_gateway/api/anthropic.py",
+    "services/llm-gateway/src/llm_gateway/api/handler.py",
+    "services/llm-gateway/src/llm_gateway/api/routes.py",
+    "services/llm-gateway/src/llm_gateway/models/anthropic.py",
+    "services/llm-gateway/src/llm_gateway/callbacks/__init__.py",
+    "services/llm-gateway/src/llm_gateway/callbacks/posthog.py",
+    "services/llm-gateway/src/llm_gateway/config.py"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "count_tokens_proxy_does_not_fake_response",
+      "description": "The fix does not pretend to succeed when no Anthropic API key is configured or when the upstream Anthropic call fails. A handler that hardcodes {\"input_tokens\": 0} or returns a synthetic 200 with no real proxy is rejected — the Claude Agent SDK uses the count to plan context windows, so a fake count would cause real prompt-overflow errors downstream. The fix must either forward Anthropic's response (success or error) verbatim or return a clear gateway-side error (for example: 503 with a configuration_error type when the API key is missing, or 502 with a proxy_error type when the upstream call fails)."
+    },
+    {
+      "name": "fix_addresses_root_cause_not_symptom",
+      "description": "The fix is in the LLM Gateway service's request-routing layer (a new endpoint that bypasses litellm and the callback chain), not in the PostHogCallback (no event filtering, no payload deduplication) and not in the rate-limiter (no special-case for ai_product=twig). The diff makes the spam-source code path stop existing — i.e., the Claude Agent SDK's primary token-count strategy starts succeeding so its fallback (a real $ai_generation-emitting completion) never runs. Filtering events after they've been captured does not address the wasted Anthropic spend, so it is rejected even if it makes the spam events disappear from PostHog."
+    }
+  ],
+  "pass_to_pass": []
+}

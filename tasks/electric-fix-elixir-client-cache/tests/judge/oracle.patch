@@ -1,0 +1,502 @@
+diff --git a/packages/elixir-client/lib/electric/client/application.ex b/packages/elixir-client/lib/electric/client/application.ex
+index fde1c8cae..53786b322 100644
+--- a/packages/elixir-client/lib/electric/client/application.ex
++++ b/packages/elixir-client/lib/electric/client/application.ex
+@@ -8,7 +8,8 @@ defmodule Electric.Client.Application do
+     children = [
+       {Registry, name: Electric.Client.Registry, keys: :unique},
+       {Finch, name: Electric.Client.Finch},
+-      {DynamicSupervisor, name: Electric.Client.RequestSupervisor, strategy: :one_for_one}
++      {DynamicSupervisor, name: Electric.Client.RequestSupervisor, strategy: :one_for_one},
++      Electric.Client.ExpiredShapesCache
+     ]
+ 
+     Supervisor.start_link(children, strategy: :one_for_one, name: __MODULE__)
+diff --git a/packages/elixir-client/lib/electric/client/expired_shapes_cache.ex b/packages/elixir-client/lib/electric/client/expired_shapes_cache.ex
+new file mode 100644
+index 000000000..cd3839a48
+--- /dev/null
++++ b/packages/elixir-client/lib/electric/client/expired_shapes_cache.ex
+@@ -0,0 +1,147 @@
++defmodule Electric.Client.ExpiredShapesCache do
++  @moduledoc """
++  LRU cache for tracking expired shape handles.
++
++  This cache stores shape handles that have been marked as expired (typically after
++  receiving a 409 response). When making subsequent requests for the same shape,
++  the client includes the expired handle as a query parameter to help bypass
++  stale CDN/proxy caches.
++
++  The cache uses ETS for fast concurrent reads and a GenServer to manage
++  LRU eviction when the cache exceeds the maximum number of entries.
++  """
++
++  use GenServer
++
++  @table_name :electric_expired_shapes
++  @max_entries 250
++
++  # Public API
++
++  @doc """
++  Get the expired handle for a shape key, if one exists.
++
++  Updates the last_used timestamp to maintain LRU ordering.
++  """
++  @spec get_expired_handle(String.t()) :: String.t() | nil
++  def get_expired_handle(shape_key) do
++    case :ets.lookup(@table_name, shape_key) do
++      [{^shape_key, %{expired_handle: handle}}] ->
++        # Update last_used timestamp asynchronously
++        GenServer.cast(__MODULE__, {:touch, shape_key})
++        handle
++
++      [] ->
++        nil
++    end
++  end
++
++  @doc """
++  Mark a shape handle as expired for the given shape key.
++
++  If the cache exceeds the maximum number of entries, the least recently
++  used entry will be evicted.
++  """
++  @spec mark_expired(String.t(), String.t()) :: :ok
++  def mark_expired(shape_key, handle) do
++    GenServer.call(__MODULE__, {:mark_expired, shape_key, handle})
++  end
++
++  @doc """
++  Clear all entries from the cache.
++  """
++  @spec clear() :: :ok
++  def clear do
++    GenServer.call(__MODULE__, :clear)
++  end
++
++  @doc """
++  Get the current number of entries in the cache.
++
++  Primarily for testing purposes.
++  """
++  @spec size() :: non_neg_integer()
++  def size do
++    :ets.info(@table_name, :size)
++  end
++
++  # GenServer implementation
++
++  def start_link(opts \\ []) do
++    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
++  end
++
++  @impl true
++  def init(_opts) do
++    table =
++      :ets.new(@table_name, [
++        :set,
++        :public,
++        :named_table,
++        read_concurrency: true
++      ])
++
++    {:ok, %{table: table}}
++  end
++
++  @impl true
++  def handle_call({:mark_expired, shape_key, handle}, _from, state) do
++    timestamp = System.monotonic_time()
++
++    :ets.insert(@table_name, {shape_key, %{expired_handle: handle, last_used: timestamp}})
++
++    # Evict oldest entries if we exceed the limit
++    evict_if_needed()
++
++    {:reply, :ok, state}
++  end
++
++  @impl true
++  def handle_call(:clear, _from, state) do
++    :ets.delete_all_objects(@table_name)
++    {:reply, :ok, state}
++  end
++
++  @impl true
++  def handle_cast({:touch, shape_key}, state) do
++    timestamp = System.monotonic_time()
++
++    case :ets.lookup(@table_name, shape_key) do
++      [{^shape_key, entry}] ->
++        :ets.insert(@table_name, {shape_key, %{entry | last_used: timestamp}})
++
++      [] ->
++        :ok
++    end
++
++    {:noreply, state}
++  end
++
++  defp evict_if_needed do
++    size = :ets.info(@table_name, :size)
++
++    if size > @max_entries do
++      # Find and evict the oldest entry
++      oldest =
++        :ets.foldl(
++          fn {key, %{last_used: ts}}, acc ->
++            case acc do
++              nil -> {key, ts}
++              {_oldest_key, oldest_ts} when ts < oldest_ts -> {key, ts}
++              _ -> acc
++            end
++          end,
++          nil,
++          @table_name
++        )
++
++      case oldest do
++        {oldest_key, _ts} ->
++          :ets.delete(@table_name, oldest_key)
++
++        nil ->
++          :ok
++      end
++    end
++  end
++end
+diff --git a/packages/elixir-client/lib/electric/client/poll.ex b/packages/elixir-client/lib/electric/client/poll.ex
+index 9d6ebe2b3..c23b08ac4 100644
+--- a/packages/elixir-client/lib/electric/client/poll.ex
++++ b/packages/elixir-client/lib/electric/client/poll.ex
+@@ -34,11 +34,15 @@ defmodule Electric.Client.Poll do
+   """
+ 
+   alias Electric.Client
++  alias Electric.Client.ExpiredShapesCache
+   alias Electric.Client.Fetch
+   alias Electric.Client.Message
++  alias Electric.Client.ShapeKey
+   alias Electric.Client.ShapeState
+   alias Electric.Client.TagTracker
+ 
++  @max_stale_retries 3
++
+   @type poll_result ::
+           {:ok, [Client.message()], ShapeState.t()}
+           | {:must_refetch, [Client.message()], ShapeState.t()}
+@@ -74,15 +78,16 @@ defmodule Electric.Client.Poll do
+   @spec request(Client.t(), ShapeState.t(), keyword()) :: poll_result()
+   def request(%Client{} = client, %ShapeState{} = state, opts \\ []) do
+     replica = Keyword.get(opts, :replica, :default)
++    shape_key = ShapeKey.canonical(client.endpoint, client.params)
+ 
+-    request = build_request(client, state, replica)
++    request = build_request(client, state, replica, shape_key)
+ 
+     case Fetch.request(client, request) do
+       %Fetch.Response{status: status} = resp when status in 200..299 ->
+-        handle_success(resp, client, state)
++        handle_success(resp, client, state, shape_key)
+ 
+       {:error, %Fetch.Response{status: 409} = resp} ->
+-        handle_must_refetch(resp, client, state)
++        handle_must_refetch(resp, client, state, shape_key)
+ 
+       {:error, %Fetch.Response{body: body} = resp} ->
+         {:error, %Client.Error{message: unwrap_error(body), resp: resp}}
+@@ -92,15 +97,25 @@ defmodule Electric.Client.Poll do
+     end
+   end
+ 
+-  defp build_request(client, state, replica) do
++  defp build_request(client, state, replica, shape_key) do
+     %{
+       shape_handle: shape_handle,
+       offset: offset,
+       up_to_date?: up_to_date?,
+-      next_cursor: cursor
++      next_cursor: cursor,
++      stale_cache_buster: cache_buster
+     } = state
+ 
+-    Client.request(client,
++    # Build additional params for cache busting
++    cache_busting_params =
++      %{}
++      |> maybe_add_expired_handle(shape_key)
++      |> maybe_add_cache_buster(cache_buster)
++
++    # Merge cache busting params into client params before building request
++    client_with_cache_params = Client.merge_params(client, cache_busting_params)
++
++    Client.request(client_with_cache_params,
+       offset: offset,
+       shape_handle: shape_handle,
+       replica: replica,
+@@ -109,13 +124,44 @@ defmodule Electric.Client.Poll do
+     )
+   end
+ 
+-  defp handle_success(resp, client, state) do
+-    shape_handle = shape_handle!(resp)
++  defp maybe_add_expired_handle(params, shape_key) do
++    case ExpiredShapesCache.get_expired_handle(shape_key) do
++      nil -> params
++      expired -> Map.put(params, "expired_handle", expired)
++    end
++  end
++
++  defp maybe_add_cache_buster(params, nil), do: params
++  defp maybe_add_cache_buster(params, buster), do: Map.put(params, "cache-buster", buster)
++
++  defp handle_success(resp, client, state, shape_key) do
++    response_handle = shape_handle!(resp)
++    expired_handle = ExpiredShapesCache.get_expired_handle(shape_key)
++
++    # Check for stale CDN response
++    cond do
++      # Stale: response matches expired AND no valid local handle
++      response_handle == expired_handle and
++          (is_nil(state.shape_handle) or state.shape_handle == expired_handle) ->
++        handle_stale_response(state)
++
++      # Stale but have valid local handle: ignore response
++      response_handle == expired_handle ->
++        {:stale_ignored, ShapeState.clear_stale_retry(state)}
++
++      # Normal: process response
++      true ->
++        process_success_response(resp, client, state, response_handle)
++    end
++  end
++
++  defp process_success_response(resp, client, state, shape_handle) do
+     final_offset = last_offset(resp, state.offset)
+     next_cursor = resp.next_cursor
+ 
+     state = %{state | shape_handle: shape_handle, next_cursor: next_cursor, offset: final_offset}
+     state = handle_schema(resp, client, state)
++    state = ShapeState.clear_stale_retry(state)
+ 
+     %{value_mapper_fun: value_mapper_fun} = state
+ 
+@@ -128,11 +174,29 @@ defmodule Electric.Client.Poll do
+     {:ok, messages, new_state}
+   end
+ 
+-  defp handle_must_refetch(resp, client, state) do
++  defp handle_stale_response(state) do
++    if state.stale_cache_retry_count >= @max_stale_retries do
++      {:error,
++       %Client.Error{
++         message:
++           "CDN continues serving stale cached responses after #{@max_stale_retries} retry attempts"
++       }}
++    else
++      {:stale_retry, ShapeState.enter_stale_retry(state)}
++    end
++  end
++
++  defp handle_must_refetch(resp, client, state, shape_key) do
++    # Mark the old handle as expired
++    if state.shape_handle do
++      ExpiredShapesCache.mark_expired(shape_key, state.shape_handle)
++    end
++
+     handle = shape_handle(resp) || "#{state.shape_handle}-next"
+ 
+     new_state = ShapeState.reset(state, handle)
+     new_state = handle_schema(resp, client, new_state)
++    new_state = ShapeState.clear_stale_retry(new_state)
+ 
+     %{value_mapper_fun: value_mapper_fun} = new_state
+ 
+diff --git a/packages/elixir-client/lib/electric/client/shape_key.ex b/packages/elixir-client/lib/electric/client/shape_key.ex
+new file mode 100644
+index 000000000..8b141c9fe
+--- /dev/null
++++ b/packages/elixir-client/lib/electric/client/shape_key.ex
+@@ -0,0 +1,81 @@
++defmodule Electric.Client.ShapeKey do
++  @moduledoc """
++  Generate canonical shape keys for cache lookup.
++
++  The canonical shape key is a stable identifier for a shape definition that
++  excludes Electric protocol parameters (like cursor, handle, offset, etc.).
++  This allows the client to identify when different requests are for the same
++  underlying shape, which is useful for cache busting when CDN/proxy caches
++  serve stale responses.
++  """
++
++  # Parameters that are part of the Electric protocol and should be excluded
++  # from the canonical shape key
++  @protocol_params ~w(
++    cursor
++    handle
++    live
++    offset
++    cache-buster
++    expired_handle
++    log
++    subset__where
++    subset__limit
++    subset__offset
++    subset__order_by
++    subset__params
++    subset__where_expr
++    subset__order_by_expr
++  )
++
++  @doc """
++  Generate a canonical shape key from a URI.
++
++  Extracts query parameters, filters out Electric protocol parameters,
++  sorts the remaining parameters alphabetically, and returns a canonical
++  URL string.
++
++  ## Examples
++
++      iex> uri = URI.parse("http://localhost:3000/v1/shape?table=items&cursor=123&offset=0_0")
++      iex> ShapeKey.canonical(uri)
++      "http://localhost:3000/v1/shape?table=items"
++
++  """
++  @spec canonical(URI.t()) :: String.t()
++  def canonical(%URI{} = uri) do
++    params = URI.decode_query(uri.query || "")
++    canonical(uri, params)
++  end
++
++  @doc """
++  Generate a canonical shape key from an endpoint URI and params map.
++
++  ## Examples
++
++      iex> endpoint = URI.parse("http://localhost:3000/v1/shape")
++      iex> params = %{"table" => "items", "where" => "id > 0", "offset" => "0_0"}
++      iex> ShapeKey.canonical(endpoint, params)
++      "http://localhost:3000/v1/shape?table=items&where=id%20%3E%200"
++
++  """
++  @spec canonical(URI.t(), map()) :: String.t()
++  def canonical(%URI{} = endpoint, params) when is_map(params) do
++    # Filter out protocol parameters
++    shape_params =
++      params
++      |> Enum.reject(fn {key, _value} -> key in @protocol_params end)
++      |> Enum.sort_by(fn {key, _value} -> key end)
++
++    # Build the canonical URL
++    query =
++      if shape_params == [] do
++        nil
++      else
++        URI.encode_query(shape_params, :rfc3986)
++      end
++
++    %{endpoint | query: query}
++    |> URI.to_string()
++  end
++end
+diff --git a/packages/elixir-client/lib/electric/client/shape_state.ex b/packages/elixir-client/lib/electric/client/shape_state.ex
+index 4cf28be5a..6f1888bac 100644
+--- a/packages/elixir-client/lib/electric/client/shape_state.ex
++++ b/packages/elixir-client/lib/electric/client/shape_state.ex
+@@ -22,16 +22,19 @@ defmodule Electric.Client.ShapeState do
+   alias Electric.Client
+   alias Electric.Client.Offset
+   alias Electric.Client.Message.ResumeMessage
++  alias Electric.Client.Util
+ 
+   defstruct [
+     :shape_handle,
+     :schema,
+     :value_mapper_fun,
+     :next_cursor,
++    :stale_cache_buster,
+     offset: Offset.before_all(),
+     up_to_date?: false,
+     tag_to_keys: %{},
+-    key_data: %{}
++    key_data: %{},
++    stale_cache_retry_count: 0
+   ]
+ 
+   @type t :: %__MODULE__{
+@@ -42,7 +45,9 @@ defmodule Electric.Client.ShapeState do
+           next_cursor: binary() | nil,
+           up_to_date?: boolean(),
+           tag_to_keys: %{optional(term()) => MapSet.t()},
+-          key_data: %{optional(term()) => %{tags: MapSet.t(), msg: term()}}
++          key_data: %{optional(term()) => %{tags: MapSet.t(), msg: term()}},
++          stale_cache_buster: String.t() | nil,
++          stale_cache_retry_count: non_neg_integer()
+         }
+ 
+   @doc """
+@@ -111,4 +116,43 @@ defmodule Electric.Client.ShapeState do
+       key_data: state.key_data
+     }
+   end
++
++  @doc """
++  Enter stale retry mode by setting a cache buster and incrementing the retry count.
++
++  Called when a stale CDN response is detected - the server returns an expired
++  handle that matches our cached expired handle.
++  """
++  @spec enter_stale_retry(t()) :: t()
++  def enter_stale_retry(%__MODULE__{} = state) do
++    %{
++      state
++      | stale_cache_buster: generate_cache_buster(),
++        stale_cache_retry_count: state.stale_cache_retry_count + 1
++    }
++  end
++
++  @doc """
++  Clear stale retry state after a successful response.
++
++  Called when we receive a fresh (non-stale) response from the server.
++  """
++  @spec clear_stale_retry(t()) :: t()
++  def clear_stale_retry(%__MODULE__{} = state) do
++    %{
++      state
++      | stale_cache_buster: nil,
++        stale_cache_retry_count: 0
++    }
++  end
++
++  @doc """
++  Generate a random cache buster string.
++
++  Uses 8 random bytes encoded as hex (16 characters).
++  """
++  @spec generate_cache_buster() :: String.t()
++  def generate_cache_buster do
++    Util.generate_id(8)
++  end
+ end
+diff --git a/packages/elixir-client/lib/electric/client/stream.ex b/packages/elixir-client/lib/electric/client/stream.ex
+index 9873d4586..94be64322 100644
+--- a/packages/elixir-client/lib/electric/client/stream.ex
++++ b/packages/elixir-client/lib/electric/client/stream.ex
+@@ -166,6 +166,16 @@ defmodule Electric.Client.Stream do
+         |> handle_messages(messages)
+         |> dispatch()
+ 
++      {:stale_retry, new_poll_state} ->
++        # Retry immediately with cache buster
++        %{stream | poll_state: new_poll_state}
++        |> fetch()
++
++      {:stale_ignored, new_poll_state} ->
++        # Stale response ignored, continue polling
++        %{stream | poll_state: new_poll_state}
++        |> fetch()
++
+       {:error, error} ->
+         handle_error(error, stream)
+     end

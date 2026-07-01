@@ -1,0 +1,207 @@
+version = "1.0"
+
+[environment]
+base_image = "paperless-ngx-feat-saved-view-sharing:latest"
+build_timeout_sec = 1800.0
+cpus = 2
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1200.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "paperless-ngx"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "paperless-ngx"
+
+[metadata]
+family = "paperless-ngx-feat-saved-view-sharing"
+variant = "hard"
+segment = "design"
+repo = "paperless-ngx"
+tags = ["paperless-ngx", "python-service", "typescript-frontend", "sql-database"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Saved views in Paperless-ngx are owner-only: a user only ever sees views
+they own, and the per-view "show on dashboard" / "show in sidebar" toggles
+apply globally because the values live on the saved-view row itself. We
+want saved views to behave like the other shareable resources in the app
+(tags, correspondents, …): owners can grant view/change access to other
+users and groups, the recipient sees the view in their list and (with
+change perm) can edit it, and global search surfaces shared views the
+same way it surfaces shared documents. As part of that change the
+dashboard / sidebar visibility flags should move off the saved-view
+itself and become per-user preferences, since "this view shows up on my
+dashboard" is fundamentally a recipient-side preference. Existing data
+must be preserved on upgrade — and on downgrade.
+"""
+context = """Touchpoints: the Django app `documents` — `models.SavedView`,
+`serialisers.SavedViewSerializer`, `views.SavedViewViewSet` and the
+related `GlobalSearchView`, plus `paperless.settings` for the API
+version bump. A new `documents` migration is required to rewrite
+existing per-view visibility into the per-user `UiSettings.settings`
+JSON store. The frontend (Angular `src-ui/`) consumes the saved-view
+list through `SavedViewService` and `SettingsService`; the visibility
+computation in those services is currently driven by fields on the
+saved-view object that will no longer exist after the change.
+
+Existing patterns to mirror: `CorrespondentViewSet` (and Tag, Document
+Type, Storage Path) all use `BulkPermissionMixin`,
+`ObjectOwnedOrGrantedPermissionsFilter`, and
+`extend_schema_view(**generate_object_with_permissions_schema(...))`
+to expose the `set_permissions` write field. `OwnedObjectSerializer`
+already implements the create/update authorization rules — the new
+serializer should delegate to it via `super()`. `GlobalSearchView`
+already uses `get_objects_for_user_owner_aware` for other models
+(documents, tags, etc.).
+
+The repo's two-layer permission system (Django model perms + django-
+guardian object perms) is documented in `docs/repo-notes/paperless-ngx.md`
+§ 4 — non-superuser recipients need BOTH the model-level perm and the
+Guardian per-object perm.
+
+Senior decisions in the oracle (and likely traps):
+- The boolean fields are not just nulled out — they're removed in a
+  multi-step migration that first defaults them, then runs Python to
+  translate, then drops the columns, with a Python reverse path. An
+  agent who only deletes the fields silently loses data.
+- `OwnedObjectSerializer.update` raises `PermissionDenied` if a non-
+  owner tries to change `owner` or `set_permissions`. The new
+  `SavedViewSerializer.update` MUST delegate to `super().update(...)`
+  for that authorization to apply; the pre-fix `update` discards the
+  return of `super().update`, which breaks the `set_permissions`
+  contract.
+- `GlobalSearchView` previously hard-filtered `owner=request.user` —
+  it must switch to `get_objects_for_user_owner_aware` so shared
+  views appear.
+- Frontend visibility no longer lives on the saved-view object; the
+  service layer must derive it from the user's settings (whether
+  inside `SavedViewService.dashboardViews/sidebarViews` getters,
+  inside `app-frame`/`saved-views`/etc. components, or via a helper).
+- API version bump 9 → 10 is intentional (the PR description calls
+  this out). Both must be in `ALLOWED_VERSIONS` so older clients keep
+  working.
+
+Wire-format contract that the migration AND the frontend must agree on:
+the per-user UiSettings JSON gains a `saved_views` block with two
+arrays of saved-view IDs, `dashboard_views_visible_ids` and
+`sidebar_views_visible_ids`. The frontend reads exactly those keys; the
+migration must populate exactly those keys.
+"""
+solution = """Canonical fix follows the oracle:
+
+1. `SavedViewViewSet`:
+   - Adopt `BulkPermissionMixin`, `PassUserMixin`, `ModelViewSet`.
+   - Decorate with
+     `extend_schema_view(**generate_object_with_permissions_schema(SavedViewSerializer))`.
+   - Set `filter_backends = (OrderingFilter, ObjectOwnedOrGrantedPermissionsFilter)`.
+   - Drop the manual `get_queryset(user)` filter and replace with the
+     class-level `queryset = SavedView.objects.select_related("owner").prefetch_related("filter_rules")`.
+   - Drop the manual `perform_create(owner=...)` (the serializer base handles it).
+
+2. `SavedViewSerializer`:
+   - Remove `show_on_dashboard` and `show_in_sidebar` from
+     `Meta.fields`; add `set_permissions`.
+   - In `update`: capture `super().update(instance, validated_data)`
+     into `instance` before re-creating filter rules (the pre-fix
+     code discarded the return value, which breaks the new
+     authorization branch).
+   - In `create`: delegate to `super().create(validated_data)` so
+     the `set_permissions` block is applied.
+
+3. New documents migration (filename can vary — `0015_*.py`):
+   - `AlterField` to make the booleans `default=False` (so RunPython
+     can read them safely without re-prompting).
+   - `RunPython` forward: for each user, ensure a UiSettings row, then
+     populate `settings["saved_views"]["dashboard_views_visible_ids"]`
+     and `["sidebar_views_visible_ids"]` from the SavedView rows the
+     user OWNS (not all rows — visibility is intentionally per owner
+     because the data only existed per owner pre-fix). Preserve any
+     pre-existing `saved_views` block.
+   - `RunPython` reverse: pull the lists back out of UiSettings, set
+     all SavedView booleans to False, then mark True for views whose
+     ID appears in the *owner's* list.
+   - `RemoveField` for both booleans.
+
+4. `GlobalSearchView.get`: replace
+   `SavedView.objects.filter(owner=request.user, name__icontains=query)`
+   with a `get_objects_for_user_owner_aware(...).filter(name__icontains=query)`
+   block.
+
+5. `paperless.settings`:
+   - `DEFAULT_VERSION = "10"`.
+   - Append `"10"` to `ALLOWED_VERSIONS`.
+
+6. Frontend (Angular):
+   - `src-ui/src/app/data/ui-settings.ts`: add new
+     `DASHBOARD_VIEWS_VISIBLE_IDS` and `SIDEBAR_VIEWS_VISIBLE_IDS`
+     entries to `SETTINGS_KEYS`.
+   - `src-ui/src/app/services/settings.service.ts`: add
+     `updateSavedViewsVisibility(dashboardIds, sidebarIds)` that calls
+     `set(...)` for both keys and `storeSettings()`.
+   - `src-ui/src/app/services/rest/saved-view.service.ts`: in the
+     `list` `tap`, decorate each saved view with a computed
+     `show_on_dashboard` / `show_in_sidebar` based on the settings
+     keys; rewrite `dashboardViews` / `sidebarViews` getters to filter
+     using those settings.
+   - `src-ui/src/environments/environment.prod.ts`: bump
+     `apiVersion: '10'`.
+   - Components: refactor `saved-views.component`,
+     `save-view-config-dialog`, `document-list.component`,
+     `permissions-dialog`, `app-frame` to drive UI off the new
+     visibility computation and expose the new "share with users /
+     groups" UI on the save-view dialog.
+
+Common shortcuts that should NOT pass:
+- Just removing the boolean fields without writing a migration — the
+  forward migration story detects missing UiSettings keys.
+- Switching `get_queryset` to "show all views to everyone" — the
+  no-perm story (a user without view perm) catches it.
+- Returning the `set_permissions` field but ignoring it on write —
+  the sharing story catches it (the recipient never gets visibility).
+- Removing the boolean filter from `GlobalSearchView` but not making
+  it permission-aware — the global-search story (non-shared view)
+  catches it.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-service", "typescript-frontend", "sql-database"]
+runtime_dependence = "runtime-essential"
+skills = ["codebase-exploration", "interface-design", "framework-fluency", "data-model-design", "api-contract-design", "architectural-refactoring", "cross-service-reasoning", "security-reasoning", "state-management", "dependency-research"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 523
+files = 18
+hunks = 43
+scope = "extensive"
+
+[metadata.origin]
+repo = "paperless-ngx/paperless-ngx"
+pr_numbers = [12142]
+base_commit = "ae182c459bc41cece1860b61dc6610b6ef38cb2f"
+base_commit_date = "2026-02-22"
+merged_at = "2026-03-04"
+
+
+
+

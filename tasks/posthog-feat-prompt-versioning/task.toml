@@ -1,0 +1,209 @@
+version = "1.0"
+
+[environment]
+base_image = "posthog-feat-prompt-versioning:latest"
+build_timeout_sec = 1200.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 2400.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "posthog"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "posthog"
+
+[metadata]
+family = "posthog-feat-prompt-versioning"
+variant = "hard"
+segment = "design"
+repo = "posthog"
+tags = ["posthog", "python-service", "sql-database"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """The LLM-Prompt Management feature currently treats prompts as mutable rows
+keyed by ID — editing a prompt rewrites the same row in place, so prior
+content is lost. We want prompts to behave as a stack of immutable named
+versions instead: callers identify prompts by name, edits create new
+versions, historical content remains retrievable, and the system blocks
+concurrent edits that would silently overwrite each other. Listing prompts
+on the management page should show one entry per active name (the current
+version), not the entire edit history. Archiving a prompt soft-deletes
+every version under that name and frees the name for reuse.
+"""
+context = """The relevant backend lives at ``posthog/api/llm_prompt.py`` (DRF
+viewset), ``posthog/models/llm_prompt.py`` (the ``LLMPrompt`` model),
+and ``posthog/storage/llm_prompt_cache.py`` (a HyperCache wrapper
+backed by Redis + S3). The model already has a ``version`` integer
+column with a ``# TODO`` hinting at a future versioning feature, but
+the column is unused — every PATCH currently mutates the same row.
+
+Pre-existing endpoints (rooted at
+``/api/environments/{team_id}/llm_prompts/``):
+- ``POST /`` create
+- ``GET /`` list
+- ``GET /name/{name}/`` fetch by name (cached via HyperCache)
+- ``GET /resolve/name/{name}/`` resolve (web-auth only, bypasses cache)
+- ``GET/PATCH/DELETE /{id}/`` ID-keyed CRUD (legacy)
+
+Versioning means the legacy ID-keyed write path goes away and is
+replaced by name-keyed publish/archive operations. The production
+frontend already uses the name-keyed read endpoints, so those URLs
+must keep working.
+
+The HyperCache used to store all prompts for a team in one blob keyed
+by team id; that blob shape is wrong for per-name versioning and the
+agent will need to redesign the cache key strategy. The model is
+registered for cache invalidation via post_save / post_delete signals;
+the new cache strategy must still receive invalidation triggers when
+versions are added or archived.
+
+PostHog multi-tenancy is rooted in the ``Team`` model; the test
+infrastructure expects the full Org → Project → Team → User chain to
+exist. Tests use
+``posthog.test.base.setup_test_organization_team_and_user`` to build
+it.
+
+A pre-existing feature gate (``LLMPromptFeatureFlagPermission`` in
+``posthog/api/llm_prompt.py``) checks
+``posthoganalytics.feature_enabled`` for either of the
+``prompt-management`` or ``llm-analytics-early-adopters`` flags.
+Tests mock this to True.
+
+Out of scope: the React frontend in
+``products/llm_analytics/frontend/prompts/``. Focus only on the
+Django backend (model, viewset, service layer, cache).
+
+Red herrings:
+- The pre-existing ``rate_limit.py`` already attaches generic
+  burst/sustained throttles via the viewset's ``get_throttles``;
+  agents are NOT required to introduce a new throttle class.
+- The post_save / post_delete signal handlers exist; agents may
+  keep, replace, or augment them.
+- ``LLMPrompt`` has a ``deleted`` BooleanField that's already
+  honored by the unique constraint condition. Reusing it for the
+  archive flow is the natural design.
+"""
+solution = """The reference example introduces:
+
+1. A migration adding ``is_latest`` (Boolean default True), dropping
+   the single ``(team, name)`` unique constraint, and adding two new
+   constraints: ``(team, name, version)`` unique among non-deleted
+   rows; ``(team, name)`` unique among non-deleted rows where
+   ``is_latest=True``. The ``is_latest=True`` partial unique
+   constraint is what makes concurrent publishes race-safe at the DB
+   level.
+
+2. A service module (``posthog/api/services/llm_prompt.py``) with
+   ``publish_prompt_version`` (transactional, locks the current
+   latest with ``select_for_update``, demotes its ``is_latest``,
+   inserts a new row at ``version+1``, raises a conflict error on
+   stale ``base_version``), ``archive_prompt`` (bulk-soft-deletes
+   every version of the name and triggers cache invalidation), and
+   queryset helpers that annotate version metadata via correlated
+   subqueries.
+
+3. A new serializer module
+   (``posthog/api/llm_prompt_serializers.py``) carrying the request /
+   response shapes: ``LLMPromptSerializer`` (with version metadata
+   SerializerMethodFields), ``LLMPromptPublicSerializer`` (the public
+   fetch response), ``LLMPromptPublishSerializer`` (publish input),
+   ``LLMPromptResolveQuerySerializer`` (offset / before_version /
+   limit query parsing), and ``LLMPromptVersionSummarySerializer``.
+
+4. Viewset rewiring: switch from ``ModelViewSet`` to
+   ``CreateModelMixin + ListModelMixin + GenericViewSet`` so
+   retrieve/update/destroy by ID are no longer auto-routed.
+   ``name/{name}`` gets a PATCH mapping (publish), a sibling
+   ``name/{name}/archive/`` action (archive), and the resolve endpoint
+   returns a ``{prompt, versions, has_more}`` envelope.
+
+5. Cache split: per-name latest key (``<team>:<name>:latest``) plus
+   per-version keys (``<team>:<name>:v:<version>``). Archive batches
+   invalidations: the first 100 sync, the rest queued via a new
+   ``invalidate_archived_prompt_versions_cache_task`` celery task.
+
+6. A new ``LLMPromptPublishBurstRateThrottle`` (30/minute) attached
+   to the publish endpoint, plus a ``PersonalApiKeyOrUserRateThrottle``
+   abstraction so both web and personal-API-key requests count.
+
+Valid alternatives we accept:
+
+- A two-table layout (slimmed ``LLMPrompt`` + new ``LLMPromptVersion``)
+  is fine. Field names like ``current_version``, ``is_current``,
+  ``history_count`` instead of ``latest_version``, ``is_latest``,
+  ``version_count`` are fine. Validation stories observe behaviour
+  through HTTP responses, not specific field names.
+- Publish endpoint method (PATCH vs PUT vs POST) and body shape
+  (``prompt`` / ``base_version`` vs ``content`` / ``expected_version``)
+  — any reasonable design that surfaces a conflict on stale base
+  versions is fine. Stories tell CC to discover the agent's publish
+  path.
+- Archive endpoint method/path is unconstrained; stories tell CC to
+  discover it.
+- Skipping the celery batching for archive (purely synchronous
+  invalidation) is fine — no story exercises the >100-version
+  threshold.
+- Skipping the resolve-envelope rewrite is fine — historical fetches
+  can be served entirely via ``GET /name/{name}?version=N`` (the
+  pre-existing path).
+- Skipping the new burst throttle class is fine — no story tests it.
+
+What naive implementations get wrong:
+
+- Mutating the existing row's ``prompt`` and bumping ``version``
+  instead of inserting a new row.
+- Forgetting to filter the list endpoint to only show the current
+  row per name, so every historical row appears.
+- Forgetting to demote the previous current-row marker, violating
+  the "exactly one current row per (team, name)" invariant on the
+  next publish.
+- Using application-level locking instead of ``select_for_update``
+  in the publish transaction, allowing two concurrent edits to both
+  win.
+- Treating archive as a hard delete, or only soft-deleting the
+  current row instead of every version of the name.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-service", "sql-database"]
+runtime_dependence = "runtime-helpful"
+skills = ["interface-design", "framework-fluency", "data-model-design", "api-contract-design", "concurrency-reasoning", "storage-design", "codebase-exploration"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 2083
+files = 16
+hunks = 36
+scope = "extensive"
+
+[metadata.origin]
+repo = "PostHog/posthog"
+pr_numbers = [49900]
+base_commit = "877722887cb247bfec639715e8250b530f6d9352"
+base_commit_date = "2026-03-03"
+merged_at = "2026-03-04"
+
+
+
+

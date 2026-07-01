@@ -1,0 +1,165 @@
+# Unified validation-judge rubric.
+#
+# Five dimensions, each scored 0-3 with anchored guides. All five are
+# `gating = true`: a score of 0 on any of them is grounds for hard-failing
+# the trial. Scores also feed the calibrated overall score and actionable
+# retry feedback.
+#
+# The score=0 anchors are intentionally narrow — they're calibrated for
+# high-precision discard, NOT general "this could be better" signals.
+# Score=1 captures the "concerning but recoverable via retry" zone that
+# drives actionable feedback. Score=2 is the typical clean state.
+
+judge_model_default = "@bedrock/global.anthropic.claude-sonnet-4-6"
+
+# ── Gating-eligible dimensions: score == 0 ⇒ discard ────────────────────────
+
+[[criterion]]
+id = "behavioral_authenticity"
+gating = true
+scale = "0-3"
+description = """
+Tests exercise the real implementation and report honestly. No mocking of the
+system under test, no fabricated pass conditions, no skipped tests, no
+assertion-weakening tricks designed to make tests pass regardless of
+behavior.
+"""
+guide = """
+0 = at least one of these patterns is present in any script:
+    - mocks the system under test (the function/class/module the procedure
+      is testing),
+    - fabricates pass conditions (returns hard-coded values that match
+      ``expected`` without exercising real code; pre-sets test state so the
+      assertion holds without invoking the SUT),
+    - marks tests as skipped (``pytest.skip``, ``it.skip``, etc.),
+    - weakens assertions to make them trivially satisfied (replacing ``==``
+      with ``in [list-containing-expected]``, replacing concrete-value
+      checks with ``is not None`` / truthiness, asserting only the type
+      rather than the value),
+    - wraps assertions in ``try/except`` that swallow ``AssertionError`` and
+      report success,
+    - inverts an expected-exception test to assert the exception was NOT
+      raised.
+1 = primary path exercises real code but optional/edge cases use loose
+    mocking, broadened comparisons, or skipped sub-cases that mask failures.
+2 = tests exercise real code, with one or two minor cases where mocking is
+    overly broad but doesn't mask the documented behavior.
+3 = every assertion exercises real code paths; mocks (if any) are limited
+    to external boundaries the procedure explicitly permits; assertions
+    match the strictness implied by ``expected`` values.
+"""
+
+[[criterion]]
+id = "procedure_fidelity"
+gating = true
+scale = "0-3"
+description = """
+Each test case maps cleanly to its story's procedure. No fabricated cases,
+no silent procedure-step drops, no disobeyed explicit instructions to
+test/use a specific symbol or approach.
+
+Note: the framework intentionally uses discovery to adapt to whatever the
+implementing agent built. A divergence from the procedure's literal
+identifiers is NOT a defect when (a) the spec instructs discovery, (b) the
+procedure-prescribed name does not exist in the implementing agent's diff,
+or (c) the deviation is grounded in a stable pre-existing repo interface.
+Score 0 only when the procedure unambiguously instructs the agent to use
+a particular symbol/approach AND that symbol/approach exists AND the
+agent ignored the instruction.
+"""
+guide = """
+0 = scripts diverge significantly from the procedure or invent unrelated
+    cases (e.g. test bodies that ignore inputs/expected and assert on
+    hard-coded literals); OR the agent disobeyed an explicit, satisfiable
+    instruction to test/use a specific symbol or approach.
+1 = scripts cover the procedure with notable deviations (e.g. cases
+    collapsed, multi-step procedures shortened to a single assertion).
+2 = scripts follow the procedure with only minor stylistic differences.
+3 = scripts implement the procedure precisely as declared.
+"""
+
+[[criterion]]
+id = "story_coverage"
+gating = true
+scale = "0-3"
+description = """
+Every story declared in validation_spec.toml has at least one generated
+script that exercises it. A story with no script is unscorable — it
+silently contributes 0 to the validation score and can mask whether the
+implementation actually works.
+"""
+guide = """
+0 = one or more declared stories have no corresponding generated script.
+1 = all stories have a script, but several test_cases inside stories are
+    unimplemented.
+2 = all stories covered, only minor gaps in test_case coverage.
+3 = every story and every test_case has assertions in a generated script.
+"""
+
+[[criterion]]
+id = "execution_outcome_alignment"
+gating = true
+scale = "0-3"
+description = """
+Final pass/fail outcome aligns with what the spec implies given the
+implementing agent's patch.
+
+This dimension uses your semantic judgment — read agent.patch and the
+story's procedure, decide whether the patch actually implements the
+behavior the story tests. A story passing while the patch demonstrably
+fails to implement the behavior under test is misalignment, regardless of
+whether other stories are pass-to-pass coverage checks.
+
+Truncation guard: if any input was truncated to the point that you cannot
+confidently reconstruct what the patch implements or what each story
+tests, default to 2 (clean). The truncation_notes preamble in the prompt
+tells you which inputs were clamped.
+"""
+guide = """
+0 = the patch demonstrably does not implement the story's behavior, but
+    that story passes anyway. Examples:
+    - The patch is empty / no-op / boilerplate-only and stories testing
+      substantial behavior pass.
+    - A story tests behavior A; the patch touches none of the code paths
+      that produce A; the story passes (only possible if the test
+      fabricates state or asserts on something tangential).
+    Do NOT score 0 when:
+    - The judgment would require fuzzy guessing about whether a passing
+      story is p2p coverage of pre-existing behavior — only fire when the
+      test claims to exercise a behavior the patch clearly doesn't
+      provide.
+    - Inputs were truncated (see truncation_notes) and you can't
+      confidently judge whether the patch covers the story.
+1 = the outcome has at least one unexplained anomaly that is concerning
+    but not airtight. Examples:
+    - A story passes that you suspect tests a behavior the patch may not
+      implement, but you can't confirm without more context.
+    - The patch substantively implements the feature (non-trivial diff
+      touching the expected surface) but a story rejects it for
+      non-content reasons (TypeError / AttributeError / ImportError stack
+      traces in the failure ``reason`` field, never reaching the
+      assertions) — the test, not the patch, is likely at fault.
+    Surface via actionable feedback; doesn't gate.
+2 = outcome aligns; any anomalies are explainable or low-confidence.
+3 = outcome matches spec expectations cleanly across every story.
+"""
+
+[[criterion]]
+id = "expected_fidelity"
+gating = true
+scale = "0-3"
+description = """
+Generated assertions use every key in each ``expected`` dict
+unconditionally — no ``if key in expected:`` guards, no skipped keys.
+Score 0 means the test is silently dropping most of the spec's
+assertions, which makes the test unscorable in the same way an unwritten
+script does.
+"""
+guide = """
+0 = many expected keys go unused or are guarded by conditionals — the
+    assertions have been substantially gutted relative to what the spec
+    declared.
+1 = a few keys skipped or guarded.
+2 = essentially complete with one or two minor omissions.
+3 = every expected key drives an unconditional assertion.
+"""

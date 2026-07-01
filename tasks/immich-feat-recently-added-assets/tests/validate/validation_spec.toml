@@ -1,0 +1,456 @@
+stack_profile = "typescript-service"
+
+[settings]
+script_timeout_sec = 600
+va_timeout_sec = 1800
+
+# Jest-driver settings, medium test tier (real Postgres).
+#
+# config_dir = "server" → the driver runs vitest from /repo/immich/server, where
+# `tests/test-setup.sh` has already written `server/vitest.config.mjs`
+# (auto-resolved by vitest since no --config is passed). That config mirrors
+# immich's medium tier (swc + tsconfigPaths, globals, TZ=UTC) with an
+# `include` of test/medium/** and a non-testcontainers globalSetup that runs the
+# migration set into the local `mich` template. test-setup.sh also starts the
+# pre-provisioned Postgres+vchord cluster and exports IMMICH_TEST_POSTGRES_URL.
+#
+# test_parent = "server/test/medium/specs" → the driver copies each generated
+# spec to server/test/medium/specs/__validation__/<story-id>.spec.ts, which
+# matches the config's `include` (test/medium/**/*.spec.ts) and whose
+# `src/...` / `test/...` alias imports resolve via the server tsconfig paths.
+[settings.jest]
+runner = "vitest"
+config_dir = "server"
+test_parent = "server/test/medium/specs"
+command = "pnpm exec vitest run --reporter=verbose"
+
+instructions = """
+This task validates the immich SERVER timeline feature at immich's "medium"
+test tier — a REAL Postgres database, not mocked repositories. You write
+TypeScript spec files that exercise the pre-existing `TimelineService`
+(`getTimeBuckets` / `getTimeBucket`) through the same medium-test harness the
+repo already uses in
+`server/test/medium/specs/services/timeline.service.spec.ts`.
+
+## What the feature does
+
+Users can group/order the timeline by each asset's UPLOAD date (when the asset
+row was created in immich) instead of its CAPTURE date (the timezone-local date
+it was taken). The default — no ordering option — must stay capture-date so
+existing clients are unaffected.
+
+- `getTimeBuckets(auth, dto)` returns one `{ count, timeBucket }` per calendar
+  month. Under upload ordering the month is the UPLOAD month; by default it is
+  the CAPTURE month.
+- `getTimeBucket(auth, dto)` returns a JSON string of column-parallel arrays for
+  one month. Under upload ordering it includes exactly the assets whose UPLOAD
+  month equals the requested bucket, ordered by upload date descending, and the
+  response reports each asset's upload timestamp (UTC), paired to that asset;
+  a bucket with no assets reports none.
+
+## Discover this implementation's API
+
+The option that selects upload ordering, its accepted value(s), and the response
+field that carries per-asset upload timestamps are all designed by the
+implementation — the task does not fix their names or shapes. Before writing
+assertions, read the implementing source to find them:
+
+- `src/dtos/time-bucket.dto.ts` — the bucket query DTO(s): the new optional
+  field that requests upload ordering, and the new per-asset upload-timestamp
+  field on the bucket response DTO.
+- `src/services/timeline.service.ts` and the repository it calls — confirm how
+  that option drives grouping / membership / ordering and how the response
+  field is populated.
+
+One known implementation uses `{ orderBy: 'createdAt' }` to select upload
+ordering (omitted = capture-date default) and adds a `createdAt` array of
+upload timestamps parallel to `id`. **Treat that purely as an example of what
+to look for — assert against whatever this code actually declares.** Equally
+valid implementations might use:
+
+- a different string-valued key: `{ sort: 'uploaded' }`
+- a boolean flag: `{ recentlyAdded: true }`
+- more than one field: `{ orderBy: 'created', direction: 'desc' }`
+- a differently named response field, or a different shape (e.g. `{ id, timestamp }` objects, not an array parallel to `id`).
+- the option living one level up — a new dto type or `TimelineService` method, not new fields on the existing dto.
+
+Build the upload-ordering dto once from what you discover and reuse it across
+all three stories. The service spreads the whole dto into repository options,
+so whatever field(s) it declares reach the implementation when you call
+the service method directly. Likewise resolve the upload-timestamp response
+field's name and shape once (story 3 says how to normalise it). Timestamp
+values may be ISO strings or epoch numbers — `new Date(value)` handles both.
+
+## File names and the workspace
+
+For each story create a file named `<story-id>.spec.ts` in the scripts
+directory the validator placed you in. The driver copies it to:
+
+  /repo/immich/server/test/medium/specs/__validation__/<story-id>.spec.ts
+
+and runs `pnpm exec vitest run --reporter=verbose <path> --testTimeout=...`
+from /repo/immich/server. The server `vitest.config.mjs` is auto-resolved (do
+NOT pass --config, do NOT create your own config). It enables globals, swc, and
+tsconfig path aliases, and a globalSetup that runs migrations into the `mich`
+template; `getKyselyDB()` clones that template per call. Postgres is already
+running and `IMMICH_TEST_POSTGRES_URL` is already exported — you do NOT start a
+database or touch testcontainers.
+
+## Pre-existing imports (use these EXACT module paths — do NOT invent names)
+
+```ts
+import { describe, it, expect, beforeAll } from 'vitest';
+import { Kysely } from 'kysely';
+import { AccessRepository } from 'src/repositories/access.repository';
+import { AssetRepository } from 'src/repositories/asset.repository';
+import { LoggingRepository } from 'src/repositories/logging.repository';
+import { PartnerRepository } from 'src/repositories/partner.repository';
+import { DB } from 'src/schema';
+import { TimelineService } from 'src/services/timeline.service';
+import { newMediumService } from 'test/medium.factory';
+import { factory } from 'test/small.factory';
+import { getKyselyDB } from 'test/utils';
+
+import { getTestCases } from './validationParams';
+```
+
+## Required test-file skeleton
+
+ALWAYS use this skeleton. Keep the `'case $#'` title in `it.each` — the driver
+matches per-case results on "case 0", "case 1", etc. `getTestCases()` returns
+the immutable, driver-injected `{ inputs, expected }` array; never hard-code or
+recompute the expected values.
+
+```ts
+// @ts-nocheck
+import { describe, it, expect, beforeAll } from 'vitest';
+import { Kysely } from 'kysely';
+import { AccessRepository } from 'src/repositories/access.repository';
+import { AssetRepository } from 'src/repositories/asset.repository';
+import { LoggingRepository } from 'src/repositories/logging.repository';
+import { PartnerRepository } from 'src/repositories/partner.repository';
+import { DB } from 'src/schema';
+import { TimelineService } from 'src/services/timeline.service';
+import { newMediumService } from 'test/medium.factory';
+import { factory } from 'test/small.factory';
+import { getKyselyDB } from 'test/utils';
+
+import { getTestCases } from './validationParams';
+
+let defaultDatabase: Kysely<DB>;
+
+const setup = () =>
+  newMediumService(TimelineService, {
+    database: defaultDatabase,
+    real: [AssetRepository, AccessRepository, PartnerRepository],
+    mock: [LoggingRepository],
+  });
+
+beforeAll(async () => {
+  defaultDatabase = await getKyselyDB();
+});
+
+describe('<story-id>', () => {
+  const cases = getTestCases();
+  it.each(cases)('case $#', async ({ inputs, expected }) => {
+    const { sut, ctx } = setup();
+    const { user } = await ctx.newUser();
+    const auth = factory.auth({ user });
+    // ... per-story body, see the story's procedure ...
+  });
+});
+```
+
+## Test-data lever
+
+Each asset carries two distinct dates. Set BOTH explicitly when creating an
+asset so the capture month differs from the upload month:
+
+```ts
+await ctx.newAsset({
+  ownerId: user.id,
+  localDateTime: new Date('1970-01-15T00:00:00.000Z'), // capture date
+  createdAt: new Date('2020-02-10T00:00:00.000Z'),      // upload date
+});
+```
+
+`getTimeBucket` inner-joins the EXIF table, so give every asset you expect back
+a matching EXIF row: `await ctx.newExif({ assetId: asset.id, make: 'Canon' });`
+(`ctx.newAsset` returns `{ asset }`).
+
+Exercise the implementation honestly — if the behavior is missing, let
+the assertion fail; never weaken a test or implement the feature yourself.
+"""
+
+
+# =============================================================================
+# Story 1: month grouping switches between capture and upload month
+# =============================================================================
+
+[[story]]
+id = "recently_added_groups_by_upload"
+driver = "jest"
+script_extension = ".spec.ts"
+description = """
+The timeline's month grouping can now be based on upload date instead of the
+default capture date. In the "recently added" view, assets are grouped by their
+upload month; the default capture-month grouping stays unchanged.
+"""
+procedure = """
+Insert two assets for a fresh user, both CAPTURED in January 1970 but UPLOADED
+in different 2020 months, then call `getTimeBuckets` and compare the returned
+`{ count, timeBucket }` list. For the recently-added case pass the
+upload-ordering dto you discovered from the implementing source (see the
+instructions block); for the default case pass `{}`.
+
+Per-case body (inside it.each):
+
+```ts
+const { sut, ctx } = setup();
+const { user } = await ctx.newUser();
+const auth = factory.auth({ user });
+
+// Both captured Jan 1970; uploaded Feb 2020 and Mar 2020.
+await ctx.newAsset({
+  ownerId: user.id,
+  localDateTime: new Date('1970-01-15T00:00:00.000Z'),
+  createdAt: new Date('2020-02-10T00:00:00.000Z'),
+});
+await ctx.newAsset({
+  ownerId: user.id,
+  localDateTime: new Date('1970-01-20T00:00:00.000Z'),
+  createdAt: new Date('2020-03-10T00:00:00.000Z'),
+});
+
+// The dto that selects upload ordering, discovered from the implementing
+// source (see the instructions block) — replace with the field name(s) and
+// value(s) this implementation actually declares.
+const uploadOrdering = { orderBy: 'createdAt' };
+// inputs.mode is 'recently_added' (pass the discovered dto) or 'default' (omit it).
+const dto = inputs.mode === 'default' ? {} : uploadOrdering;
+const buckets = await sut.getTimeBuckets(auth, dto);
+
+// Project each bucket to its pre-existing fields so an implementation that
+// adds extra per-bucket fields still compares equal.
+const view = buckets.map(({ count, timeBucket }) => ({ count, timeBucket }));
+
+// EXPECTED: view equals expected.buckets (array of { count, timeBucket },
+// in returned order — upload months desc for recently-added, the single capture
+// month for default).
+expect(view).toEqual(expected.buckets);
+```
+
+The recently-added case must return the two distinct UPLOAD months; the default
+case must return the single CAPTURE month with count 2. A build that ignores the
+ordering option returns the capture-month grouping for both cases and fails the
+recently-added case.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "recently_added_groups_by_upload_month"
+mode = "recently_added"
+[story.test_case.expected]
+buckets = [
+  { count = 1, timeBucket = "2020-03-01" },
+  { count = 1, timeBucket = "2020-02-01" },
+]
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "default_groups_by_capture_month"
+mode = "default"
+[story.test_case.expected]
+buckets = [{ count = 2, timeBucket = "1970-01-01" }]
+
+
+# =============================================================================
+# Story 2: single-bucket membership + ordering follow the upload date
+# =============================================================================
+
+[[story]]
+id = "recently_added_bucket_membership"
+driver = "jest"
+script_extension = ".spec.ts"
+description = """
+In the "recently added" view, a month holds exactly the photos uploaded that
+month. An old photo imported this month shows up under this month; a photo taken
+this month but imported at another time shows up under the month it was imported.
+"""
+procedure = """
+Insert three assets for a fresh user, each with an EXIF row (the single-bucket
+query inner-joins EXIF) and a distinct upload month, then request one month
+bucket under the discovered upload ordering and check exactly which assets come
+back (mapped back to a per-asset label we assign at insert time). This story
+isolates bucket membership; the per-asset upload-date field and its ordering
+are covered by the next story.
+
+Per-case body (inside it.each):
+
+```ts
+const { sut, ctx } = setup();
+const { user } = await ctx.newUser();
+const auth = factory.auth({ user });
+
+// Uploaded June 2021: C (earlier) and D (later).
+const { asset: assetC } = await ctx.newAsset({
+  ownerId: user.id,
+  localDateTime: new Date('2020-02-05T00:00:00.000Z'),
+  createdAt: new Date('2021-06-10T00:00:00.000Z'),
+});
+await ctx.newExif({ assetId: assetC.id, make: 'Canon' });
+const { asset: assetD } = await ctx.newAsset({
+  ownerId: user.id,
+  localDateTime: new Date('1999-01-01T00:00:00.000Z'),
+  createdAt: new Date('2021-06-20T00:00:00.000Z'),
+});
+await ctx.newExif({ assetId: assetD.id, make: 'Canon' });
+
+// Decoy E: CAPTURED June 2021 but UPLOADED Jan 2019 — must fall in its
+// upload-month bucket (Jan 2019), not the capture-month bucket (June 2021).
+const { asset: assetE } = await ctx.newAsset({
+  ownerId: user.id,
+  localDateTime: new Date('2021-06-15T00:00:00.000Z'),
+  createdAt: new Date('2019-01-01T00:00:00.000Z'),
+});
+await ctx.newExif({ assetId: assetE.id, make: 'Canon' });
+
+// uploadOrdering is the dto discovered from the implementing source (see the
+// instructions block).
+const response = JSON.parse(
+  await sut.getTimeBucket(auth, { timeBucket: inputs.time_bucket, ...uploadOrdering }),
+);
+
+// Map each returned id back to the label we assigned that asset at insert time.
+const labelById = new Map([
+  [assetC.id, 'C'],
+  [assetD.id, 'D'],
+  [assetE.id, 'E'],
+]);
+const returnedLabels = response.id.map((id) => labelById.get(id)).sort();
+
+// EXPECTED: members equals expected.members — the exact set of assets in the
+// requested bucket, selected by UPLOAD month (sorted labels).
+expect(returnedLabels).toEqual(expected.members);
+```
+
+A build that selects bucket membership by capture date would put the decoy in
+the June 2021 bucket and leave it out of the January 2019 bucket, so the
+membership sets would not match.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "june_2021_upload_bucket"
+time_bucket = "2021-06-01"
+[story.test_case.expected]
+members = ["C", "D"]
+
+# The decoy (captured June 2021, uploaded Jan 2019) lands in its UPLOAD month
+# bucket — proving membership tracks upload date, not capture date. C and D
+# (uploaded June 2021) are absent from this bucket.
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "jan_2019_upload_bucket_holds_decoy"
+time_bucket = "2019-01-01"
+[story.test_case.expected]
+members = ["E"]
+
+
+# =============================================================================
+# Story 3: getTimeBucket reports each asset's upload timestamp
+# =============================================================================
+
+[[story]]
+id = "recently_added_upload_timestamps"
+driver = "jest"
+script_extension = ".spec.ts"
+description = """
+When a user opens a single month of the timeline, they can see when each photo
+was added: every asset in that month is shown with its own upload date, and a
+month with no assets shows none.
+"""
+procedure = """
+Insert two assets for a fresh user (each with an EXIF row), both UPLOADED in
+August 2022 on distinct days, then request a bucket under the discovered upload
+ordering and check the per-asset upload-timestamp field you discovered in the
+bucket response DTO: it exists, each asset is paired with its own upload date,
+and the dates come back newest-upload first. A second case requests an empty
+bucket.
+
+Per-case body (inside it.each):
+
+```ts
+const { sut, ctx } = setup();
+const { user } = await ctx.newUser();
+const auth = factory.auth({ user });
+
+const { asset: a1 } = await ctx.newAsset({
+  ownerId: user.id,
+  localDateTime: new Date('2010-01-01T00:00:00.000Z'),
+  createdAt: new Date('2022-08-05T00:00:00.000Z'),
+});
+await ctx.newExif({ assetId: a1.id, make: 'Canon' });
+const { asset: a2 } = await ctx.newAsset({
+  ownerId: user.id,
+  localDateTime: new Date('2011-01-01T00:00:00.000Z'),
+  createdAt: new Date('2022-08-20T00:00:00.000Z'),
+});
+await ctx.newExif({ assetId: a2.id, make: 'Canon' });
+
+// uploadOrdering is the dto discovered from the implementing source (see the
+// instructions block).
+const response = JSON.parse(
+  await sut.getTimeBucket(auth, { timeBucket: inputs.time_bucket, ...uploadOrdering }),
+);
+
+// id -> the upload day we assigned that asset at insert time.
+const dayById = new Map([
+  [a1.id, '2022-08-05'],
+  [a2.id, '2022-08-20'],
+]);
+
+// The response field carrying per-asset upload timestamps, discovered from
+// the bucket response DTO — replace 'createdAt' with the name you found. The
+// canonical shape is a timestamp array parallel to `id`; if this
+// implementation pairs timestamps with assets differently (e.g. an array of
+// { id, timestamp } objects), adapt the extraction below so uploadDays still
+// lists each returned asset's upload day in response order.
+const reported = response.createdAt;
+const uploadTimestamps = Array.isArray(reported) ? reported : null;
+const uploadDays =
+  uploadTimestamps?.map((value) => new Date(value).toISOString().slice(0, 10)) ?? null;
+
+// The response must report per-asset upload timestamps, one per asset.
+expect(uploadTimestamps).not.toBeNull();
+expect(uploadTimestamps.length).toBe(response.id.length);
+
+// Pairing: position i's upload date must be this asset's own upload day, so a
+// misaligned (but equal-length) array fails here, not just a missing one.
+response.id.forEach((id, i) => {
+  expect(uploadDays[i]).toBe(dayById.get(id));
+});
+
+// EXPECTED: upload_days equals expected.upload_days — the upload dates in
+// returned (newest-upload-first) order; [] for an empty bucket.
+expect(uploadDays).toEqual(expected.upload_days);
+```
+
+A build that does not report per-asset upload timestamps has nothing to
+discover — `uploadTimestamps` stays null and the first assertion fails; a
+build that reports a misaligned pairing fails the pairing check.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "populated_august_2022_bucket"
+time_bucket = "2022-08-01"
+[story.test_case.expected]
+upload_days = ["2022-08-20", "2022-08-05"]
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "empty_bucket_returns_empty_array"
+time_bucket = "1900-01-01"
+[story.test_case.expected]
+upload_days = []

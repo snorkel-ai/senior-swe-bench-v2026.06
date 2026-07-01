@@ -1,0 +1,190 @@
+version = "1.0"
+
+[environment]
+base_image = "harbor-refactor-optional-sandbox-deps:latest"
+build_timeout_sec = 900.0
+cpus = 2
+memory = "4G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 900.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "harbor"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 14400.0
+
+[solution.env]
+REPO_NAME = "harbor"
+
+[metadata]
+family = "harbor-refactor-optional-sandbox-deps"
+variant = "hard"
+segment = "design"
+repo = "harbor"
+tags = ["harbor", "python-lib", "infrastructure"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Harbor's core package force-installs every cloud-sandbox provider SDK
+(daytona, e2b, modal, runloop, kubernetes, and the docker tooling) as hard
+runtime dependencies. A user who only wants to embed Harbor's core packages in
+their own environment — and never touches a third-party sandbox — still pays
+for all of those heavyweight SDKs on `pip install harbor`, and any environment
+that fails to import one of them takes the whole package down with it. The goal
+is to make the sandbox provider SDKs optional: installing Harbor's core should
+pull in none of them, each provider should be installable on demand, and
+importing the environment layer (or asking for a provider you have not
+installed) must degrade gracefully with an actionable message instead of an
+import-time crash. A second, related thread loosens the environment-type
+contract so that an out-of-tree environment implementation can identify itself
+without editing Harbor's closed type enum.
+"""
+context = """Setting:
+- Harbor selects a sandbox backend through src/harbor/environments/factory.py
+  (EnvironmentFactory). The factory historically imported every concrete
+  environment class eagerly at module load — AppleContainer, Docker, Daytona,
+  E2B, GKE, Modal, Runloop — and each of those modules imports its vendor SDK
+  at the top of the file. Importing the factory therefore transitively imported
+  every vendor SDK, so a single missing SDK raised ImportError before any
+  environment could be created.
+- The provider SDKs were all listed under [project.dependencies] in
+  pyproject.toml, i.e. mandatory for every install of the core package.
+- Every concrete environment extends BaseEnvironment
+  (src/harbor/environments/base.py) and reports its identity through a
+  type() method whose return type was annotated as the closed EnvironmentType
+  enum. EnvironmentType is a str subclass (class EnvironmentType(str, Enum)),
+  and two base-class validators (_validate_gpu_support, _validate_internet_config)
+  consumed self.type().value — relying on the enum's .value attribute.
+
+What a good solution accomplishes:
+- pip install harbor (core only) installs none of the provider SDKs; each
+  provider is available as a named optional extra, plus convenience aggregate
+  extras; the development install still pulls the providers in.
+- The environment layer imports cleanly with none of the provider SDKs present:
+  importing the factory, or any single provider module, never raises at import
+  time merely because that provider's SDK is absent.
+- Requesting a provider whose extra is not installed fails with a clear,
+  actionable error (an ImportError-flavoured failure that names the missing
+  package and tells the user how to install the matching extra), rather than a
+  bare ModuleNotFoundError from deep inside a vendor import.
+- An external BaseEnvironment subclass can return an arbitrary identifier from
+  type() (a plain string that is not an EnvironmentType member) and still flow
+  through the base-class validation logic without an AttributeError.
+
+Investigation evidence:
+- The originating report describes embedding Harbor's core in a private project
+  that does not need the third-party sandbox libraries, and shows the desired
+  failure shape: requesting an unavailable provider should surface a message of
+  the form "the X package is required; install it with pip install 'harbor[X]'"
+  rather than crashing on import.
+- The behavior is observable with only Harbor's lightweight core dependencies
+  installed and none of the vendor SDKs: importing the factory must succeed, and
+  asking the factory for a provider must raise the actionable error.
+
+Red herrings / leads:
+- tenacity (used for retry decorators in several environment modules) and the
+  pydantic/config core are NOT provider SDKs and remain ordinary core
+  dependencies — they must keep importing eagerly. The split is specifically
+  about the vendor sandbox SDKs, not every import in those files.
+- The Docker and AppleContainer environments are first-class/local and are not
+  gated behind a provider extra.
+"""
+solution = """Canonical solution (reference example):
+- pyproject.toml: remove the vendor sandbox SDKs (dockerfile-parse, e2b,
+  runloop-api-client, daytona, kubernetes, modal) from [project.dependencies]
+  and re-home them under [project.optional-dependencies] as per-provider extras
+  (e2b — which also carries dockerfile-parse — daytona, modal, runloop, gke),
+  plus aggregate extras (a "cloud" extra that unions the providers and an "all"
+  extra). The dev dependency group installs the cloud extra so contributors
+  still get everything.
+- Each provider module (daytona, e2b, gke, modal, runloop) wraps its vendor
+  import in try/except ImportError, recording a module-level availability flag
+  (e.g. _HAS_MODAL), and raises a dedicated MissingExtraError as the first
+  statement of the relevant constructor when the SDK is absent. The error names
+  the missing package and the install command for the matching extra.
+- A new helper module (src/harbor/utils/optional_import.py) defines
+  MissingExtraError(ImportError) carrying the package name and extra name and
+  rendering an actionable install message.
+- factory.py stops importing the provider classes eagerly. Instead a registry
+  maps each EnvironmentType to (module path, class name, optional pip extra),
+  and a lazy loader imports the target module on demand, surfacing the actionable
+  install hint if the import fails. create_environment and preflight go through
+  the lazy loader.
+- base.py: BaseEnvironment.type()'s annotation changes from EnvironmentType to
+  str (built-in environments still return EnvironmentType members, which are str
+  subclasses), and the two base validators stop calling .value on the result so
+  that a plain-string identifier from an external subclass works.
+
+Why it works:
+- Moving the SDKs to extras means the core install never pulls them; wrapping
+  the imports means importing an environment module (or the factory) no longer
+  fails just because an SDK is missing; raising MissingExtraError on
+  construction converts a confusing deep ModuleNotFoundError into an actionable
+  message. Loosening type() to str removes the hidden coupling to the enum's
+  .value so out-of-tree environments are not forced to edit the closed enum.
+
+Alternative valid solutions (all accepted):
+- The lazy dispatch may be a registry+loader (reference), a function-local
+  import inside each create branch, an importlib-based plugin lookup, or a
+  module __getattr__ — any scheme where importing the factory does not import
+  the vendor SDKs and an unavailable provider yields an actionable error.
+- The actionable error may be a custom ImportError subclass (reference) or a
+  plain ImportError, raised from the loader or from the constructor, as long as
+  it is an ImportError-family exception whose message names the missing package
+  and the matching install command.
+- The extras grouping may differ in exact names/bundling (e.g. dockerfile-parse
+  grouped with e2b vs. its own extra) as long as core deps no longer include the
+  vendor SDKs and each provider is installable on demand.
+- type() may be annotated str, or any supertype of EnvironmentType, as long as
+  the base validators no longer assume an EnvironmentType-specific API (.value)
+  and a plain-string identifier flows through.
+
+Non-optimal solutions / shortcuts to reject:
+- Leaving the provider SDKs in [project.dependencies] (so the core install
+  still drags them in) even if imports are wrapped.
+- Wrapping the imports but having the factory still import every provider class
+  eagerly (so importing the factory with a missing SDK still crashes).
+- Catching the missing SDK but failing with a bare ModuleNotFoundError / generic
+  message that does not tell the user which extra to install.
+- Keeping type() coupled to EnvironmentType.value such that an external subclass
+  returning a plain string raises AttributeError inside base validation.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-lib", "infrastructure"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "interface-design", "framework-fluency", "build-tooling", "architectural-refactoring"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 276
+files = 9
+hunks = 28
+scope = "extensive"
+
+[metadata.origin]
+repo = "harbor-framework/harbor"
+pr_numbers = [1404, 1446]
+base_commit = "7e56a5b77df825932665b65ea38870affc7a7f7b"
+base_commit_date = "2026-04-09"
+merged_at = "2026-04-17"
+
+
+
+

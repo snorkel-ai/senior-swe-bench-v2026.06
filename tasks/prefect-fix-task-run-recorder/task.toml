@@ -1,0 +1,145 @@
+version = "1.0"
+
+[environment]
+base_image = "prefect-fix-task-run-recorder:latest"
+build_timeout_sec = 1200.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "prefect"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "prefect"
+
+[metadata]
+family = "prefect-fix-task-run-recorder"
+variant = "hard"
+segment = "investigate"
+repo = "prefect"
+tags = ["prefect", "python-service", "sql-database"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Customers running flows that fan out into many tasks report that some task
+runs never appear in the API/UI even though the flow completed, and that an
+occasional task run is stuck displaying a stale (earlier) state rather than
+its final one. The loss is load- and timing-dependent: quiet runs look fine,
+busy runs drop task runs. The agent must investigate the server-side path
+that records client-emitted task-run events into the database and fix it so
+every task run that executes is persisted with its correct latest state,
+without regressing the cases that already work.
+"""
+context = """The bug lives in `record_bulk_task_run_events` (and the single-event
+`record_task_run_event`) in
+`src/prefect/server/services/task_run_recorder.py`. The TaskRunRecorder
+service consumes client-emitted `prefect.task-run.*` events and upserts task
+run rows. The `task_run` table has TWO uniqueness constraints: the primary
+key `id`, and a natural-key unique index
+`uq_task_run__flow_run_id_task_key_dynamic_key` over
+`(flow_run_id, task_key, dynamic_key)`.
+
+Pre-fix, the recorder dedups incoming events by `id` only and always issues
+`insert(...).on_conflict_do_update(index_elements=["id"])`. When two events
+describe the SAME logical task run (same flow_run_id/task_key/dynamic_key)
+but carry DIFFERENT task-run ids — which happens routinely under client-side
+task orchestration and retries — the id-conflict target does not match, so
+the second insert violates the natural-key UNIQUE index and raises
+`IntegrityError`. In the bulk path the whole batch's state insert is lost; in
+the single path the event is retried once then discarded. Net effect: missing
+task runs and stale states under load.
+
+Crucially this reproduces DETERMINISTICALLY on the default in-memory SQLite
+backend used by Prefect's server test fixtures — the natural-key index exists
+in both SQLite and PostgreSQL — so no PostgreSQL, running server, or worker
+is required to observe or fix it. A two-event in-process reproduction through
+the recorder's public function is enough.
+
+The merged PR (#21726) ships regression coverage for four scenarios:
+sequential natural-key conflicts, same-batch natural-key conflicts,
+single-event recorder conflicts, and existing-id conflicts.
+"""
+solution = """Canonical fix (merged PR #21726): make the recorder reconcile BOTH
+uniqueness constraints instead of only the `id` constraint.
+
+- Coalesce incoming events by the *persisted* task-run identity: when a
+  `flow_run_id` is present, group/dedup by `(flow_run_id, task_key,
+  dynamic_key)` (the natural key), not just by `id`; keep the event with the
+  latest `state_timestamp`. This also collapses same-batch collisions before
+  any write is attempted.
+- Choose the upsert conflict target dynamically from what already exists in
+  the database: if a row with the natural key already exists, target the
+  natural-key index; otherwise target `id`. This lets a single code path
+  resolve both natural-key conflicts and primary-key `id` conflicts.
+- Preserve the canonical persisted task-run id (the id of the row that
+  actually survives in the DB) and attribute the inserted task-run *state*
+  rows to that canonical id, so the state history stays consistent and
+  attached to the surviving run.
+- Keep the existing id-based behavior for task runs that have no
+  `flow_run_id` (the natural key is incomplete / not enforceable there).
+
+Equally valid alternatives the reward stack should accept (they all reconcile
+both constraints and preserve state-history attribution):
+- Union-find / transitive coalescing of same-batch conflicts (the reference
+  example's approach) vs. a simpler "latest timestamp wins per natural key"
+  grouping.
+- Requerying existing rows to pick the conflict target vs. attempting the
+  id-targeted upsert and, on IntegrityError, retrying against the natural-key
+  target.
+- Per-row upserts vs. batched upserts, as long as both constraints are
+  honored and the latest state wins.
+
+Wrong / non-optimal fixes the reward stack REJECTS:
+- Swallowing the `IntegrityError` (try/except + discard) — the task run is
+  still lost.
+- Only changing the id-dedup to natural-key-dedup WITHOUT also fixing the
+  conflict target (or vice versa) — leaves one of the two collision modes
+  open.
+- `asyncio.sleep` / jitter / extra retries at the consumer/flush layer —
+  the write fails again the same way.
+- Deduplicating events upstream of the recorder — moves the problem and
+  drops legitimately distinct runs.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["python-service", "sql-database"]
+runtime_dependence = "runtime-essential"
+skills = ["codebase-exploration", "fault-localization", "log-interpretation", "concurrency-reasoning", "framework-fluency", "query-optimization", "logic-fix"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 214
+files = 1
+hunks = 6
+scope = "extensive"
+
+[metadata.origin]
+repo = "PrefectHQ/prefect"
+pr_numbers = [21726]
+base_commit = "e934cf2282d8ae88cf80505018076db993862b79"
+base_commit_date = "2026-05-01"
+merged_at = "2026-05-01"
+
+
+
+

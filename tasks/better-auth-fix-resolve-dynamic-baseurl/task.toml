@@ -1,0 +1,224 @@
+version = "1.0"
+
+[environment]
+base_image = "better-auth-fix-resolve-dynamic-baseurl:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "better-auth"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "better-auth"
+
+[metadata]
+family = "better-auth-fix-resolve-dynamic-baseurl"
+variant = "hard"
+segment = "investigate"
+repo = "better-auth"
+tags = ["better-auth", "typescript-lib"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Multi-tenant deployments configure better-auth with a dynamic baseURL
+(an `allowedHosts` allowlist plus protocol) so the resolved origin
+follows whichever tenant's domain a request arrived on. That works for
+requests that come in over HTTP — `auth.handler(request)` resolves the
+per-request origin correctly. It does NOT work for direct programmatic
+calls into the typed server-side API: those calls only carry headers
+(no full Request), so the resolution code never fires and the endpoint
+sees an empty origin. Customers downstream get blank or wrong values
+baked into emails, OAuth callbacks, and any URL constructed inside an
+endpoint handler. The two entry points have to behave consistently.
+"""
+context = """Setting:
+- `packages/better-auth/src/auth/base.ts` already does dynamic
+  baseURL resolution on the HTTP entry point. When the configured
+  `baseURL` is dynamic, `auth.handler(request)` clones the auth
+  context, calls `resolveBaseURL(config, basePath, request)`,
+  rehydrates `trustedOrigins` (and cookies, when
+  `crossSubDomainCookies` is on), and routes the request through the
+  per-request clone.
+- `packages/better-auth/src/api/to-auth-endpoints.ts` builds the
+  typed `auth.api.<endpoint>` wrappers. Pre-fix it threads the shared
+  `authContext` straight through every direct call without ever
+  consulting the user-supplied `headers` or `request`. Endpoint
+  handlers therefore see `c.context.baseURL === ""` (the default for
+  dynamic configs) on every direct API call, regardless of which
+  tenant the caller intended to talk about.
+- `packages/better-auth/src/utils/url.ts` exposes the host/protocol
+  primitives used by the resolution code. Pre-fix they all take a
+  `Request`. A direct API call that only has headers cannot use
+  them as-is.
+- `packages/better-auth/src/context/helpers.ts` exposes
+  `getTrustedOrigins(options, request)` and `getTrustedProviders`.
+  These are used by `auth/base.ts` after the per-request clone is
+  built; any new direct-API resolution path needs the same
+  rehydration.
+
+Investigation evidence (PR #9113 / issue #9105):
+- The reporter ran `auth.api.getSession({ headers: { host:
+  "tenant-a.app" }})` against a multi-tenant config and saw email
+  verification URLs with the wrong origin in the response.
+- The PR author found two related concerns while building the fix:
+  1. Some Node integrations pass `http.IncomingMessage` directly as
+     the `request` field. `IncomingMessage.headers` is a plain object,
+     not a Web `Headers` instance. Naive duck-type detection (any
+     object with `.headers` is a Request) crashes inside header
+     parsing because `headers.get(...)` is undefined on a plain
+     object.
+  2. Concurrent direct API calls in different tenants must not see
+     each other's resolved baseURL — the per-request clone must come
+     from the dynamic-resolution code, not be written through to the
+     shared `authContext`.
+
+Behavioural observation surface:
+- The change is observable through the typed server-side API. A
+  pluggable endpoint added via the standard plugin shape
+  (`createAuthEndpoint` from `@better-auth/core/api` registered as a
+  plugin's `endpoints`) can read `c.context.baseURL` and return it.
+  Pre-fix, that endpoint's handler sees `""` no matter what host the
+  caller put in `headers`. Post-fix, it sees the dynamic-resolved URL.
+- The same observation also confirms regression on the HTTP entry
+  point: `auth.handler(new Request("https://tenant.example.com/api/auth/<probe-path>"))`
+  must still produce the expected resolved URL.
+
+Note on patch scope:
+- The reference example also extracts a shared `resolveRequestContext`
+  helper into `context/helpers.ts` and refactors `auth/base.ts` to
+  use it. That refactor is incidental — the verifier asserts only
+  the externally observable behaviour, and a fix that inlines the
+  same logic in `to-auth-endpoints.ts` without touching `auth/base.ts`
+  is equally valid.
+- The reference example renames `getHostFromRequest` /
+  `getProtocolFromRequest` (in `utils/url.ts`) to
+  `getHostFromSource` / `getProtocolFromSource` to match the broader
+  `Request | Headers` signature. Renaming is one valid choice; adding
+  a sibling overload or a new headers-only helper alongside the
+  existing functions is equally valid.
+"""
+solution = """Canonical fix (reference example):
+- In `to-auth-endpoints.ts`, before the endpoint handler runs, when
+  the configured `baseURL` is a `DynamicBaseURLConfig`, build a
+  per-call source from the user input — preferring a real Request
+  (verified via `isRequestLike`) and falling back to the user-supplied
+  `headers` only when those headers carry a `host` or
+  `x-forwarded-host`. Pass the source into a shared helper
+  `resolveRequestContext(rawCtx, source?)` that returns a per-call
+  clone of the auth context with `baseURL`, `trustedOrigins`, and (if
+  `crossSubDomainCookies` is on) cookie config rehydrated for the
+  resolved host. Static configs and dynamic configs that find no
+  source short-circuit to the original `authContext` so the fast
+  path stays zero-overhead.
+- The reference example extracts that clone-and-rehydrate logic out
+  of `auth/base.ts` and into `context/helpers.ts` as the new exported
+  `resolveRequestContext`, then reuses it from both the HTTP
+  handler path and the new direct-API path. This is a refactor; the
+  same logic could be inlined in `to-auth-endpoints.ts` without
+  touching `auth/base.ts`.
+- The reference example generalises `getHostFromRequest` /
+  `getProtocolFromRequest` (and the chain through
+  `resolveDynamicBaseURL` / `resolveBaseURL`) to accept
+  `Request | Headers`. It also adds a robust Request detector
+  `isRequestLike(value)` that uses BOTH `value instanceof Request`
+  AND `Object.prototype.toString.call(value) === "[object Request]"`
+  so cross-realm Request instances (workers, Node adapters) succeed
+  while plain-object duck-types (Node `IncomingMessage`) are rejected.
+
+Why this approach works:
+- `auth.api.<endpoint>` is the same observable surface
+  `auth.handler` already serves; both paths now produce the same
+  per-request `c.context.baseURL` for dynamic configs.
+- The clone uses `Object.create(getPrototypeOf(ctx),
+  getOwnPropertyDescriptors(ctx))` and only overwrites `baseURL`,
+  `options.baseURL`, `trustedOrigins`, and (conditionally)
+  `authCookies` / `createAuthCookie`. The shared raw context's
+  `baseURL` stays at the init default (empty string for dynamic
+  configs), which is what concurrent callers in different tenants
+  rely on.
+- Strict Request detection keeps duck-typed `IncomingMessage`-shaped
+  objects out of header-parsing code, which would otherwise crash on
+  the plain-object `headers` field.
+
+Alternative valid fixes:
+1. Inline the per-request clone in `to-auth-endpoints.ts` without
+   adding a shared helper. Verifier passes — it asserts behaviour,
+   not the existence of an exported helper.
+2. A different export name for the shared helper
+   (`cloneAuthContextForRequest`, `withDynamicBaseURL`,
+   `rehydrateContext`, …) or placing it in a different module.
+3. Keep `getHostFromRequest` / `getProtocolFromRequest` named as-is
+   and add either a `Request | Headers` overload, a new headers-only
+   sibling, or an internal `Request`-only function plus a thin
+   adapter. Verifier never names these utilities.
+4. A different `isRequestLike` implementation (`globalThis.Request`
+   guard, prototype check, etc.) as long as it rejects plain-object
+   duck-types.
+5. Adding the resolution as a `before` hook on every endpoint
+   instead of in `to-auth-endpoints.ts` proper — the hook just has
+   to mutate the resolved `c.context.baseURL` the handler reads.
+6. Skipping the `auth/base.ts` refactor entirely and only fixing the
+   direct-API path. The HTTP handler keeps its inline clone.
+
+Non-optimal "fixes" the verifier rejects:
+- Mutating the shared `authContext.baseURL` instead of cloning. Two
+  concurrent direct API calls in different tenants will then see
+  whichever resolved last. The verifier's concurrent test catches
+  this.
+- Soft duck-type detection (`value && typeof value.headers?.get ===
+  "function"`) that crashes when given a Node `IncomingMessage` —
+  its plain-object `headers` has no `.get`. The verifier passes a
+  duck-typed object explicitly.
+- Ignoring the dynamic config's `fallback` URL on the direct path.
+  The verifier exercises a config with a `fallback` and no host
+  source, expecting the fallback URL.
+- Not honouring `x-forwarded-host` headers on direct API calls.
+  The verifier covers proxy-style headers as well as `host`.
+- Triggering the dynamic-resolution overhead on static (string)
+  baseURL configs. The verifier asserts the static path is unchanged
+  no matter what host header the caller passes.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["typescript-lib"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "framework-fluency", "interface-design", "logic-fix", "concurrency-reasoning", "test-execution"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 192
+files = 4
+hunks = 14
+scope = "broad"
+
+[metadata.origin]
+repo = "better-auth/better-auth"
+pr_numbers = [9113]
+base_commit = "2514c3d970e0f710fcd54217a877e16b5ee573e0"
+base_commit_date = "2026-04-13"
+merged_at = "2026-04-14"
+
+
+
+

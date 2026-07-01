@@ -1,0 +1,144 @@
+version = "1.0"
+
+[environment]
+base_image = "gitea-fix-diff-highlight-overlap:latest"
+build_timeout_sec = 1800.0
+cpus = 2
+memory = "4G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "gitea"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "gitea"
+
+[metadata]
+family = "gitea-fix-diff-highlight-overlap"
+variant = "hard"
+segment = "investigate"
+repo = "gitea"
+tags = ["gitea", "go"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Users of a Gitea instance are reporting that inline diffs in code review
+render with the add/remove highlight in awkward places — the colored
+marker overlaps the syntax-highlight tokens in a way that breaks the
+visual structure of changed identifiers. The behaviour shows up across
+most languages and is most obvious on small edits like adding a prefix
+in front of a method call.
+"""
+context = """The defective code is in `services/gitdiff/highlightdiff.go`, the
+package responsible for combining chroma's syntax-highlighted HTML
+output with diff-match-patch's character-level diff. The bug surfaces
+in `(*highlightCodeDiff).diffLineWithHighlight`, the only entry point
+the surrounding code (`gitdiff.go`'s `getDiffLineForRender`) calls.
+
+The PR (#36539) fixes #36536; the linked issue contains a screenshot
+of the rendered bug. The PR author chose to introduce a "full tag with
+content" extraction step (`extractDiffTokenRemainingFullTag`) so that
+matched opening/closing tag pairs around a single piece of text become
+a single atomic token before diff-match-patch runs. That guarantees the
+diff marker wraps complete syntax spans rather than nesting inside
+them. The original `convertToPlaceholders` flow had already special-cased
+line-wrapper spans (`<span class="line">…<span class="cl">…</span></span>`)
+and the fix simplifies that path while introducing the new full-tag
+case.
+
+The package's `main_test.go` insists on running `unittest.MainTest`
+which initialises a fixture SQLite DB; this is irrelevant to the bug
+but every `go test` invocation in the package pays the setup cost.
+The image bakes in `tests/sqlite.ini` so that running as root is
+permitted and the DB init is fast. Build tags `sqlite
+sqlite_unlock_notify` are required.
+
+Investigation evidence available from the PR thread:
+- Issue #36536 (bug report) shows the symptom on screenshots.
+- The PR comment notes a follow-up #36561 ("full-file highlighting for
+  diff sections") — independent and out-of-scope here.
+- A senior reviewer (`wxiaoguang`) authored the fix; the diff is small
+  but the algorithmic move (full tag-pair atomic token) is non-obvious.
+"""
+solution = """Canonical fix: teach the tokenizer used by `convertToPlaceholders` /
+`recoverOneDiff` to recognise an opening tag immediately followed by
+its matching closing tag with text in between, and treat the whole
+opening-text-closing triple as a single atomic token (one reference
+example uses a marker form `<<span ...>content</span>>`). This forces
+the diff
+algorithm to keep complete syntax-highlighted tokens together, so the
+diff marker placed around the differing token wraps the whole pair
+instead of cutting between opening and closing tags.
+
+Equally valid alternatives:
+- Fix only `convertToPlaceholders` to combine pair+content into one
+  placeholder rune, then teach `recoverOneDiff` to expand that rune.
+- Re-emit `added-code`/`removed-code` placeholders at recovery time
+  whenever they fall inside an opening/closing span pair that brackets
+  them.
+
+Either approach produces the same observable output on the test
+inputs, because the inputs are taken from the PR's own test suite and
+the diff-match-patch result on equivalent placeholder streams is
+deterministic.
+
+Suboptimal fixes that might game the verifier:
+- Hardcoding the three test inputs in `diffLineWithHighlight`. Caught
+  by an LLM judge / rubric review (this would be obvious in the diff)
+  and would also fail real-world inputs.
+- Disabling diff highlighting entirely (`return codeA` or `return
+  codeB`). This breaks the partial-change pass-to-pass case — the
+  output for `<span class="cm">this is a comment</span>` would no
+  longer mark the `<span class="removed-code">a</span>` substring.
+
+Red herrings:
+- The chroma highlighter (`modules/highlight`) is fine. The bug is in
+  how its output is reassembled, not in how it is produced.
+- The diff parsing layer (`gitdiff.go`'s `ParsePatch`) is fine — it
+  produces the structured `Diff*` types correctly.
+- The line-wrapper handling (`<span class="line">…</span>`) is touched
+  by the canonical fix but only as cleanup — agents should not focus
+  on it.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["go"]
+runtime_dependence = "runtime-helpful"
+skills = ["fault-localization", "logic-fix", "framework-fluency", "codebase-exploration"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 96
+files = 1
+hunks = 11
+scope = "broad"
+
+[metadata.origin]
+repo = "go-gitea/gitea"
+pr_numbers = [36539]
+base_commit = "f65df2a69be5625ab5e4ecc4aa67b194b77607b1"
+base_commit_date = "2026-02-08"
+merged_at = "2026-02-08"
+
+
+
+

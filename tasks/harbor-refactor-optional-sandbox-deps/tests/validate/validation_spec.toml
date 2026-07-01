@@ -1,0 +1,278 @@
+stack_profile = "python-library"
+
+instructions = """
+General environment for every story in this task. These stories are the primary
+reward signal for the feature; read them carefully and assert the observable
+behaviour, never an internal name or an exact string.
+
+ENVIRONMENT
+- The harbor repo is at /repo/harbor with a venv at /repo/harbor/.venv.
+  validation-setup.sh has already created that venv and installed harbor in
+  editable mode with ONLY its lightweight core libraries (pydantic, toml,
+  shortuuid, tenacity) plus pytest — and deliberately NONE of the
+  cloud-provider SDKs (daytona, e2b, modal, runloop, kubernetes,
+  dockerfile-parse). Their ABSENCE is intentional and is what these stories
+  exercise. Do NOT install any of those SDKs.
+- Run scripts with the repo interpreter `/repo/harbor/.venv/bin/python`
+  (the [settings.pytest].python below already points there). `import harbor...`
+  resolves to the editable repo.
+- You may READ anything under /repo/harbor (source and pyproject.toml) to
+  discover the solution's shape, but DO NOT MODIFY anything there. The
+  validation orchestrator zeros the score if the source tree changes between
+  setup and verification.
+
+WHAT YOU ARE TESTING (observable contract — discover the specifics from source)
+- The environment-selection layer is the public class
+  `harbor.environments.factory.EnvironmentFactory`; you create a backend
+  through its pre-existing classmethod
+  `create_environment(type, environment_dir=..., environment_name=...,
+  session_id=..., trial_paths=..., task_env_config=...)`. The backend
+  identifiers are the members of `harbor.models.environment_type.EnvironmentType`
+  (e.g. `EnvironmentType.MODAL`). A default `EnvironmentConfig` comes from
+  `harbor.models.task.config`, and `TrialPaths` from
+  `harbor.models.trial.paths` (build it via `make_trial_paths` from the helper).
+- Each concrete provider lives in its own module under
+  `harbor.environments.*` (e.g. `harbor.environments.modal`) and exposes a
+  concrete environment class. The base class every environment extends is
+  `harbor.environments.base.BaseEnvironment`. It exposes a static `type()`
+  method reporting the backend identity, and runs validation in its
+  constructor. `ExecResult` (also in that module) wraps `return_code` plus
+  optional `stdout`/`stderr`.
+
+DISCOVERY (read the solution; do not assume the reference's internal shape)
+These stories deliberately do NOT pin the solution-chosen pieces. Discover each
+from the harbor source you are validating (read the implementation directly under
+/repo/harbor), then code against what you find:
+  - which `EnvironmentType` members are CLOUD backends (gated behind an optional
+    SDK) versus local/first-class ones that need no extra;
+  - how the project re-homes each provider SDK as an installable optional extra:
+    read `/repo/harbor/pyproject.toml` `[project.optional-dependencies]` and
+    work out, for each provider, which extra name(s) install that provider's
+    vendor distribution (extras may reference other extras as `harbor[other]`,
+    so expand those self-references transitively);
+  - which constructor-time base-class validators interpolate the environment's
+    identity (the `type()` result) into their message — there may be more than
+    one (e.g. one that rejects a GPU request the environment cannot satisfy, and
+    one that rejects disabling internet when the environment cannot).
+Discover with prose and direct reading — do NOT add `find_*`/`discover_*`/AST
+helpers. The error class, the lazy-import mechanism, the exact wording, and the
+extras names are all free for the solution to choose.
+
+THE HELPER (test_harness.py — importable as `from test_harness import ...`)
+Framework plumbing only; it asserts no outcome and pins no solution-chosen name:
+  - `make_trial_paths(tmp_path) -> TrialPaths` builds a `TrialPaths` rooted in a
+    fresh directory under `tmp_path`.
+
+TEST AUTHORING CONVENTION
+- Each story's procedure defines exactly ONE pytest test function that takes
+  `inputs` and `expected` as fixture arguments (the driver parametrizes them
+  from the story's test cases).
+- Match error messages loosely: lowercase and check for the named substrings;
+  tolerate any additional wording. Do NOT assert a specific exception subclass
+  beyond what the procedure states, and do NOT assume any particular internal
+  module raised it.
+- Run only the assertions described in the procedure — do not add extra
+  exploratory assertions that may differ across valid implementations.
+"""
+
+[settings]
+va_max_turns = 60
+va_timeout_sec = 1500
+script_timeout_sec = 600
+
+[settings.pytest]
+python = "/repo/harbor/.venv/bin/python"
+
+
+# ===========================================================================
+# Story 1 — the environment layer imports cleanly with no cloud SDK present
+# ===========================================================================
+[[story]]
+id = "optional_provider_layer_imports_cleanly"
+driver = "pytest"
+description = """
+The default Harbor install shouldn't install any cloud sandbox SDKs and work
+correctly with local envs.
+"""
+procedure = """
+- Define one pytest test function taking fixtures `inputs` and `expected`.
+- Import `importlib`. Import `EnvironmentFactory` from
+  `harbor.environments.factory` at the top of the test body — this import is
+  itself part of the contract: the backend-selection layer must import cleanly
+  with no vendor SDK present (if it raises, the test fails). Assert
+  `callable(EnvironmentFactory.create_environment)`.
+- Import the provider module named by `inputs["module_path"]` via
+  `importlib.import_module(inputs["module_path"])`. This must NOT raise merely
+  because that provider's SDK is absent (if it raises ImportError, the test
+  fails — that is exactly the unsolved behaviour). Bind the result as `module`.
+- EXPECTED: `getattr(module, expected["class_name"]).__name__` equals
+  `expected["class_name"]` — i.e. the provider module imported cleanly and still
+  exposes its concrete environment class.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+module_path = "harbor.environments.daytona"
+[story.test_case.expected]
+class_name = "DaytonaEnvironment"
+
+[[story.test_case]]
+[story.test_case.inputs]
+module_path = "harbor.environments.e2b"
+[story.test_case.expected]
+class_name = "E2BEnvironment"
+
+[[story.test_case]]
+[story.test_case.inputs]
+module_path = "harbor.environments.gke"
+[story.test_case.expected]
+class_name = "GKEEnvironment"
+
+[[story.test_case]]
+[story.test_case.inputs]
+module_path = "harbor.environments.modal"
+[story.test_case.expected]
+class_name = "ModalEnvironment"
+
+[[story.test_case]]
+[story.test_case.inputs]
+module_path = "harbor.environments.runloop"
+[story.test_case.expected]
+class_name = "RunloopEnvironment"
+
+
+# ===========================================================================
+# Story 2 — an uninstalled cloud backend errors with a resolvable install hint
+# ===========================================================================
+[[story]]
+id = "cloud_backend_without_sdk_errors_with_install_hint"
+driver = "pytest"
+description = """
+When a user tries to invoke a cloud environment without its SDK installed, they
+should get an error with the missing package and install instructions.
+"""
+procedure = """
+- Define one pytest test function taking fixtures `inputs` and `expected`.
+- Import `pytest`, `re`, `tomllib`, `Path` (from `pathlib`), `make_trial_paths`
+  (from `test_harness`), and from harbor: `EnvironmentFactory`
+  (harbor.environments.factory), `EnvironmentType`
+  (harbor.models.environment_type), `EnvironmentConfig`
+  (harbor.models.task.config).
+- Build a real temp dir `d` under `tmp_path` and `tp = make_trial_paths(tmp_path)`.
+- Resolve `env_type = getattr(EnvironmentType, inputs["environment_type"])`.
+- Use `pytest.raises(ImportError)` to capture:
+  `EnvironmentFactory.create_environment(env_type, environment_dir=d,
+  environment_name="validate-env", session_id="validate-session",
+  trial_paths=tp, task_env_config=EnvironmentConfig())`.
+- Read `message = str(excinfo.value)`; `lowered = message.lower()`.
+- Resolve the install hint against the solution's own packaging. Read
+  `/repo/harbor/pyproject.toml` with `tomllib`; take
+  `opt = data["project"]["optional-dependencies"]` (a dict of extra-name ->
+  list of requirement strings). Define, inline, a transitive expander: for an
+  extra name, collect its requirement strings; any requirement of the form
+  `harbor[other]` (optionally quoted) expands to the requirements of `other`
+  (guard against cycles); for every other requirement, take its distribution
+  name = the text before the first of the characters `<>=!~;[ ` (or a space),
+  lowercased. This yields the set of vendor distributions an extra installs.
+  Extract every `harbor[<X>]` token from `message` with a regex
+  (`harbor\\[([^\\]]+)\\]`). For each extracted extra name `X` that is a key in
+  `opt`, expand it transitively and collect its distribution set; let
+  `resolving_extras` be the list of those `X` whose distribution set contains
+  `expected["vendor_distribution"]`.
+- EXPECTED: the raised exception is an instance of `ImportError`.
+- EXPECTED: `expected["package_substr"]` (already lowercase) is contained in
+  `lowered` (the error names the missing package).
+- EXPECTED: `resolving_extras` is non-empty — i.e. the message tells the user how
+  to install the provider by naming at least one `harbor[X]` extra that exists in
+  the project's optional-dependencies and whose transitive distributions include
+  `expected["vendor_distribution"]`. This is the actionable-install-hint check;
+  it is agnostic to the install verb (pip / uv / uv tool), which the message may
+  word however it likes.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+environment_type = "MODAL"
+[story.test_case.expected]
+package_substr = "modal"
+vendor_distribution = "modal"
+
+[[story.test_case]]
+[story.test_case.inputs]
+environment_type = "RUNLOOP"
+[story.test_case.expected]
+package_substr = "runloop"
+vendor_distribution = "runloop-api-client"
+
+[[story.test_case]]
+[story.test_case.inputs]
+environment_type = "DAYTONA"
+[story.test_case.expected]
+package_substr = "daytona"
+vendor_distribution = "daytona"
+
+[[story.test_case]]
+[story.test_case.inputs]
+environment_type = "E2B"
+[story.test_case.expected]
+package_substr = "e2b"
+vendor_distribution = "e2b"
+
+
+# ===========================================================================
+# Story 3 — a custom string-identified environment passes base validation
+# ===========================================================================
+[[story]]
+id = "custom_string_environment_passes_validation"
+driver = "pytest"
+description = "Custom local environments can be registered with string labels. Things like validation should work correctly."
+procedure = """
+- Define one pytest test function taking fixtures `inputs` and `expected`.
+- Import `pytest`, `Path` (from `pathlib`), `make_trial_paths` (from
+  `test_harness`), and from harbor: `BaseEnvironment` and `ExecResult`
+  (harbor.environments.base), `EnvironmentConfig` (harbor.models.task.config).
+- Read `harbor/environments/base.py` to confirm the constructor-time validators
+  that interpolate the environment identity: one rejects a positive GPU request
+  when the environment reports it does not support GPUs; one rejects
+  `allow_internet=False` when the environment reports it cannot disable
+  internet. `inputs["validator"]` selects which to trip ("gpu" or "internet").
+- Define a minimal `BaseEnvironment` subclass that:
+    * `type()` (a staticmethod) returns `inputs["type_identifier"]` (a plain str
+      that is NOT an `EnvironmentType` member),
+    * `is_mounted` -> False, `_validate_definition` -> None (no-op),
+    * for the "gpu" case: `supports_gpus` -> False, `can_disable_internet` ->
+      True; for the "internet" case: `supports_gpus` -> True,
+      `can_disable_internet` -> False,
+    * stub-implements the remaining abstract async methods (`start`, `stop`,
+      `upload_file`, `upload_dir`, `download_file`, `download_dir`, and `exec`
+      returning `ExecResult(return_code=0)`).
+- Build a real temp dir `d` under `tmp_path` and `tp = make_trial_paths(tmp_path)`.
+- Build the config that trips the selected validator:
+    * "gpu":      `EnvironmentConfig(gpus=1)` (a GPU is requested but the env
+                  reports no GPU support).
+    * "internet": `EnvironmentConfig(gpus=0, allow_internet=False)` (internet is
+                  disabled but the env reports it cannot disable internet).
+- Use `pytest.raises(Exception)` to capture construction of the subclass with
+  `environment_dir=d, environment_name="ext-env", session_id="ext-session",
+  trial_paths=tp, task_env_config=<that config>`.
+- EXPECTED: the raised exception is NOT an `AttributeError`.
+- EXPECTED: `type(excinfo.value).__name__` equals `expected["error_type"]`.
+- EXPECTED: `expected["identifier_echoed"]` is contained in `str(excinfo.value)`
+  (the domain validation error echoes the environment's own string label).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+type_identifier = "acme-cloud"
+validator = "gpu"
+[story.test_case.expected]
+error_type = "RuntimeError"
+identifier_echoed = "acme-cloud"
+
+[[story.test_case]]
+[story.test_case.inputs]
+type_identifier = "外部环境"
+validator = "internet"
+[story.test_case.expected]
+error_type = "ValueError"
+identifier_echoed = "外部环境"

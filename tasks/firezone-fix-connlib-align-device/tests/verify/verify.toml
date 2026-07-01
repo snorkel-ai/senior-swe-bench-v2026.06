@@ -1,0 +1,24 @@
+# Two verifiers run side-by-side; both must pass for correctness == 1.0:
+# verify_test.rs (Rust integration test, hosted in `client-shared` so the
+# `tunnel` message types are reachable without compiling tunnel's eBPF
+# dev-dependency chain) and verify_match_sites_compile.sh (structural
+# `cargo check` of both crates).
+
+[rust]
+# `crate` is relative to the repo dir (/repo/firezone). The runner
+# copies verify_test.rs into {repo_dir}/{crate}/tests/, then runs
+# `cargo test --test verify_test --manifest-path={crate}/Cargo.toml -v`
+# from {workspace_dir}.
+crate = "rust/libs/client-shared"
+workspace_dir = "rust"
+
+# Cold compile of the integration test on top of the pre-warmed
+# `client-shared --tests` cache (the Dockerfile pre-builds it) is well
+# under 60s. 600s is generous for a cold target/.
+timeout = 600
+
+[shell]
+# Cold `cargo check -p tunnel -p client-shared` from a clean target/
+# stays under a few minutes; warm (the image pre-builds both libs) is
+# under 30 seconds. 600s covers both with margin.
+timeout = 600

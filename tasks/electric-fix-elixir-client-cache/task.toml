@@ -1,0 +1,232 @@
+version = "1.0"
+
+[environment]
+base_image = "electric-fix-elixir-client-cache:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 300.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "electric"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "electric"
+
+[metadata]
+family = "electric-fix-elixir-client-cache"
+variant = "hard"
+segment = "investigate"
+repo = "electric"
+tags = ["electric", "elixir"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """On stacks where an HTTP CDN or proxy sits between our Elixir
+applications and the Electric sync service, long-running shape streams
+occasionally get stuck after a shape rotation and never recover —
+they keep hitting the server with the same request, the server keeps
+saying the shape handle is gone, and the cache keeps replaying the
+old response. Memory and CPU on the application stay busy with no
+shape progress; restarting the Elixir process briefly clears the
+problem until the next rotation hits the same shape. The TypeScript
+client doesn't have this issue, so it's specific to the Elixir
+client.
+"""
+context = """The Electric stack publishes "Shapes" (filtered Postgres table
+subsets) over HTTP. Clients long-poll a `/v1/shape` endpoint with
+`handle`, `offset`, `live`, `cursor` query parameters and consume a
+stream of insert/update/delete messages.
+
+When the server invalidates a shape (compaction, snapshot rotation,
+explicit reset) it returns HTTP 409 with a `must-refetch` control
+message; the response may carry a new handle in the `electric-handle`
+header. The client is expected to discard its local state and start
+over against the new handle.
+
+Production deployments commonly put Caddy / Cloudflare / nginx in
+front of the sync service. Until a CDN cache entry expires naturally,
+an intermediate cache may continue serving the pre-409 response to
+clients that arrive at the same URL — handing the client a 200 for a
+handle the server has long since discarded.
+
+The TypeScript client at `packages/typescript-client/` already handles
+this scenario (see `src/client.ts` and the protocol parameter
+definitions in `src/constants.ts`). The Elixir client at
+`packages/elixir-client/` does not — its
+`Electric.Client.Poll.handle_must_refetch/3` simply resets state to
+the new handle and re-issues the request to the same URL, and the
+intermediate cache can hand back the same stale 200 indefinitely.
+
+Production reproduction signature (from the on-call ticket that
+prompted this work):
+
+  1. Client receives 409, gets new handle.
+  2. Client makes request with new handle.
+  3. CDN serves cached 200 with the OLD handle.
+  4. Client receives 409 again (handle mismatch).
+  5. Repeat forever — the shape never makes progress.
+
+Files involved in the canonical fix (reference example):
+
+  - `packages/elixir-client/lib/electric/client/application.ex`
+  - `packages/elixir-client/lib/electric/client/expired_shapes_cache.ex` (NEW)
+  - `packages/elixir-client/lib/electric/client/poll.ex`
+  - `packages/elixir-client/lib/electric/client/shape_key.ex` (NEW)
+  - `packages/elixir-client/lib/electric/client/shape_state.ex`
+  - `packages/elixir-client/lib/electric/client/stream.ex`
+
+Investigation evidence available in the linked TS-side code:
+
+  - The TS client `src/constants.ts` names the two protocol parameters
+    that the server / CDN configuration is built around:
+    `expired_handle` (cache-key signal) and `cache-buster` (cache-bypass
+    signal). The Electric server reads these to decide how to respond;
+    the CDN configuration uses them as cache-key inputs and cache-bypass
+    signals.
+  - The TS client's `expiredShapesCache` is a 250-entry LRU keyed by a
+    canonical shape URL with protocol parameters stripped (handle,
+    cursor, live, offset, etc.).
+  - The TS client gives up after 3 consecutive `stale-retry` cycles
+    and raises a clear "CDN continues serving stale cached responses"
+    error — bounding the worst case so operators can spot the
+    misconfiguration.
+
+Red herrings that show up during triage but are not the cause:
+
+  - Connection-pool starvation: there are plenty of free Finch
+    connections during the stuck period. The client is making
+    requests; they're just getting the wrong responses.
+  - The 409-handling path in `handle_must_refetch/3` — superficially
+    suspicious because the issue manifests post-409, but the local
+    state transition is correct: it accepts the new handle and resets
+    offset. The actual bug is that the next request URL is identical
+    to a URL the CDN already has a cached response for.
+  - The `Fetch.HTTP` retry / backoff logic — it's not retrying the
+    same request quickly; that's already correctly debounced. The
+    requests succeed (HTTP 200) at the wire level; the payload is
+    just stale.
+  - The `Stream` Enumerable implementation in `stream.ex` — the
+    stream loop is correct, it just keeps getting fed bad data.
+"""
+solution = """Canonical fix (reference example) implements the same cache-busting
+strategy as the TypeScript client:
+
+  1. Track expired shape handles in a process-independent cache keyed
+     by canonical shape URL. The reference example uses an LRU cache
+     (max 250 entries) backed by ETS, supervised by the
+     elixir-client's Application supervisor. After every
+     `must-refetch` response, the about-to-be-discarded handle is
+     marked expired in the cache.
+
+  2. Build canonical shape URLs by stripping the Electric protocol
+     query parameters (`handle`, `offset`, `cursor`, `live`,
+     `expired_handle`, `cache-buster`, the `subset__*` family, etc.)
+     from the request URL and sorting the remaining parameters
+     alphabetically. The same shape requested with different protocol
+     parameters yields the same canonical key.
+
+  3. On every outbound request, look up the canonical key in the
+     expired-shapes cache. If a match is found, attach
+     `expired_handle=<handle>` as a query parameter. The Electric
+     server / CDN configuration reads this parameter to invalidate
+     stale cached responses.
+
+  4. After receiving a 200 response, compare the response's handle
+     against any expired handle the cache has for this shape. If they
+     match AND the client has no valid local handle (initial sync or
+     after the previous handle was just expired), enter a stale-retry
+     state: generate a random `cache-buster` value, attach it to the
+     next request as a query param, and re-issue the request. The
+     `cache-buster` makes the request URL unique, so any intermediate
+     cache must consult the origin server.
+
+  5. Bound the stale-retry loop. The reference example caps it at 3
+     consecutive retries; on exhaustion, raise `Client.Error` with a
+     message that mentions stale cached responses so operators can
+     distinguish this from a normal protocol error.
+
+  6. When a 200 response's handle matches an expired handle but the
+     client DOES have a valid local handle, ignore the stale response
+     entirely and continue polling. (PR #3866 alone leaves this path
+     incomplete in a corner case; full parity is achieved only with
+     follow-up PR #4027 which is OUT OF SCOPE for this task. The
+     verifier and rubric must not depend on the corner-case-correct
+     behavior.)
+
+Other valid implementations:
+
+  - Cache backed by `:persistent_term`, `Agent`, or `Cachex` instead
+    of an ETS-owning GenServer. Same observable read/write semantics.
+  - Cache key derived from the `ShapeDefinition.params/1` map plus
+    the endpoint URL, hashed to an opaque binary, instead of the
+    string-form canonical URL. Same mapping from "same shape" to
+    "same key".
+  - Stale-retry state stored on the `%Stream{}` struct or in the
+    cache module itself rather than on `%ShapeState{}`. Same
+    bounded-retry semantics.
+  - Different bounded-retry counts (3, 5, 10 — anything small).
+  - Cache-buster generation via UUID v4, monotonic time + nonce, or
+    other random bytes — anything that varies the URL across retries.
+
+Non-optimal "fixes" the rubric will reject:
+
+  - Re-issuing the request without changing the URL on stale
+    detection. The CDN keys on URL; the same URL gets the same cached
+    response. The fix must add some varying parameter (cache-buster
+    or equivalent) to force a cache miss.
+  - Unbounded retry on stale responses. Without an upper bound, a
+    misconfigured CDN turns the client into a permanent traffic
+    source. The fix must terminate within a small bounded number of
+    attempts.
+  - Tracking expired handles in an unbounded data structure. A
+    long-running client that observes many shape rotations would
+    eventually exhaust memory.
+  - Using a different parameter name than `expired_handle` /
+    `cache-buster`. These are protocol contracts shared with the
+    TypeScript client and the production server / CDN configuration.
+    A different name still works locally but breaks server-side
+    cache invalidation.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["elixir"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "framework-fluency", "logic-fix", "interface-design", "concurrency-reasoning", "test-execution", "build-tooling"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 289
+files = 6
+hunks = 12
+scope = "extensive"
+
+[metadata.origin]
+repo = "electric-sql/electric"
+pr_numbers = [3866]
+base_commit = "b17eac80804ee2f8ea1f1c78509b519f6ffc28c5"
+base_commit_date = "2026-02-18"
+merged_at = "2026-02-18"
+
+
+
+

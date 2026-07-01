@@ -1,0 +1,124 @@
+version = "1.0"
+
+[environment]
+base_image = "plausible-feat-shared-dashboard-deeplink:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1200.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "plausible"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "plausible"
+
+[metadata]
+family = "plausible-feat-shared-dashboard-deeplink"
+variant = "hard"
+segment = "design"
+repo = "plausible"
+tags = ["plausible", "elixir"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Allow deep linking into password-protected shared dashboards.
+
+Today, when someone clicks a deep link to a password-protected
+shared dashboard (a URL with a specific page segment under
+`/share/:domain/...` plus a filter query string), the password page
+works but authenticating drops them onto the dashboard root and
+loses the page segment they were trying to share. Make the
+post-authentication redirect land on the same deep path the
+original link pointed to, with the original query string preserved.
+"""
+context = """Shared dashboards live under `/share/:domain` and are served by
+`PlausibleWeb.StatsController.shared_link/2`. The router currently
+only matches the bare domain, so any URL that tries to add a
+deep-path segment under `/share/:domain/...` returns 404 before it
+reaches the controller.
+
+Password-protected links go through a challenge: the controller
+delegates to `render_password_protected_shared_link/2`, which
+renders `lib/plausible_web/templates/stats/shared_link_password.html.heex`.
+The template builds the form's `action` attribute from the request's
+query string. After a correct password POST, `authenticate_shared_link/2`
+redirects to `Routes.stats_path(conn, :shared_link, domain, auth: slug)`
+with the existing query string appended.
+
+The dashboard frontend (React) already supports rendering at deep
+paths under `/share/:domain/...`; the missing piece is purely
+backend routing + redirect plumbing.
+"""
+solution = """Reference example: broaden the router so `/share/:domain` accepts
+arbitrary trailing path segments, and plumb that captured path
+through the password challenge so the authenticate handler can
+build a redirect URL that lands on it.
+
+Treat the path the user actually visited as the trusted source for
+the redirect. A `return_to=...` query string supplied alongside the
+URL must NOT override the path — it could be tampered with by an
+attacker. Strip parent-directory `..` segments from the path before
+constructing the redirect, so the redirect cannot be steered out of
+the shared-link namespace.
+
+Valid alternatives we accept:
+- The mechanism for carrying the deep path from GET render to
+  POST authenticate is unspecified — a `return_to=...` fragment in
+  the password form's action URL, a hidden form field, or a
+  short-lived cookie are all fine. What matters is that the
+  post-auth redirect lands on the same path the user clicked.
+- The router parameter name (`*path`, `*subpath`, `*pages`, etc.)
+  and the query-string key carrying the path (`return_to`, `dest`,
+  `next`, etc.) are arbitrary.
+- Path-traversal cleanup can use any approach that produces a
+  redirect free of `..` segments — `Path.expand`-style normalization,
+  an explicit filter on split segments, or a regex sanity check are
+  all reasonable.
+- The bare-domain flow (no deep path) must keep redirecting back
+  inside the shared-link context — the redirect shape is allowed to
+  change slightly (e.g. an extra trailing slash) as long as the
+  followed redirect renders the dashboard.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["elixir"]
+runtime_dependence = "code-evident"
+skills = ["framework-fluency", "interface-design", "codebase-exploration", "security-reasoning"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 61
+files = 2
+hunks = 6
+scope = "broad"
+
+[metadata.origin]
+repo = "plausible/analytics"
+pr_numbers = [5954]
+base_commit = "114c8d9e1cedae3bc24f49113a7ba7eabd36005d"
+base_commit_date = "2026"
+merged_at = "2026"
+
+
+
+

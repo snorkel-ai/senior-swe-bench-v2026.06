@@ -1,0 +1,27 @@
+{
+  "files": [
+    "packages/sync-service/lib/electric/plug/serve_shape_plug.ex",
+    "packages/sync-service/lib/electric/admission_control.ex",
+    "packages/sync-service/lib/electric/shapes.ex"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "root_cause_identified",
+      "description": "The investigation write-up and diff identify the true root cause: admission control was choosing which concurrency pool to charge a request to based on the raw request offset value (treating offset=-1 as synonymous with 'creates a new shape') instead of on whether the requested shape actually already exists. The fix changes the classification so it is derived from real shape existence (e.g. by probing the shape subsystem for a registered shape matching the request) rather than from the offset. A write-up that only describes the permit-release refactor, retry-after jitter, or pool-limit tuning, without naming the offset-based classification as the defect, does NOT satisfy this."
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "no_request_handle_mutation",
+      "description": "The fix records the shape-existence signal in connection-local state (e.g. conn.private, a conn assign, or any equivalent per-request store) and does NOT overwrite the request's client-supplied handle to carry the classification. This avoids flipping downstream shape loading from the no-handle get-or-create path onto the strict-match resolve path, which could produce a spurious 409 refetch for a handle the client never sent when the shape is cleaned between the existence check and shape loading (a time-of-check/time-of-use hazard)."
+    },
+    {
+      "name": "ets_startup_race_resilience",
+      "description": "The shape-existence lookup tolerates the shape-cache startup race where the cache's backing ETS tables do not yet exist (which raises ArgumentError). The lookup handles that condition and defaults to treating the shape as new (the protective :initial classification) rather than crashing the request. Erring toward :initial is the safe direction."
+    },
+    {
+      "name": "permit_released_all_paths",
+      "description": "An admission permit acquired while serving a request is released on every exit path of the request pipeline — normal success, rejection/halt, and uncaught exception — so permits are not leaked under any outcome. This may be achieved via the pre-existing register_before_send callback, an after/ensure block, a process-dictionary mechanism, or any equivalent that covers all three paths."
+    }
+  ]
+}

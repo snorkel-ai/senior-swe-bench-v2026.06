@@ -1,0 +1,14 @@
+# Layout rationale:
+# - test_parent places the copied test inside the `better-auth`
+#   workspace project so vitest workspace mode runs it under that
+#   project's config and resolves the `better-auth` /
+#   `@better-auth/core` imports.
+# - config_dir = "" (repo root) so vitest finds the root workspace
+#   `vitest.config.ts`.
+# - timeout = 540s covers the first run's cold-start (vite transform +
+#   workspace config load) plus the test-setup.sh rebuild.
+
+[jest]
+runner = "vitest"
+test_parent = "packages/better-auth/src"
+timeout = 540

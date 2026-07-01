@@ -1,0 +1,20 @@
+{
+  "files": [
+    "nodejs/src/ingestion/event-preprocessing/",
+    "nodejs/src/utils/",
+    "nodejs/src/ingestion/analytics/post-team-preprocessing-subpipeline.ts",
+    "nodejs/src/ingestion/analytics/joined-ingestion-pipeline.ts",
+    "nodejs/src/ingestion/ingestion-consumer.ts"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "rubric_validator_mirrors_clickhouse_coercion_semantics",
+      "description": "The schema-validation logic correctly mirrors the property-type coercion rules already enforced elsewhere in the system (see posthog/hogql/transforms/property_types.py). For all five PostHog property types (String, Numeric, Boolean, DateTime, Object) the validator: rejects values that ClickHouse silently drops (Numeric: Infinity, -Infinity, NaN, the strings 'NaN'/'Infinity'/'-Infinity', empty/whitespace-only strings, booleans; Boolean: anything that is not exactly true/false or the lowercase strings 'true'/'false' — rejects 1/0, 'yes'/'no', 'TRUE'/'FALSE'); accepts safe values (numbers, numeric strings, booleans, ISO-8601 datetimes); treats null/undefined/missing as missing_required (not type_mismatch); accepts a value matching ANY of multiple configured types when a property appears in multiple property groups with disagreement; delegates DateTime parsing to the pre-existing isValidClickHouseDateTime helper rather than rolling its own; permits unknown property types (forward-compatibility). Naive implementations using `typeof v === 'number'` or `Boolean(v)` directly will fail this rubric."
+    },
+    {
+      "name": "rubric_manager_caches_per_team_with_lazy_loader",
+      "description": "The schema-lookup path between Postgres and the per-event hot path is cached on a per-team basis with a refresh window — there is some caching layer (LazyLoader from nodejs/src/utils/lazy-loader.ts is the natural primitive, but any equivalent in-memory cache with a TTL is acceptable) that prevents an event-rate Postgres query from firing for every ingested event. The exact TTL is not constrained. Naive implementations that issue a fresh SQL query per event, or that load all-team schemas into memory once and never refresh, fail this rubric."
+    }
+  ],
+  "pass_to_pass": []
+}

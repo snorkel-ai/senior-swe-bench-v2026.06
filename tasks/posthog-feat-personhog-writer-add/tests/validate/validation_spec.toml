@@ -1,0 +1,307 @@
+instructions = """
+All stories are black-box, end-to-end tests of the agent's `personhog-writer`
+service. They never import the service's code. Each story produces one or more
+`Person` protobuf messages onto the Kafka topic `personhog_updates`, then reads
+the resulting person state back through the pre-existing PersonHogReplica gRPC
+read API (the same API the rest of the persons pipeline uses).
+
+Postgres, the Kafka broker, the PersonHogReplica read API, and the compiled
+gRPC client are ALL started for you by validation-setup.sh. The writer itself
+is NOT started for you — you launch it (once) after discovering how it is
+configured (see "Discovery — configuring the writer" below).
+
+Import the harness first:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    from test_harness import (
+        ensure_writer_running,   # launch the writer with the config you discovered
+        produce,                 # produce(team_id, person_id, version, uuid_str=None, properties=None)
+        cleanup_team,            # cleanup_team(team_id) — delete rows before a case
+        preinsert_null_version,  # preinsert_null_version(team_id, person_id) — direct row, version=NULL
+        get_person,              # get_person(team_id, person_id) -> dict | None (version, properties, ...)
+        get_version,             # get_version(team_id, person_id) -> int | None
+        get_properties,          # get_properties(team_id, person_id) -> dict | None
+        wait_for_person,         # wait_for_person(team_id, person_id, timeout=30) -> bool
+        wait_for_version,        # wait_for_version(team_id, person_id, expected_version, timeout=30) -> int | None
+        settle,                  # settle(seconds=6.0) — wait out an ignored/skipped update
+        oversized_props,         # oversized_props(email_value, big_key, size) -> dict (> the size limit, trimmable)
+        untrimmable_props,       # untrimmable_props(protected_key, size) -> dict (> the size limit, not trimmable)
+    )
+
+Notes on the helpers:
+  * `produce(...)` defaults to a valid, deterministic UUID and `properties={}`.
+    Pass `uuid_str="not-a-valid-uuid"` to send a record with an invalid
+    identifier. Pass `properties=<dict>` to send a specific JSON properties blob.
+  * Reads go through the gRPC read API: `get_person` / `get_version` /
+    `get_properties` address a person by `(team_id, person_id)` and return its
+    PERSISTED state (or None if no such person is stored). Poll with
+    `wait_for_person` / `wait_for_version` (they retry ~30s, covering the flush
+    interval and write latency). Use `settle(...)` before asserting that a
+    record was NOT stored (there is no positive state change to poll for).
+  * Always `cleanup_team(team_id)` at the start of a case so re-runs are clean.
+  * `get_person(...)["properties"]` is the persisted properties as a dict.
+
+## Discovery — configuring the writer (do NOT guess; read the source)
+
+The writer is configured entirely through environment variables, and it reads
+them under names IT chooses. Before producing in a story, you must launch the
+writer with two settings discovered from its own source under
+`/repo/posthog/rust/personhog-writer/src/`:
+
+1. The env var that selects WHICH persistence target the writer writes to. The
+   read API serves the canonical persons store, so the writer must be pointed at
+   that store — the table named `posthog_person`. Read the writer's config to
+   find the env var that selects the target table.
+2. The env var (and the time UNIT it expects) that controls the periodic
+   timer-flush interval. Set it SHORT (≈1 second) so small batches land within
+   the read poll windows. Read the writer's config to find this env var and
+   whether its unit is milliseconds or seconds.
+
+Read the writer's config source ONCE to determine both, then call:
+
+    ensure_writer_running({"<TARGET_TABLE_ENV>": "posthog_person",
+                           "<FLUSH_INTERVAL_ENV>": "<short value in the right unit>"})
+
+`ensure_writer_running` is idempotent across stories — the first call launches
+the writer; later calls return immediately. Call it at the start of every story
+before you produce.
+
+Reference example of the shape (NOT necessarily the names this implementation
+uses — read the source): a target-table var like `PG_TARGET_TABLE=posthog_person`
+and a flush var like `FLUSH_INTERVAL_MS=1000`. Other defensible choices a writer
+might use include a seconds-unit var such as `FLUSH_INTERVAL_SECS=1`, or a
+differently-named target-table var. Use whichever names/units the writer
+actually reads. Do not enumerate candidate names against the running service —
+read the config.
+
+You only produce messages and read state.
+"""
+
+[settings]
+va_max_turns = 80
+va_timeout_sec = 2400
+script_timeout_sec = 1200
+
+[settings.pytest]
+python = "python3"
+
+
+# =============================================================================
+# Story 1 — a person update is durably persisted and reads back correctly
+# =============================================================================
+[[story]]
+id = "persist_and_read_back"
+driver = "pytest"
+description = """
+A person-state update published to the topic is durably persisted: after it's
+sent, the person can be read back with the same identity, the version it
+carried, and the properties it included.
+"""
+procedure = """
+1. Launch the writer per the "Discovery — configuring the writer" section:
+   `ensure_writer_running({...})` with the target-table and flush-interval env
+   vars you discovered from the writer's source.
+2. `cleanup_team(inputs["team_id"])`.
+3. Produce one Person carrying a `version` and a properties blob with a known
+   `email`:
+   `produce(inputs["team_id"], inputs["person_id"], inputs["version"],
+            properties={"email": inputs["email_value"]})`.
+4. Wait for it to be persisted:
+   `assert wait_for_person(inputs["team_id"], inputs["person_id"])`.
+5. Read it back through the read API:
+   `person = get_person(inputs["team_id"], inputs["person_id"])`;
+   `stored_version = person["version"]`;
+   `email_value = (person["properties"] or {}).get("email", "absent")`.
+
+- EXPECTED: `stored_version` equals `expected["stored_version"]` (the persisted
+  version matches the one that was sent).
+- EXPECTED: `email_value` equals `expected["email_value"]` (the properties were
+  persisted and read back intact).
+
+Return `{"stored_version": stored_version, "email_value": email_value}`.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+team_id = 99010
+person_id = 42
+version = 1
+email_value = "alice@example.com"
+[story.test_case.expected]
+stored_version = 1
+email_value = "alice@example.com"
+
+[[story.test_case]]
+[story.test_case.inputs]
+team_id = 99011
+person_id = 7
+version = 4
+email_value = "bob@example.org"
+[story.test_case.expected]
+stored_version = 4
+email_value = "bob@example.org"
+
+
+# =============================================================================
+# Story 2 — a person converges to the latest version (no rollback on replay)
+# =============================================================================
+[[story]]
+id = "converges_to_latest"
+driver = "pytest"
+description = "When several updates for the same person arrive close together, the persisted person collapses to a single row at the latest version, and a later arriving older update (a replay or out-of-order redelivery) never rolls the person back to an earlier state."
+procedure = """
+1. Launch the writer (`ensure_writer_running({...})` with the discovered config).
+2. `cleanup_team(inputs["team_id"])`.
+3. If `inputs["preinsert_null"]` is true, create a pre-existing person row whose
+   stored version is unset before any update arrives:
+   `preinsert_null_version(inputs["team_id"], inputs["person_id"])`.
+4. Produce one update per version in `inputs["versions"]`, in the given order,
+   all for the same person, each with distinct properties so they are genuinely
+   different updates:
+   `for v in inputs["versions"]: produce(inputs["team_id"], inputs["person_id"], v, properties={"v": str(v)})`.
+5. Wait for the person to reach the newest version sent:
+   `top = max(inputs["versions"])`;
+   `wait_for_version(inputs["team_id"], inputs["person_id"], top)`.
+6. If `inputs["stale_version"]` is greater than 0, produce a later-arriving
+   OLDER update and give it time to be (correctly) ignored:
+   `produce(inputs["team_id"], inputs["person_id"], inputs["stale_version"], properties={"v": "stale"})`;
+   `settle()`.
+7. Read the final persisted version:
+   `final_version = get_version(inputs["team_id"], inputs["person_id"])`.
+
+- EXPECTED: `final_version` equals `expected["final_version"]` (the persisted
+  version is the newest one sent; out-of-order and replayed older updates do not
+  change it, and an update applied over an unset version still takes effect).
+
+Return `{"final_version": final_version}`.
+"""
+
+[[story.test_case]]
+# A burst of updates for one person collapses to a single row at the latest version.
+[story.test_case.inputs]
+team_id = 99020
+person_id = 1
+versions = [1, 2, 3, 4, 5]
+preinsert_null = false
+stale_version = 0
+[story.test_case.expected]
+final_version = 5
+
+[[story.test_case]]
+# A later-arriving older update (replay) must not roll the person back.
+[story.test_case.inputs]
+team_id = 99021
+person_id = 1
+versions = [5]
+preinsert_null = false
+stale_version = 2
+[story.test_case.expected]
+final_version = 5
+
+[[story.test_case]]
+# A versioned update applies over a pre-existing person whose version is unset.
+[story.test_case.inputs]
+team_id = 99022
+person_id = 1
+versions = [7]
+preinsert_null = true
+stale_version = 0
+[story.test_case.expected]
+final_version = 7
+
+
+# =============================================================================
+# Story 3 — bad records don't sink the batch or stall the pipeline
+# =============================================================================
+[[story]]
+id = "resilient_to_bad_records"
+driver = "pytest"
+description = "A record the writer cannot store does not prevent the other records in the same batch from being persisted and it does not stall the pipeline. Valid person updates sent alongside or after it are still persisted and readable."
+procedure = """
+1. Launch the writer (`ensure_writer_running({...})` with the discovered config).
+2. `cleanup_team(inputs["team_id"])`.
+3. Produce a single burst (close together so they share a flush window):
+   a. Valid persons, each with a known email:
+      `for pid in inputs["valid_ids"]: produce(inputs["team_id"], pid, 1, properties={"email": f"v{pid}@ex.com"})`.
+   b. A person whose properties exceed the store's size limit but carry a small
+      protected `email` alongside one large non-essential key:
+      `produce(inputs["team_id"], inputs["trimmable_id"], 1,
+               properties=oversized_props(inputs["email_value"], inputs["big_key"], inputs["big_size"]))`.
+   c. A record with an invalid identifier:
+      `produce(inputs["team_id"], inputs["poison_id"], 1, uuid_str="not-a-valid-uuid")`.
+   d. A person whose oversized properties consist only of a protected key, so
+      they cannot be reduced under the limit:
+      `produce(inputs["team_id"], inputs["untrimmable_id"], 1,
+               properties=untrimmable_props("email", inputs["big_size"]))`.
+   e. A record whose team id is far too large for the store's team-id column:
+      `produce(inputs["oversized_team_id"], 1, 1)`.
+4. After the burst, produce one more ordinary valid person (liveness check that
+   the pipeline kept consuming):
+   `produce(inputs["team_id"], inputs["late_id"], 1, properties={"email": "late@ex.com"})`.
+5. Wait for the records that SHOULD be persisted, then settle so any record that
+   must be dropped has had its chance to (wrongly) appear:
+   `for pid in inputs["valid_ids"]: wait_for_person(inputs["team_id"], pid)`;
+   `wait_for_person(inputs["team_id"], inputs["trimmable_id"])`;
+   `wait_for_person(inputs["team_id"], inputs["late_id"])`; `settle()`.
+6. Compute observables (all via the read API):
+   - `valid_present = sum(1 for pid in inputs["valid_ids"] if get_person(inputs["team_id"], pid) is not None)`.
+   - `late_present = 1 if get_person(inputs["team_id"], inputs["late_id"]) is not None else 0`.
+   - `tp = get_person(inputs["team_id"], inputs["trimmable_id"])`;
+     `tprops = (tp or {}).get("properties") or {}`;
+     `trimmable_email = tprops.get("email", "absent")`;
+     `trimmable_big_present = 1 if inputs["big_key"] in tprops else 0`.
+   - `poison_present = 1 if get_person(inputs["team_id"], inputs["poison_id"]) is not None else 0`.
+   - `untrimmable_present = 1 if get_person(inputs["team_id"], inputs["untrimmable_id"]) is not None else 0`.
+
+- EXPECTED: `valid_present` equals `expected["valid_present"]` (every plain valid record persisted).
+- EXPECTED: `late_present` equals `expected["late_present"]` (the record sent AFTER the bad ones still landed — the pipeline did not stall).
+- EXPECTED: `trimmable_email` equals `expected["trimmable_email"]` (the oversized-but-reducible person was persisted with its protected key intact).
+- EXPECTED: `trimmable_big_present` equals `expected["trimmable_big_present"]` (its bulky non-essential key was dropped to fit the limit).
+- EXPECTED: `poison_present` equals `expected["poison_present"]` (the record with an invalid identifier was not stored).
+- EXPECTED: `untrimmable_present` equals `expected["untrimmable_present"]` (the irreducibly-oversized record was not stored).
+
+Return `{"valid_present": valid_present, "late_present": late_present,
+         "trimmable_email": trimmable_email, "trimmable_big_present": trimmable_big_present,
+         "poison_present": poison_present, "untrimmable_present": untrimmable_present}`.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+team_id = 99030
+valid_ids = [1, 2]
+trimmable_id = 3
+poison_id = 4
+untrimmable_id = 5
+late_id = 6
+oversized_team_id = 3000000000
+email_value = "carol@example.com"
+big_key = "zzz_big"
+big_size = 700000
+[story.test_case.expected]
+valid_present = 2
+late_present = 1
+trimmable_email = "carol@example.com"
+trimmable_big_present = 0
+poison_present = 0
+untrimmable_present = 0
+
+[[story.test_case]]
+[story.test_case.inputs]
+team_id = 99031
+valid_ids = [10, 20, 30]
+trimmable_id = 11
+poison_id = 12
+untrimmable_id = 13
+late_id = 14
+oversized_team_id = 2147483648
+email_value = "dave@example.io"
+big_key = "mmm_big"
+big_size = 760000
+[story.test_case.expected]
+valid_present = 3
+late_present = 1
+trimmable_email = "dave@example.io"
+trimmable_big_present = 0
+poison_present = 0
+untrimmable_present = 0

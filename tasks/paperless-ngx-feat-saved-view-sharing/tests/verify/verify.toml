@@ -1,0 +1,8 @@
+# Verifier runner config.
+#
+# A single shell verifier (verify.sh) wraps `uv run pytest` to execute
+# pytest inside paperless-ngx's uv-managed venv. Django setup happens
+# inside the test file (savedview_field_check.py).
+
+[shell]
+timeout = 180

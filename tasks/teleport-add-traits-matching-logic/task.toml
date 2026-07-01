@@ -1,0 +1,133 @@
+version = "1.0"
+
+[environment]
+base_image = "teleport-add-traits-matching-logic:latest"
+build_timeout_sec = 1500.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 900.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "teleport"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "teleport"
+
+[metadata]
+family = "teleport-add-traits-matching-logic"
+variant = "hard"
+segment = "design"
+repo = "teleport"
+tags = ["teleport", "go"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Teleport's user listing needs trait-aware filtering. The UserFilter
+used by the ListUsers API must support a new traits-based matcher: when
+the filter carries a set of required traits, only users whose traits
+contain all of the requested keys and values are returned. In addition,
+the existing free-text user search (SearchKeywords) must be widened so
+that a keyword also matches against a user's trait keys and trait
+values, not just their labels, name, and roles. This lets an operator
+list users by an external identity attribute (for example, finding the
+Teleport user whose `logins` trait carries a particular Slack-derived
+email).
+"""
+context = """The protobuf data model already exists: the UserFilter.Traits field is
+present in the generated code (api/types/types.pb.go) and the .proto
+source. The agent must NOT run protoc — the generated plumbing is
+provided. The work is to build the Go matching behaviour around that
+model.
+
+The pre-existing ListUsers path already applies UserFilter.Match to
+each candidate user (lib/services/local/users.go), and Match already
+delegates the SearchKeywords case to UserV2.MatchSearch. No new wiring
+between layers is required: implementing the matching behaviour on the
+api/types user model is sufficient for the gRPC ListUsers endpoint to
+honour the new filter.
+
+Senior-expertise nuances:
+- The traits matcher is conjunctive across keys AND across values: a
+  user matches only if, for every requested key, the user has that
+  trait key and the user's values for that key include EVERY requested
+  value (subset-of-user semantics, not mere intersection).
+- A user with no traits at all never matches a non-empty traits filter.
+- An empty / nil traits filter is vacuously satisfied (matches every
+  user), consistent with how the other UserFilter fields behave.
+- The widened search must additionally consider trait keys and trait
+  values while preserving the existing matches against labels, name,
+  and roles — none of the previously matched fields may regress.
+- The search keeps its case-insensitive, substring matching behaviour.
+
+Reproduction path: every behaviour is observable through the
+pre-existing UserFilter.Match / UserV2.MatchSearch surface on the
+api/types user model, and end-to-end through the gRPC ListUsers
+endpoint, which filters via UserFilter.Match.
+"""
+solution = """Reference example (the agent may structure this differently):
+- api/types/user.go: in UserFilter.Match, add a branch that, when the
+  filter's Traits are non-empty, rejects any user that does not match
+  those traits. Implement the traits matcher (the reference adds a
+  UserV2.MatchTraits method): for each requested key, look up the
+  user's values for that key and require that they contain every
+  requested value; a user with nil traits fails. Widen
+  UserV2.MatchSearch so that, in addition to labels, name, and roles, a
+  search keyword also matches a trait key or any trait value, using the
+  same case-insensitive substring comparison.
+- api/utils/slices.go: the reference adds a small generic helper
+  (ContainsAll) that reports whether a slice contains all elements of
+  another slice; the agent may inline this instead.
+
+Likely shortcuts to guard against:
+- Implementing the traits matcher as an intersection ("any value
+  matches") instead of the required "all requested values present".
+- Letting a non-empty traits filter match a user that has no traits.
+- Treating an empty traits filter as rejecting everyone instead of
+  matching everyone.
+- Widening search for trait values but forgetting trait keys (or vice
+  versa).
+- Regressing the existing label / name / role search while rewriting
+  MatchSearch.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["go"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "interface-design", "api-contract-design", "data-model-design", "framework-fluency", "cross-service-reasoning"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 59
+files = 2
+hunks = 4
+scope = "broad"
+
+[metadata.origin]
+repo = "gravitational/teleport"
+pr_numbers = [66020]
+base_commit = "cd592ffddc75b0bd80ea48a04d2e70bcbc1f55a0"
+base_commit_date = "2026-04-22"
+merged_at = "2026-05-06"
+
+
+
+

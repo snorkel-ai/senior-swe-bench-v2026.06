@@ -1,0 +1,14 @@
+# Verifier runner config.
+#
+# The verifier (verify.py) must run inside paperless-ngx's uv-managed venv
+# (which contains Django, DRF, and paperless's own packages). We invoke
+# pytest via the venv's interpreter directly (not via `uv run`) so the
+# python runner's subprocess kill on timeout is a clean single-process kill
+# with no orphaned children holding resources.
+#
+# Only verify.py is shipped (no verify*.sh), so only the python runner fires
+# — there is no double-run.
+
+[pytest]
+command = "/repo/paperless-ngx/.venv/bin/python -m pytest"
+timeout = 240

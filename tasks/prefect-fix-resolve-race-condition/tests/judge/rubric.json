@@ -1,0 +1,26 @@
+{
+  "files": [
+    "src/prefect/server/events/triggers.py",
+    "src/prefect/server/events/models/composite_trigger_child_firing.py"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "serializes_concurrent_compound_trigger_evaluation",
+      "description": "The fix uses a real concurrency primitive (PostgreSQL advisory lock, SELECT FOR UPDATE row lock, DELETE...RETURNING / UPDATE...RETURNING atomic claim, unique-index idempotency key, application-layer mutex, or an equivalent serialization or arbitration mechanism) to prevent concurrent evaluations of the SAME compound trigger from racing. Retry-with-backoff, sleep-based throttling, or catch-and-discard fixes do NOT count. Both the never-fire and double-fire failure modes must be addressed."
+    },
+    {
+      "name": "atomic_claim_on_clearing_firings",
+      "description": "The decision to fire the parent compound trigger is gated on an atomic claim of the child firings — only the worker that wins the race proceeds to invoke the parent action. A worker that loses the race aborts without invoking the parent. Implementations that rely on optimistic 'check then delete' without an atomic returning/locking step are insufficient."
+    },
+    {
+      "name": "fix_addresses_both_failure_modes",
+      "description": "The fix addresses BOTH observable failure modes — never-fire (parent compound trigger never fires when child firings race in separate transactions) AND double-fire (parent fires twice when both workers see all firings before either deletes). Fixes that close one race but leave the other open do not satisfy this criterion."
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "preserves_single_child_compound_trigger_semantics",
+      "description": "Non-concurrent compound-trigger evaluation still works correctly. Single-child shortcuts (num_expected_firings == 1) and standard non-concurrent multi-child evaluation continue to fire the parent exactly once with the same trigger_states and triggering_firings semantics as before."
+    }
+  ]
+}

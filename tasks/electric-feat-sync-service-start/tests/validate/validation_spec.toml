@@ -1,0 +1,457 @@
+instructions = """
+ExUnit tests run from `packages/sync-service` (the mix app). The
+project's `elixirc_paths(:test)` setting compiles everything under
+`packages/sync-service/test/support/` into the test environment, so
+you can use `Support.ComponentSetup`, `Support.DbSetup`, and
+`Support.TestUtils` from your test files.
+
+For tests that allocate a `tmp_dir`, declare `@moduletag :tmp_dir`.
+
+Use `async: false`. These tests use `with_unique_db` (which is
+async-safe by design) but they also manipulate the per-stack
+supervision tree and the connection-manager named processes;
+running them serially is the safer default.
+
+Aliases that are useful in every story:
+
+    alias Electric.Connection
+    alias Electric.Connection.Manager
+    alias Electric.StatusMonitor
+    import Support.ComponentSetup
+    import Support.DbSetup
+
+Setup chain that mirrors the canonical `manager_test.exs`:
+
+    @moduletag :tmp_dir
+
+    setup [
+      :with_unique_db,
+      :with_stack_id_from_test,
+      :with_status_monitor,
+      :with_persistent_kv,
+      :with_inspector,
+      :with_slot_name,
+      :with_in_memory_storage,
+      :with_shape_status
+    ]
+
+The pre-existing test file
+`packages/sync-service/test/electric/connection/manager_test.exs`
+has a private helper `start_connection_manager(ctx)` (~lines 25-76)
+that wires up the full connection-manager supervision tree using
+fixtures provided by the setup chain. Re-define an equivalent helper
+inline in your test module if the procedure asks for it. The helper
+also subscribes the test process to stack events via
+`Registry.register(stack_events_registry, {:stack_status, stack_id}, nil)`
+so `assert_receive {:stack_status, _, :waiting_for_connection_lock}, 5000`
+works.
+
+The `wait_for_pg_backend_pid/2` helper used by the canonical tests is
+also private to `manager_test.exs`; re-define it inline:
+
+    defp wait_for_pg_backend_pid(manager_pid, attempts \\\\ 100) do
+      state = :sys.get_state(manager_pid)
+      if is_nil(state.replication_pg_backend_pid) and attempts > 0 do
+        Process.sleep(10)
+        wait_for_pg_backend_pid(manager_pid, attempts - 1)
+      else
+        state
+      end
+    end
+
+This polls until the manager has captured the replication client's
+backend pid (set when `pg_info_obtained` arrives, ~line 700-720 of
+`lib/electric/connection/manager.ex`).
+
+`ctx.db_conn` from `Support.DbSetup.with_unique_db/1` is a Postgrex
+pool — you can run any `pg_*` setup query against it directly:
+
+    Postgrex.query!(ctx.db_conn, "SELECT pg_create_logical_replication_slot('#{ctx.slot_name}', 'pgoutput')", [])
+
+`ctx.slot_name` is a deterministic, hashed-and-truncated slot name
+derived from the test name (so two tests in the same module don't
+collide).
+
+The connection manager's lock-breaker check normally runs on a
+periodic timer. Tests trigger it on demand by cancelling the timer
+and synthesising the timeout message:
+
+    manager_pid = GenServer.whereis(Connection.Manager.name(ctx.stack_id))
+    %{replication_lock_timer: tref} = wait_for_pg_backend_pid(manager_pid)
+    :erlang.cancel_timer(tref)
+    send(manager_pid, {:timeout, tref, {:check_status, :replication_lock}})
+
+The implementation may expose its lock-breaker SQL via a public or
+`@doc false` function on `Electric.Connection.Manager` (e.g.
+`Connection.Manager.lock_breaker_query/3`), or it may keep the SQL
+private. If you need the SQL string in a story, FIRST read
+`packages/sync-service/lib/electric/connection/manager.ex` to find
+out how the implementation exposes it. If no public function is
+available, recompose the query inline — the canonical pattern is:
+
+    WITH inactive_slots AS (
+      SELECT slot_name FROM pg_replication_slots
+      WHERE active = false AND database = $database AND slot_name = $lock_name
+    ),
+    stuck_backends AS (
+      SELECT pid FROM pg_locks, inactive_slots
+      WHERE hashtext(slot_name) = (classid::bigint << 32) | objid::bigint
+        AND locktype = 'advisory'
+        AND objsubid = 1
+        AND database = (SELECT oid FROM pg_database WHERE datname = $database)
+        AND granted
+        AND pid != $excluded_pid
+    )
+    SELECT pg_terminate_backend(pid) FROM stuck_backends;
+
+(Substitute `$database`, `$lock_name`, `$excluded_pid` literally
+into the SQL — they're string-quoted, not parameter-bound. Use
+`Electric.Utils.quote_string/1` for the `$lock_name` and
+`$database` substitutions to match the implementation's escaping.)
+
+IMPORTANT — write efficiency: do NOT search the repository for usage
+examples of `ExUnit.CaptureLog`, `Postgrex.query`, etc. — these are
+stdlib / well-known surfaces. Follow the procedure directly and
+write the test file immediately. The procedure tells you everything
+you need.
+"""
+
+[settings]
+script_timeout_sec = 600
+
+# ---------------------------------------------------------------------
+# Story 1: admin pool is alive while waiting for the advisory lock
+#   — strong discriminator: pre-implementation has no admin pool
+#     during the lock-wait phase.
+# ---------------------------------------------------------------------
+[[story]]
+id = "admin_pool_alive_during_lock_wait"
+driver = "mix-test"
+mix_app = "packages/sync-service"
+description = "While the connection manager is waiting for the advisory lock, the admin connection pool should already be up and serving queries. A caller that asks the connection manager for the admin pool's name during the lock-waiting phase gets back a registered, queryable pool."
+procedure = """
+Use the canonical setup chain (see top-level instructions).
+
+Define a private `start_connection_manager/1` helper that mirrors
+the one at lines 25-76 of
+`packages/sync-service/test/electric/connection/manager_test.exs`.
+It must:
+- build `connection_opts`, `replication_opts`, `connection_manager_opts`
+  from the fixtures (`ctx.stack_id`, `ctx.slot_name`, `ctx.db_config`,
+  `ctx.persistent_kv`, `ctx.inspector`),
+- start the supervision tree with
+  `start_link_supervised!({Electric.CoreSupervisor, ...}, significant: false)`,
+- subscribe the test process to stack events via
+  `Registry.register(Electric.stack_events_registry(), {:stack_status, ctx.stack_id}, nil)`,
+- return a context map with `connection_opts` and `replication_opts`.
+
+For each test case:
+- Spawn a separate Task that grabs the advisory lock from a separate
+  Postgres connection so the manager will stall waiting for it:
+    test_pid = self()
+    start_supervised!({
+      Task,
+      fn ->
+        DBConnection.run(ctx.db_conn, fn conn ->
+          Postgrex.query!(
+            conn,
+            "SELECT pg_advisory_lock(hashtext('#{ctx.slot_name}'))",
+            []
+          )
+          send(test_pid, :lock_held)
+          Process.sleep(:infinity)
+        end)
+      end
+    })
+    assert_receive :lock_held
+
+- Start the connection manager:
+    start_connection_manager(ctx)
+
+- Wait for the manager to enter the lock-waiting phase:
+    assert_receive {:stack_status, _, :waiting_for_connection_lock}, 5000
+
+- Look up the admin pool by its registered name and check it is alive:
+    admin_pool_name = Connection.Manager.admin_pool(ctx.stack_id)
+
+    pool_pid =
+      case GenServer.whereis(admin_pool_name) do
+        pid when is_pid(pid) -> pid
+        _ -> nil
+      end
+
+  - EXPECTED: if `pool_pid` is a pid, return `expected["admin_pool_status"] == "alive"`,
+    otherwise return `"missing"`. The test assertion is
+    `assert pool_pid != nil` followed by
+    `assert pool_pid_alive == expected["admin_pool_status"]`.
+
+- Run the configured query against the admin pool:
+    {:ok, %Postgrex.Result{rows: rows, num_rows: num_rows}} =
+      Postgrex.query(admin_pool_name, inputs["query"], [])
+
+  - EXPECTED: assert `num_rows == expected["query_row_count"]`.
+  - EXPECTED: assert `hd(hd(rows)) == expected["query_first_value"]` — the first column of the first row (e.g. for `SELECT 1` the value is the integer `1`).
+
+The discriminator is whether `Connection.Manager.admin_pool(stack_id)`
+resolves to a live pool while the manager is still in
+`:waiting_for_connection_lock`. An implementation that only stands
+up the admin pool after lock acquisition will fail the
+`assert pool_pid != nil` step before any query runs.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+query = "SELECT 1"
+[story.test_case.expected]
+admin_pool_status = "alive"
+query_row_count = 1
+query_first_value = 1
+
+[[story.test_case]]
+[story.test_case.inputs]
+query = "SELECT 42 AS answer"
+[story.test_case.expected]
+admin_pool_status = "alive"
+query_row_count = 1
+query_first_value = 42
+
+# ---------------------------------------------------------------------
+# Story 2: the lock-breaker recovery still frees an abandoned lock
+#   — pass-to-pass guard: the SQL semantics are unchanged across
+#     implementations.
+# ---------------------------------------------------------------------
+[[story]]
+id = "lock_breaker_frees_abandoned_lock"
+driver = "mix-test"
+mix_app = "packages/sync-service"
+description = "When the advisory lock is held by an abandoned session whose replication slot is inactive, the connection manager's lock-breaker recovery detects the inactive slot, terminates the holding backend, and the replication client then acquires the lock and proceeds. The breaker behavior must be preserved end-to-end (from the caller's view, the lock-acquisition event eventually fires)."
+procedure = """
+Use the canonical setup chain (see top-level instructions). Reuse the
+`start_connection_manager/1` and `wait_for_pg_backend_pid/2` helpers
+from story 1.
+
+For each test case:
+
+- Pre-create the replication slot named by `ctx.slot_name`. The
+  `slot_kind` input picks logical vs (logical, but with a different
+  output plugin) — both produce an inactive-slot row in
+  `pg_replication_slots` matching the lock name:
+
+    case inputs["slot_kind"] do
+      "logical" ->
+        Postgrex.query!(
+          ctx.db_conn,
+          "SELECT pg_create_logical_replication_slot('#{ctx.slot_name}', 'pgoutput')",
+          []
+        )
+
+      "logical_test_decoding" ->
+        Postgrex.query!(
+          ctx.db_conn,
+          "SELECT pg_create_logical_replication_slot('#{ctx.slot_name}', 'test_decoding')",
+          []
+        )
+    end
+
+- Create a dedicated lock-holder connection for the advisory lock
+  task. Do NOT use `ctx.db_conn` here: `pg_terminate_backend` will
+  kill that backend's Postgres connection, and `ctx.db_conn`
+  (pool_size: 1) will then be unavailable for the lock-status query
+  at the end of the test. Start a fresh connection instead:
+
+    {:ok, lock_conn} = Postgrex.start_link(ctx.db_config)
+
+  Hold the advisory lock via `lock_conn` so the manager stalls in
+  `:acquiring_lock`. Wait for the `:lock_held` confirmation:
+
+    test_pid = self()
+
+    start_supervised!({
+      Task,
+      fn ->
+        DBConnection.run(lock_conn, fn conn ->
+          Postgrex.query!(conn, "SELECT pg_advisory_lock(hashtext('#{slot_name}'))", [])
+          send(test_pid, :lock_held)
+          Process.sleep(:infinity)
+        end)
+      end
+    })
+
+    assert_receive :lock_held
+
+- Start the connection manager:
+    start_connection_manager(ctx)
+
+- Wait for the manager to reach the lock-waiting phase:
+    assert_receive {:stack_status, _, :waiting_for_connection_lock}, 5000
+
+- Trigger the lock-breaker check on demand (the manager only runs
+  the breaker on a periodic timer, so cancel the timer and
+  synthesise the timeout):
+    manager_pid = GenServer.whereis(Connection.Manager.name(ctx.stack_id))
+    %{replication_lock_timer: tref} = wait_for_pg_backend_pid(manager_pid)
+    :erlang.cancel_timer(tref)
+    send(manager_pid, {:timeout, tref, {:check_status, :replication_lock}})
+
+- Wait for the lock-acquired event and capture the final stack-status
+  string within the timeout:
+    assert_receive {:stack_status, _, status_atom}, 5000
+    final_event = Atom.to_string(status_atom)
+
+  - EXPECTED: assert `final_event == expected["final_event"]`.
+
+- Confirm the lock is no longer held by querying `pg_locks`:
+    %Postgrex.Result{rows: lock_rows} =
+      Postgrex.query!(
+        ctx.db_conn,
+        "SELECT pid FROM pg_locks WHERE objid::bigint = hashtext($1) AND locktype = 'advisory' AND granted",
+        [ctx.slot_name]
+      )
+
+  Filter `lock_rows` to exclude the manager's own pid (the manager
+  may now hold the lock itself). Whether any non-manager backend
+  still holds the lock determines the `lock_status`:
+
+    lock_status =
+      if length(lock_rows) <= 1, do: "freed", else: "still_held"
+
+  - EXPECTED: assert `lock_status == expected["lock_status"]`.
+
+In a correctly implemented manager the lock-acquired event fires
+within the timeout regardless of which strategy the implementation
+uses to break the lock, because the lock-breaker SQL is functionally
+unchanged — what varies is the routing (a separate process opening
+its own connection, vs the existing admin pool).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+slot_kind = "logical"
+[story.test_case.expected]
+final_event = "connection_lock_acquired"
+lock_status = "freed"
+
+[[story.test_case]]
+[story.test_case.inputs]
+slot_kind = "logical_test_decoding"
+[story.test_case.expected]
+final_event = "connection_lock_acquired"
+lock_status = "freed"
+
+# ---------------------------------------------------------------------
+# Story 3: the lock-breaker recovery does NOT terminate an active
+# replication client
+#   — pass-to-pass guard: with an active slot, no backends should be
+#     killed and the replication client must survive.
+# ---------------------------------------------------------------------
+[[story]]
+id = "lock_breaker_preserves_active_replication"
+driver = "mix-test"
+mix_app = "packages/sync-service"
+description = "With an active replication slot in place (i.e. slot is not abandoned) the lock-breaker recovery shouldn't terminate the backend holding the lock. So when the lock-breaker recovery runs while a real replication client holds the lock and its slot is active, the holding backend is not terminated and the replication client process is still alive."
+procedure = """
+Use the canonical setup chain (see top-level instructions).
+
+For each test case, do NOT pre-create an inactive slot — instead,
+start a real replication client that will create-and-activate the
+slot itself:
+
+    {:ok, replication_client_pid} =
+      start_supervised(
+        {Electric.Postgres.ReplicationClient,
+         stack_id: ctx.stack_id,
+         replication_opts: [
+           connection_opts: ctx.db_config,
+           stack_id: ctx.stack_id,
+           publication_name: "test_pub_#{:erlang.phash2(ctx.stack_id)}",
+           try_creating_publication?: true,
+           slot_name: ctx.slot_name,
+           handle_event: nil,
+           connection_manager: self()
+         ]}
+      )
+
+    assert_receive {:"$gen_cast", :replication_client_lock_acquired}, 5000
+    assert_receive {:"$gen_cast", {:pg_info_obtained, %{pg_backend_pid: backend_pid}}}
+
+    replication_client_monitor = Process.monitor(replication_client_pid)
+
+Now run the lock-breaker query directly via a Postgres connection,
+passing the replication client's `backend_pid` for exclusion. Read
+`packages/sync-service/lib/electric/connection/manager.ex` first to
+discover whether the implementation exposes a `lock_breaker_query/3`
+(or similarly named) function:
+
+    database = ctx.db_config[:database]
+
+    query =
+      if function_exported?(Connection.Manager, :lock_breaker_query, 3) do
+        Connection.Manager.lock_breaker_query(ctx.slot_name, backend_pid, database)
+      else
+        # Recompose the canonical query (see top-level instructions).
+        # quote_string/1 escapes the SQL literals.
+        import Electric.Utils, only: [quote_string: 1]
+        \"\"\"
+        WITH inactive_slots AS (
+          SELECT slot_name
+          FROM pg_replication_slots
+          WHERE active = false
+            AND database = #{quote_string(database)}
+            AND slot_name = #{quote_string(ctx.slot_name)}
+        ),
+        stuck_backends AS (
+          SELECT pid
+          FROM pg_locks, inactive_slots
+          WHERE hashtext(slot_name) = (classid::bigint << 32) | objid::bigint
+            AND locktype = 'advisory'
+            AND objsubid = 1
+            AND database = (SELECT oid FROM pg_database WHERE datname = #{quote_string(database)})
+            AND granted
+            AND pid != #{backend_pid}
+        )
+        SELECT pg_terminate_backend(pid) FROM stuck_backends;
+        \"\"\"
+      end
+
+    {:ok, %Postgrex.Result{num_rows: num_rows}} =
+      Postgrex.query(ctx.db_conn, query, [])
+
+  - EXPECTED: assert `num_rows == expected["breaker_termination_count"]`.
+
+After the query runs, confirm the replication client process is
+still alive (the breaker did not kill it):
+
+    refute_receive {:DOWN, ^replication_client_monitor, :process,
+                    ^replication_client_pid, _reason}, 200
+
+    replication_client_alive =
+      if Process.alive?(replication_client_pid), do: "alive", else: "dead"
+
+  - EXPECTED: assert `replication_client_alive == expected["replication_client_status"]`.
+
+The `inputs["probe_query"]` exists to vary the test input across
+cases without changing the assertion meaning — it's a sanity probe
+the test runs at the end to confirm the database is still serving
+queries through `ctx.db_conn`:
+
+    {:ok, %Postgrex.Result{rows: probe_rows}} =
+      Postgrex.query(ctx.db_conn, inputs["probe_query"], [])
+
+  - EXPECTED: assert `length(probe_rows) == expected["probe_row_count"]`.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+probe_query = "SELECT 1"
+[story.test_case.expected]
+breaker_termination_count = 0
+replication_client_status = "alive"
+probe_row_count = 1
+
+[[story.test_case]]
+[story.test_case.inputs]
+probe_query = "SELECT 1, 2 UNION SELECT 3, 4"
+[story.test_case.expected]
+breaker_termination_count = 0
+replication_client_status = "alive"
+probe_row_count = 2

@@ -1,0 +1,181 @@
+version = "1.0"
+
+[environment]
+base_image = "plausible-fix-top-pages-comparison:latest"
+build_timeout_sec = 1500.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1200.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "plausible"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "plausible"
+
+[metadata]
+family = "plausible-fix-top-pages-comparison"
+variant = "hard"
+segment = "investigate"
+repo = "plausible"
+tags = ["plausible", "elixir"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Customers using the comparison feature on the Top Pages report are seeing
+blank dates in the tooltip header — the popup that shows current-period
+and comparison-period numbers when you hover a row. Both the current-
+period date and the comparison-period date are missing from the tooltip.
+Other reports in the dashboard (sources, channels, devices, …) display
+the dates fine in the same comparison mode, so it's specific to the Top
+Pages view. The non-comparison case may also be affected — the dashboard
+just doesn't render that label visibly when comparison is off.
+"""
+context = """The internal stats API `GET /api/stats/:domain/pages` is what the Top
+Pages widget on the dashboard hits. Every other endpoint in the same
+Phoenix controller (`lib/plausible_web/controllers/api/stats_controller.ex`)
+that supports comparison mode emits a `meta` JSON object containing
+`date_range_label` and (when comparing) `comparison_date_range_label`.
+The Top Pages endpoint is the only one in the controller that tries to
+combine the breakdown's existing `meta` (used for things like
+`imports_skip_reason`) with the formatted date-range labels via
+`Map.merge/2`. The other endpoints simply replace `meta` with
+`Stats.Breakdown.formatted_date_ranges(query)`.
+
+The breakdown's `meta` originates from `Plausible.Stats.QueryRunner` →
+`Plausible.Stats.QueryResult.from/1`, which wraps the underlying
+keyword list in a `Jason.OrderedObject` struct so the JSON output keeps
+a stable key order. `Jason.OrderedObject` carries a single `:values`
+field holding the `[{key, value}, ...]` keyword list and ships its own
+`Jason.Encoder` implementation that walks ONLY `:values`. `Map.merge/2`
+on a struct does the right thing for a plain-map view but does not
+update `:values`, so the merged keys vanish during JSON encoding —
+silently. The fix has to convert the `Jason.OrderedObject` to a plain
+map before merging (e.g. `Map.new(meta.values)`), or otherwise rebuild
+the ordered object's `:values` to include the new keys.
+
+Investigation evidence available from a quick reproduction:
+- A controller test that hits `/api/stats/:domain/pages?period=day&date=2021-01-01`
+  shows `meta` empty in the response (`json_response(conn, 200)["meta"]
+  == %{}`) on the pre-fix code, while sibling endpoints (e.g.
+  `/api/stats/:domain/sources`) emit `%{"date_range_label" => "1 Jan 2021"}`
+  for the same query shape.
+- Adding a `?comparison=previous_period` parameter does not surface
+  either label on `/pages` pre-fix.
+- Logging the value just before `json/2` shows a populated map with
+  the merged keys — but the encoded JSON drops them. That points
+  squarely at the `Jason.Encoder` for `Jason.OrderedObject`.
+
+Red herrings agents commonly latch onto:
+1. The dashboard tooltip rendering code in
+   `assets/js/dashboard/stats/pages/...` — the renderer is shared with
+   sources/channels/devices and works fine; the input data is wrong.
+2. `Plausible.Stats.Comparisons` and the comparison-query builder —
+   the comparison data IS being computed correctly; the
+   `formatted_date_ranges/1` helper produces the right strings. Only
+   the JSON-shaping step at the controller boundary loses them.
+3. `Plausible.Stats.Breakdown.formatted_date_ranges/1` itself — it
+   returns a plain map and is called identically by every endpoint.
+"""
+solution = """Canonical fix (reference example):
+
+In `lib/plausible_web/controllers/api/stats_controller.ex`, the `pages/2`
+controller action (around line 723) emits:
+
+    json(conn, %{
+      results: pages,
+      meta: Map.merge(meta, Stats.Breakdown.formatted_date_ranges(query)),
+      skip_imported_reason: meta[:imports_skip_reason]
+    })
+
+`meta` here is a `%Jason.OrderedObject{}` returned by
+`Plausible.Stats.Breakdown.breakdown/4`. `Map.merge/2` on this struct
+returns a struct with the merged keys at the map level, but the struct
+still encodes through its `:values` field — which is unchanged. The
+fix converts the struct to a plain map first so the merged result is
+JSON-encoded as a plain map:
+
+    meta: Map.new(meta.values) |> Map.merge(Stats.Breakdown.formatted_date_ranges(query))
+
+Why it works: `Map.new(meta.values)` builds a plain map from the
+keyword list backing the ordered object, dropping the `:__struct__`
+field. `Map.merge/2` then produces a plain map (not a struct), which
+serialises through Jason's default Map encoder.
+
+Alternative valid fixes (the verifier accepts any of these):
+
+1. **Replace the merge with the simpler pattern other endpoints use:**
+   `meta: Stats.Breakdown.formatted_date_ranges(query)`. This drops any
+   pre-existing `meta` keys but for the basic and comparison test
+   shapes the resulting JSON contains the date labels. The pre-fix
+   `meta` is empty for the simple test queries, so the assertion
+   passes.
+2. **Rebuild the ordered object with merged keys:**
+   `%Jason.OrderedObject{values: meta.values ++
+   Enum.into(Stats.Breakdown.formatted_date_ranges(query), [])}` (or
+   with a new helper). Verifier passes — JSON encoding sees the new
+   keys.
+3. **Refactor `QueryResult.from/1` so `meta` is a plain map at the
+   boundary, only OrderedObject-wrapped at JSON serialisation time.**
+   Heavier but valid.
+4. **Add a small helper (e.g. `merge_meta_map/2`) and use it.**
+   Naming variations all pass — the verifier only inspects the
+   HTTP response.
+
+Non-optimal fixes the verifier rejects:
+
+- `Map.from_struct(meta) |> Map.merge(...)` leaves `:values` as a
+  literal key in the response JSON (because `Map.from_struct/1`
+  preserves the field name and `Map.merge/2` on the resulting plain
+  map keeps it). The exact-match assertion on
+  `json_response(conn, 200)["meta"]` fails because `meta` would
+  contain a stray `values` key alongside the date labels.
+- Mutating `Jason.OrderedObject.values` directly in a way that ends
+  up with a malformed `[{key, value}, ...]` keyword list — fails to
+  encode at all.
+- Patching the dashboard frontend tooltip to fall back to a default
+  string when the API response lacks the labels. Doesn't fix the
+  underlying data; the verifier exercises the API directly.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["elixir"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "framework-fluency", "logic-fix", "dependency-research"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 2
+files = 1
+hunks = 1
+scope = "pinpoint"
+
+[metadata.origin]
+repo = "plausible/analytics"
+pr_numbers = [6221]
+base_commit = "966759c32050d3ba1ed6a2e182e630425ffeb23e"
+base_commit_date = "2026-04-03"
+merged_at = "2026-04-06"
+
+
+
+

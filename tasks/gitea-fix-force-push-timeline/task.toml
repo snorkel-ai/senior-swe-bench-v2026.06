@@ -1,0 +1,190 @@
+version = "1.0"
+
+[environment]
+base_image = "gitea-fix-force-push-timeline:latest"
+build_timeout_sec = 1800.0
+cpus = 2
+memory = "4G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "gitea"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "gitea"
+
+[metadata]
+family = "gitea-fix-force-push-timeline"
+variant = "hard"
+segment = "investigate"
+repo = "gitea"
+tags = ["gitea", "go"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Customers of a Gitea instance are reporting wrong behaviour on
+pull-request timelines after a force-push. The header at the top of
+the PR shows the correct commit count, but the per-push events under
+the timeline are missing entries — earlier "pushed N commits" events
+disappear and the post-force-push event itself shows fewer commits
+than the branch actually contains. Simplest reproduction: push commit
+A, push commit B, amend commit B and force-push. The branch now
+contains [A, B'] (two commits) and the header agrees, but the
+timeline shows only one commit.
+"""
+context = """The defective code lives in `services/pull/comment.go`'s
+`CreatePushPullComment`, which is the single entry point every git
+push hook (services/agit for AGit-flow PRs, services/pull for
+classical PRs) calls to record a `CommentTypePullRequestPush` row in
+the database. Two distinct issues combine to produce the symptom:
+
+1. The force-push branch unconditionally deletes every existing
+   `CommentTypePullRequestPush` row for the issue (force-push markers
+   AND non-force-push entries alike), wiping prior timeline history.
+   After deletion the timeline has nothing to render except the
+   brand-new force-push marker.
+
+2. The "new commits" list for a force-push is computed via
+   `gitRepo.CommitsBetweenNotBase(newCommit, oldCommit, baseBranch)`,
+   which uses the OLD head (`oldCommit..newCommit`) as the start of
+   the range. On a real force-push the old head was rewritten away,
+   so this range only contains commits unique to the post-rewrite tip
+   — earlier commits on the new branch (such as the kept commit A in
+   the reproduction above) fall outside it and never make it into
+   the new normal-push comment.
+
+Investigation evidence available from the PR thread (#36914) and the
+linked issue (#36905):
+
+- The reporter shows a screenshot: header reads "2 commits" but the
+  timeline only shows the post-amend commit.
+- Issue #36905 also references an earlier attempt (#36653) that
+  partially fixed the area but did not handle this scenario.
+- A senior reviewer pushed back on the first cut of the fix, asking
+  to keep the logic git-only and not depend on the database for the
+  commit list. The merged design does compute the list from git
+  (mergeBase-based range) and keeps the database only as cache + render
+  source.
+
+The repo's own unit tests for `services/pull` use
+`unittest.MainTest` (sqlite fixture DB), so this bug is reproducible
+from a focused Go test that calls `CreatePushPullComment` against the
+`PullRequest{ID:2}` fixture (head=branch2, base=master on user2/repo1).
+The image bakes Go 1.26.x, libsqlite3-dev, the prewarmed go-build
+cache, and the required `tests/sqlite.ini` so a fresh `go test
+./services/pull/...` runs in seconds.
+
+Red herrings:
+- `services/issue/comments.go::LoadCommentPushCommits` (the renderer)
+  is fine. It parses the stored Content JSON correctly. The wrong
+  data is what's stored.
+- `models/issues/comment.go`'s `PushActionContent` struct itself is
+  fine; the existing fields are correct.
+- `services/agit` and `services/pull/pull.go` are only call sites of
+  the buggy function. They're involved only insofar as they pass
+  `(oldRef, newRef, isForcePush)` arguments through.
+"""
+solution = """Canonical fix (reference example):
+
+- Compute the force-push commit list from git as
+  `mergeBase(baseBranch, newHead)..newHead` rather than
+  `oldHead..newHead`. The reference example introduces a
+  `gitrepo.GetCommitIDsBetweenReverse(start, end, notRef, limit)` helper
+  that wraps `git rev-list --reverse start..end --not notRef`. This
+  captures every commit reachable from the new tip back to the base
+  — including pre-amend commits that survive the force-push.
+- Selective reconciliation of existing comments: instead of deleting
+  every push comment, walk each non-force-push comment, filter its
+  CommitIDs against the new force-push set, delete it if empty,
+  otherwise update its content (and remove those IDs from the new
+  force-push payload). Force-push markers are NEVER deleted by a new
+  force-push.
+- An explicit guard for the empty/zero commit ID lets the empty SHA
+  pass through without a `GetCommit` failure (the pre-fix code
+  crashes on `GetCommit("0000…")`).
+- The function signature gains a `created bool` return so call sites
+  no longer have to read `comment.IsForcePush` to decide whether to
+  fire push notifications. The signature change is canonical but
+  not strictly required — alternatives that keep the 2-return shape
+  and adapt the agit caller are equally valid (see
+  `alternative_implementations`).
+
+Equally valid alternative fixes:
+
+- Keep the `(comment, error)` signature; rework the agit ProcReceive
+  callsite to use `forcePush.Value()` directly when deciding whether
+  to fire `notify_service.PullRequestPushCommits`. Same observable
+  database behaviour.
+- Use a different range helper (e.g. shell out to `git rev-list`
+  directly, or reuse a different existing helper) — observable
+  behaviour identical so long as the range is `mergeBase..newHead`.
+- Reconcile inside `CreatePushPullComment` with one SQL UPDATE per
+  comment vs. a batch UPDATE+DELETE; either is fine.
+- Different helper / variable / receiver names, or non-English
+  identifiers — the verifier never reads source.
+
+Suboptimal fixes that might game the verifier:
+
+- "Just stop deleting force-push markers" — preserves prior markers
+  but still misses commits in the new range. Catches the
+  prior-force-push test but fails the kept-commit test.
+- "Just change the range to mergeBase..newHead but keep the
+  unconditional delete-all" — fixes the commit-list arithmetic but
+  still wipes every prior push comment, so prior-force-push and
+  kept-non-force-comment tests both fail.
+- Hardcoding `IsForcePush=true` and `CommitIDs=[oldHead, newHead]`
+  without ever creating a separate normal-push comment for the new
+  range — the empty-old-commit test still passes (we only check for
+  the marker), but the kept-non-force-comment scenario fails because
+  the OLD non-force-push row gets wiped along with everything else.
+
+Red herrings:
+- `services/issue/comments.go::LoadCommentPushCommits` (the renderer).
+- `models/issues/comment.go`'s `PushActionContent` struct layout
+  (unchanged).
+- `services/agit/agit.go` and `services/pull/pull.go` (call sites only).
+- `modules/git/object_id.go::IsEmptyCommitID` (already exists in
+  the pre-fix tree).
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["go"]
+runtime_dependence = "runtime-helpful"
+skills = ["fault-localization", "logic-fix", "framework-fluency", "codebase-exploration", "cross-service-reasoning"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 377
+files = 7
+hunks = 11
+scope = "extensive"
+
+[metadata.origin]
+repo = "go-gitea/gitea"
+pr_numbers = [36914]
+base_commit = "3c17daf6157ae582db97d86cd344de153e071681"
+base_commit_date = "2026-04-04"
+merged_at = "2026-04-04"
+
+
+
+

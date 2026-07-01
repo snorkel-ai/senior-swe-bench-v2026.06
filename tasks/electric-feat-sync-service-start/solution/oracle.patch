@@ -1,0 +1,693 @@
+diff --git a/packages/sync-service/lib/electric/connection/manager.ex b/packages/sync-service/lib/electric/connection/manager.ex
+index 84699eba0..a0e6373f3 100644
+--- a/packages/sync-service/lib/electric/connection/manager.ex
++++ b/packages/sync-service/lib/electric/connection/manager.ex
+@@ -8,8 +8,8 @@ defmodule Electric.Connection.Manager do
+     - adjusting connection options based on the response from the database
+     - monitoring connections and initiating a reconnection procedure
+     - custom reconnection logic with exponential backoff
+-    - starting the shape consumer supervisor tree once a database connection pool
+-      has been initialized
++    - starting the shape consumer supervisor tree once database connection pools
++      have been initialized
+ 
+   Your OTP application should start a singleton connection manager under its main supervision tree:
+ 
+@@ -50,12 +50,14 @@ defmodule Electric.Connection.Manager do
+   defmodule State do
+     @type phase :: :connection_setup | :running
+     @type step ::
+-            {:start_replication_client, nil}
++            {:start_admin_pool, nil}
++            | {:start_admin_pool, :connecting}
++            | {:start_replication_client, nil}
+             | {:start_replication_client, :acquiring_lock}
+             | {:start_replication_client, :connecting}
+             | {:start_replication_client, :configuring_connection}
+-            | {:start_connection_pool, nil}
+-            | {:start_connection_pool, :connecting}
++            | {:start_snapshot_pool, nil}
++            | {:start_snapshot_pool, :connecting}
+             | :start_shapes_supervisor
+             | {:start_replication_client, :start_streaming}
+             # Steps of the :running phase:
+@@ -122,7 +124,6 @@ defmodule Electric.Connection.Manager do
+   end
+ 
+   use GenServer, shutdown: :infinity
+-  alias Electric.Postgres.LockBreakerConnection
+   alias Electric.Connection.Manager.ConnectionBackoff
+   alias Electric.Connection.Manager.ConnectionResolver
+   alias Electric.DbConnectionError
+@@ -282,7 +283,7 @@ defmodule Electric.Connection.Manager do
+     state =
+       %State{
+         current_phase: :connection_setup,
+-        current_step: {:start_replication_client, nil},
++        current_step: {:start_admin_pool, nil},
+         pool_opts: pool_opts,
+         timeline_opts: timeline_opts,
+         inspector: Keyword.fetch!(opts, :inspector),
+@@ -377,77 +378,59 @@ defmodule Electric.Connection.Manager do
+     end
+   end
+ 
++  # The admin pool is started before the replication client so it is available
++  # during lock acquisition (e.g. for the lock breaker, ETS inspector cache
++  # population, or shutdown cleanup). It uses replication credentials because
++  # the replication user owns the publication and has the privileges needed to
++  # alter it.
+   def handle_continue(
+-        :start_connection_pool,
++        :start_admin_pool,
+         %State{
+           current_phase: :connection_setup,
+-          current_step: {:start_connection_pool, _},
+-          pool_pids: pool_pids
++          current_step: {:start_admin_pool, _},
++          pool_pids: %{admin: nil}
+         } = state
+-      )
+-      when is_nil(pool_pids.admin) or is_nil(pool_pids.snapshot) do
+-    Logger.debug("Starting connection pool for stack #{state.stack_id}")
+-
+-    # The admin pool uses replication credentials because the replication user
+-    # owns the publication and has the privileges needed to alter it. The pooled
+-    # connection user may be a lower-privilege user (e.g. on Crunchy Bridge where
+-    # superusers can't connect through PgBouncer).
+-    with {:pool, {:ok, pooled_conn_opts, state}} <-
+-           {:pool, validate_connection(pooled_connection_opts(state), :pool, state)},
+-         {:replication, {:ok, replication_conn_opts, state}} <-
+-           {:replication,
+-            validate_connection(replication_connection_opts(state), :replication, state)} do
+-      pool_sizes = pool_sizes(Keyword.get(state.pool_opts, :pool_size, 2))
+-
+-      state =
+-        [{:snapshot, pooled_conn_opts}, {:admin, replication_conn_opts}]
+-        |> Enum.filter(fn {role, _conn_opts} -> is_nil(state.pool_pids[role]) end)
+-        |> Enum.reduce(state, fn {pool_role, conn_opts}, state ->
+-          pool_size = Map.fetch!(pool_sizes, pool_role)
+-
+-          # The snapshot pool connections might run for long periods of time
+-          # depending on the nature of the query, and during bursts it is preferred
+-          # to have new queries queued for a longer time than failing them continuously
+-          pool_queue_config =
+-            if pool_role == :snapshot,
+-              do: [queue_target: 5_000, queue_interval: 10_000],
+-              else: []
+-
+-          {:ok, pool_pid} =
+-            Electric.Connection.Manager.Pool.start_link(
+-              stack_id: state.stack_id,
+-              role: pool_role,
+-              connection_manager: self(),
+-              pool_opts:
+-                Keyword.merge(
+-                  state.pool_opts,
+-                  [pool_size: pool_size] ++ pool_queue_config
+-                ),
+-              conn_opts: conn_opts
+-            )
+-
+-          %{
+-            state
+-            | pool_pids: Map.put(state.pool_pids, pool_role, {pool_pid, false})
+-          }
+-        end)
+-
+-      state = %{state | current_step: {:start_connection_pool, :connecting}}
+-      {:noreply, state}
+-    else
+-      # the ConnectionResolver process was killed, as part of the application
+-      # shutdown in which case we'll be killed next so just return here
+-      {_source, {:error, :killed}} ->
+-        {:noreply, state}
++      ) do
++    Logger.debug("Starting admin connection pool for stack #{state.stack_id}")
+ 
+-      {:pool, {:error, reason}} ->
+-        shutdown_or_reconnect(reason, :snapshot_pool, state)
++    case start_single_pool(state, :admin, &replication_connection_opts/1, :replication) do
++      {:ok, state} ->
++        {:noreply, %{state | current_step: {:start_admin_pool, :connecting}}}
+ 
+-      {:replication, {:error, reason}} ->
++      {:error, :killed} ->
++        {:noreply, state}
++
++      {:error, reason} ->
+         shutdown_or_reconnect(reason, :admin_pool, state)
+     end
+   end
+ 
++  # The snapshot pool is started after the replication client has finished
++  # configuring the connection (lock acquired, slot created, etc.). It uses
++  # the pooled connection credentials which may be a lower-privilege user
++  # (e.g. on Crunchy Bridge where superusers can't connect through PgBouncer).
++  def handle_continue(
++        :start_snapshot_pool,
++        %State{
++          current_phase: :connection_setup,
++          current_step: {:start_snapshot_pool, _},
++          pool_pids: %{snapshot: nil}
++        } = state
++      ) do
++    Logger.debug("Starting snapshot connection pool for stack #{state.stack_id}")
++
++    case start_single_pool(state, :snapshot, &pooled_connection_opts/1, :pool) do
++      {:ok, state} ->
++        {:noreply, %{state | current_step: {:start_snapshot_pool, :connecting}}}
++
++      {:error, :killed} ->
++        {:noreply, state}
++
++      {:error, reason} ->
++        shutdown_or_reconnect(reason, :snapshot_pool, state)
++    end
++  end
++
+   def handle_continue(
+         :start_shapes_supervisor,
+         %State{
+@@ -566,19 +549,10 @@ defmodule Electric.Connection.Manager do
+     if lock_breaker_allowed and
+          state.current_step == {:start_replication_client, :acquiring_lock} and
+          not is_nil(pg_backend_pid) do
+-      with {:ok, conn_opts, state} <-
+-             validate_connection(pooled_connection_opts(state), :pool, state),
+-           {:ok, breaker_pid} <-
+-             LockBreakerConnection.start(connection_opts: conn_opts, stack_id: state.stack_id) do
+-        lock_name = Keyword.fetch!(state.replication_opts, :slot_name)
+-
+-        LockBreakerConnection.stop_backends_and_close(breaker_pid, lock_name, pg_backend_pid)
+-      else
+-        {:error, reason} ->
+-          # no-op, this is a one-shot attempt at fixing a lock
+-          Logger.warning("Failed try and break stuck lock connection: #{inspect(reason)}")
+-          :ok
+-      end
++      pool = pool_name(state.stack_id, :admin)
++      lock_name = Keyword.fetch!(state.replication_opts, :slot_name)
++      database = replication_connection_opts(state)[:database]
++      execute_lock_breaker_query(pool, lock_name, pg_backend_pid, database)
+     else
+       if not lock_breaker_allowed do
+         Logger.notice(
+@@ -700,7 +674,7 @@ defmodule Electric.Connection.Manager do
+ 
+   @impl true
+   def handle_cast(:connection_resolver_ready, state) do
+-    {:noreply, state, {:continue, :start_replication_client}}
++    {:noreply, state, {:continue, :start_admin_pool}}
+   end
+ 
+   def handle_cast(:drop_replication_slot_on_stop, state) do
+@@ -796,37 +770,42 @@ defmodule Electric.Connection.Manager do
+     state = %{
+       state
+       | replication_configuration_blocked_by_pending_transaction: false,
+-        current_step: {:start_connection_pool, nil}
++        current_step: {:start_snapshot_pool, nil}
+     }
+ 
+-    {:noreply, state, {:continue, :start_connection_pool}}
++    {:noreply, state, {:continue, :start_snapshot_pool}}
+   end
+ 
++  # Admin pool ready → proceed to starting the replication client
+   def handle_cast(
+-        {:connection_pool_ready, role, pid},
++        {:connection_pool_ready, :admin, pid},
+         %State{
+           current_phase: :connection_setup,
+-          current_step: {:start_connection_pool, :connecting}
++          current_step: {:start_admin_pool, :connecting}
+         } = state
+       ) do
+-    Electric.StatusMonitor.mark_connection_pool_ready(
+-      state.stack_id,
+-      role,
+-      pid
+-    )
+-
+-    state = Map.update!(state, :pool_pids, &Map.put(&1, role, {pid, true}))
++    StatusMonitor.mark_connection_pool_ready(state.stack_id, :admin, pid)
++    state = Map.update!(state, :pool_pids, &Map.put(&1, :admin, {pid, true}))
++    state = mark_connection_succeeded(state)
+ 
+-    case state.pool_pids do
+-      %{admin: {pid1, true}, snapshot: {pid2, true}} when is_pid(pid1) and is_pid(pid2) ->
+-        state = mark_connection_succeeded(state)
++    {:noreply, %{state | current_step: {:start_replication_client, nil}},
++     {:continue, :start_replication_client}}
++  end
+ 
+-        {:noreply, %{state | current_step: :start_shapes_supervisor},
+-         {:continue, :start_shapes_supervisor}}
++  # Snapshot pool ready → proceed to starting the shapes supervisor
++  def handle_cast(
++        {:connection_pool_ready, :snapshot, pid},
++        %State{
++          current_phase: :connection_setup,
++          current_step: {:start_snapshot_pool, :connecting}
++        } = state
++      ) do
++    StatusMonitor.mark_connection_pool_ready(state.stack_id, :snapshot, pid)
++    state = Map.update!(state, :pool_pids, &Map.put(&1, :snapshot, {pid, true}))
++    state = mark_connection_succeeded(state)
+ 
+-      _ ->
+-        {:noreply, state}
+-    end
++    {:noreply, %{state | current_step: :start_shapes_supervisor},
++     {:continue, :start_shapes_supervisor}}
+   end
+ 
+   def handle_cast(
+@@ -1151,6 +1130,90 @@ defmodule Electric.Connection.Manager do
+ 
+   defp pooled_connection_opts(state), do: state.connection_opts
+ 
++  defp execute_lock_breaker_query(pool, lock_name, pg_backend_pid, database) do
++    query = lock_breaker_query(lock_name, pg_backend_pid, database)
++
++    case Postgrex.query(pool, query, [], timeout: 5_000) do
++      {:ok, %Postgrex.Result{num_rows: 0}} ->
++        Logger.debug("No stuck backends found")
++
++      {:ok, _result} ->
++        Logger.notice(
++          "Terminated a stuck backend to free the lock #{lock_name} because slot with same name was inactive"
++        )
++
++      {:error, error} ->
++        Logger.warning("Failed to break stuck lock connection: #{inspect(error)}")
++    end
++  catch
++    kind, error ->
++      Logger.warning(
++        "Failed to break stuck lock connection: #{Exception.format(kind, error, __STACKTRACE__)}"
++      )
++  end
++
++  # Query to find and terminate backends holding advisory locks for inactive
++  # replication slots. Used by the lock breaker to free abandoned locks.
++  @doc false
++  def lock_breaker_query(lock_name, lock_connection_pg_backend_pid, database)
++      when is_integer(lock_connection_pg_backend_pid) or is_nil(lock_connection_pg_backend_pid) do
++    import Electric.Utils, only: [quote_string: 1]
++
++    """
++    WITH inactive_slots AS (
++        select slot_name
++        from pg_replication_slots
++        where active = false and database = #{quote_string(database)} and slot_name = #{quote_string(lock_name)}
++    ),
++    stuck_backends AS (
++        select pid
++        from pg_locks, inactive_slots
++        where
++          hashtext(slot_name) = (classid::bigint << 32) | objid::bigint
++          and locktype = 'advisory'
++          and objsubid = 1
++          and database = (select oid from pg_database where datname = #{quote_string(database)})
++          and granted
++          and pid != #{lock_connection_pg_backend_pid || 0}
++    )
++    SELECT pg_terminate_backend(pid) FROM stuck_backends;
++    """
++  end
++
++  defp start_single_pool(state, role, conn_opts_fn, conn_type) do
++    case validate_connection(conn_opts_fn.(state), conn_type, state) do
++      {:ok, conn_opts, state} ->
++        pool_sizes = pool_sizes(Keyword.get(state.pool_opts, :pool_size, 2))
++        pool_size = Map.fetch!(pool_sizes, role)
++
++        # The snapshot pool connections might run for long periods of time
++        # depending on the nature of the query, and during bursts it is preferred
++        # to have new queries queued for a longer time than failing them continuously
++        pool_queue_config =
++          if role == :snapshot,
++            do: [queue_target: 5_000, queue_interval: 10_000],
++            else: []
++
++        {:ok, pool_pid} =
++          Electric.Connection.Manager.Pool.start_link(
++            stack_id: state.stack_id,
++            role: role,
++            connection_manager: self(),
++            pool_opts:
++              Keyword.merge(
++                state.pool_opts,
++                [pool_size: pool_size] ++ pool_queue_config
++              ),
++            conn_opts: conn_opts
++          )
++
++        {:ok, %{state | pool_pids: Map.put(state.pool_pids, role, {pool_pid, false})}}
++
++      {:error, _} = error ->
++        error
++    end
++  end
++
+   defguardp admin_pool_available(state)
+             when not is_nil(state.pool_pids.admin) and is_pid(elem(state.pool_pids.admin, 0))
+ 
+@@ -1271,11 +1334,19 @@ defmodule Electric.Connection.Manager do
+   defp should_retry_connection?(
+          %State{
+            current_phase: :connection_setup,
+-           current_step: {:start_connection_pool, _}
++           current_step: {:start_admin_pool, _}
+          },
+-         pid_type
+-       )
+-       when pid_type in [:pools, :admin_pool, :snapshot_pool],
++         :admin_pool
++       ),
++       do: true
++
++  defp should_retry_connection?(
++         %State{
++           current_phase: :connection_setup,
++           current_step: {:start_snapshot_pool, _}
++         },
++         :snapshot_pool
++       ),
+        do: true
+ 
+   defp should_retry_connection?(_state, _pid_type), do: false
+diff --git a/packages/sync-service/lib/electric/postgres/lock_breaker_connection.ex b/packages/sync-service/lib/electric/postgres/lock_breaker_connection.ex
+deleted file mode 100644
+index eb2427bb1..000000000
+--- a/packages/sync-service/lib/electric/postgres/lock_breaker_connection.ex
++++ /dev/null
+@@ -1,133 +0,0 @@
+-defmodule Electric.Postgres.LockBreakerConnection do
+-  @moduledoc """
+-  A Postgres connection that is used to break an abandoned lock.
+-
+-  Electric takes out a session-level advisory lock on a separate connection to better manage the
+-  ownership of the replication slot. Unfortunately, we have seen instances (especially on Neon),
+-  where the Electric disconnects, but the lock is not auto-released.
+-
+-  For these cases, this breaker exists - it'll connect to the database, and check that for
+-  a given lock name, if that lock is taken, there also exists an active replication slot with the
+-  same name. If not, it'll terminate the backend that is holding the lock, under the assumption
+-  that it's one of the abandoned locks.
+-  """
+-  require Logger
+-
+-  import Electric.Utils, only: [quote_string: 1]
+-
+-  @behaviour Postgrex.SimpleConnection
+-
+-  @type option ::
+-          {:connection_opts, Keyword.t()}
+-          | {:stack_id, String.t()}
+-
+-  @type options :: [option]
+-
+-  @spec start(options()) :: {:ok, pid()} | {:error, Postgrex.Error.t() | term()}
+-  def start(opts) do
+-    {connection_opts, init_opts} = Keyword.pop(opts, :connection_opts)
+-
+-    connection_opts = Electric.Utils.deobfuscate_password(connection_opts)
+-
+-    with {:ok, pid} <-
+-           Postgrex.SimpleConnection.start_link(
+-             __MODULE__,
+-             init_opts |> Keyword.put(:database, connection_opts[:database]),
+-             [
+-               auto_reconnect: false,
+-               sync_connect: true
+-             ] ++
+-               connection_opts
+-           ) do
+-      # unlink the lock breaker so that if it crashes it does not affect the caller,
+-      # since it is a one shot fix attempt anyway
+-      Process.unlink(pid)
+-      {:ok, pid}
+-    end
+-  end
+-
+-  def stop_backends_and_close(server, lock_name, lock_connection_pg_backend_pid \\ nil) do
+-    send(server, {:stop_backends_and_close, lock_name, lock_connection_pg_backend_pid})
+-  end
+-
+-  @impl true
+-  def init(opts) do
+-    opts = Map.new(opts)
+-
+-    Process.set_label({:lock_breaker_connection, opts.stack_id})
+-
+-    metadata = [
+-      is_connection_process?: true,
+-      stack_id: opts.stack_id
+-    ]
+-
+-    Logger.metadata(metadata)
+-    Electric.Telemetry.Sentry.set_tags_context(metadata)
+-
+-    {:ok, opts}
+-  end
+-
+-  @impl true
+-  def handle_connect(state) do
+-    {:noreply, state}
+-  end
+-
+-  @impl true
+-  def handle_info(
+-        {:stop_backends_and_close, lock_name, lock_connection_pg_backend_pid},
+-        state
+-      ) do
+-    {:query, lock_breaker_query(lock_name, lock_connection_pg_backend_pid, state.database),
+-     Map.put(state, :lock_name, lock_name)}
+-  end
+-
+-  @impl true
+-  def handle_result([%Postgrex.Result{columns: ["pg_terminate_backend"]} = result], state) do
+-    if result.num_rows == 0 do
+-      Logger.debug("No stuck backends found")
+-    else
+-      Logger.notice(
+-        "Terminated a stuck backend to free the lock #{state.lock_name} because slot with same name was inactive"
+-      )
+-    end
+-
+-    exit(:shutdown)
+-  end
+-
+-  def handle_result(%Postgrex.Error{} = error, _) do
+-    raise error
+-  end
+-
+-  @impl true
+-  def notify(_, _, _), do: :ok
+-
+-  defp lock_breaker_query(lock_name, lock_connection_pg_backend_pid, database)
+-       when is_integer(lock_connection_pg_backend_pid) or is_nil(lock_connection_pg_backend_pid) do
+-    # We're using a `WITH` clause to execute all this in one statement
+-    # - See if there are existing but inactive replication slots with the given name
+-    # - Find all backends that are holding locks with the same name
+-    # - Terminate those backends
+-    #
+-    # It's generally impossible for this to return more than one row
+-
+-    """
+-    WITH inactive_slots AS (
+-        select slot_name
+-        from pg_replication_slots
+-        where active = false and database = #{quote_string(database)} and slot_name = #{quote_string(lock_name)}
+-    ),
+-    stuck_backends AS (
+-        select pid
+-        from pg_locks, inactive_slots
+-        where
+-          hashtext(slot_name) = (classid::bigint << 32) | objid::bigint
+-          and locktype = 'advisory'
+-          and objsubid = 1
+-          and database = (select oid from pg_database where datname = #{quote_string(database)})
+-          and granted
+-          and pid != #{lock_connection_pg_backend_pid || 0}
+-    )
+-    SELECT pg_terminate_backend(pid) FROM stuck_backends;
+-    """
+-  end
+-end
+diff --git a/packages/sync-service/lib/electric/stack_supervisor.ex b/packages/sync-service/lib/electric/stack_supervisor.ex
+index d7e297b7d..6491f7136 100644
+--- a/packages/sync-service/lib/electric/stack_supervisor.ex
++++ b/packages/sync-service/lib/electric/stack_supervisor.ex
+@@ -8,16 +8,20 @@ defmodule Electric.StackSupervisor do
+ 
+   1. `Electric.Postgres.Inspector.EtsInspector` is started with a pool name as a config option, module that is passed from the base config is __ignored__
+   2. `Electric.Connection.Supervisor` takes a LOT of options to configure replication and start the rest of the tree. It starts (3) and then (4) in `rest-for-one` mode
+-  3. `Electric.Connection.Manager` takes all the connection/replication options and starts the db pool. It goes through the following steps:
+-      - start_lock_connection
+-      - exclusive_connection_lock_acquired (as a callback from the lock connection)
++  3. `Electric.Connection.Manager` takes all the connection/replication options and starts the db pools. It goes through the following steps:
++      - start_admin_pool
++        Starts an admin connection pool (3.1) using replication credentials before the lock is acquired.
++        This pool is available for operations like lock breaking, shutdown cleanup, and ETS inspector cache population.
+       - start_replication_client
+-        This starts a replication client (3.1) with no auto-reconnection, because manager is expected to restart this client in case something goes wrong. The streaming of WAL does not start automatically and has to be started explicitly by the manager
+-      - start_connection_pool (only if it's not started already, otherwise start streaming)
+-        This starts a `Postgrex` connection pool (3.2) to the DB we're going to use. If it's ok, we then do a bunch of checks, then ask (3) to finally start (4), and start streaming
+-
+-      1. `Electric.Postgres.ReplicationClient` - connects to PG in replication mod, sets up slots, _does not start streaming_ until requested
+-      2. `Postgrex` connection pool is started for querying initial snapshots & info about the DB
++        This starts a replication client (3.2) with no auto-reconnection, because manager is expected to restart this client in case something goes wrong. The streaming of WAL does not start automatically and has to be started explicitly by the manager.
++        The replication client acquires the advisory lock, creates/verifies the publication and slot.
++      - start_snapshot_pool
++        Starts a snapshot connection pool (3.3) using pooled credentials after the replication client is configured.
++        If it's ok, we then do a bunch of checks, then ask (3) to finally start (4), and start streaming.
++
++      1. `Postgrex` admin pool - small pool (1-4 connections) for metadata/admin operations
++      2. `Electric.Postgres.ReplicationClient` - connects to PG in replication mode, sets up slots, _does not start streaming_ until requested
++      3. `Postgrex` snapshot pool - larger pool for querying initial snapshots & info about the DB
+   4. `Electric.Shapes.Supervisor` is a supervisor responsible for taking the replication log from the replication client and shoving it into storage appropriately. It starts 3 things in one-for-all mode:
+       1. `Electric.Shapes.DynamicConsumerSupervisor` is DynamicSupervisor. It oversees various per-shape processes
+           1. `Electric.Shapes.Consumer` is a consumer subscribing to `LogCollector`, which acts a shared producer for all shapes. It passes any incoming operation along to the storage.
+diff --git a/packages/sync-service/test/electric/connection/manager_test.exs b/packages/sync-service/test/electric/connection/manager_test.exs
+index 063039366..ad9d537cb 100644
+--- a/packages/sync-service/test/electric/connection/manager_test.exs
++++ b/packages/sync-service/test/electric/connection/manager_test.exs
+@@ -379,8 +379,10 @@ defmodule Electric.Connection.ConnectionManagerTest do
+ 
+       StatusMonitor.wait_until_active(stack_id, timeout: 1000)
+ 
++      # Assert pooled connection opts are validated separately from replication opts.
++      # If both pool types used the same connection opts, this validation would be cached
++      # from the admin pool's earlier :replication type validation and no message would arrive.
+       assert_receive {:validate, ^pooled_conn_opts}
+-      assert_receive {:validate, ^repl_opts}
+     end
+   end
+ 
+diff --git a/packages/sync-service/test/electric/postgres/lock_breaker_connection_test.exs b/packages/sync-service/test/electric/postgres/lock_breaker_connection_test.exs
+deleted file mode 100644
+index 02a6e66bd..000000000
+--- a/packages/sync-service/test/electric/postgres/lock_breaker_connection_test.exs
++++ /dev/null
+@@ -1,117 +0,0 @@
+-defmodule Electric.Postgres.LockBreakerConnectionTest do
+-  use ExUnit.Case, async: true
+-  import Support.DbSetup, except: [with_publication: 1]
+-  import Support.ComponentSetup
+-
+-  alias Electric.Postgres.LockBreakerConnection
+-  alias Electric.Postgres.ReplicationClient
+-
+-  setup [
+-    :with_unique_db,
+-    :with_stack_id_from_test,
+-    :with_lsn_tracker,
+-    :with_slot_name
+-  ]
+-
+-  @tag connection_opt_overrides: [pool_size: 2]
+-  test "should break an abandoned lock if slot is inactive", ctx do
+-    Postgrex.query!(
+-      ctx.db_conn,
+-      "SELECT pg_create_logical_replication_slot('#{ctx.slot_name}', 'pgoutput')"
+-    )
+-
+-    test_pid = self()
+-
+-    start_supervised!({
+-      Task,
+-      fn ->
+-        DBConnection.run(ctx.db_conn, fn conn ->
+-          Postgrex.query!(
+-            conn,
+-            "SELECT pg_advisory_lock(hashtext('#{ctx.slot_name}'))",
+-            []
+-          )
+-
+-          send(test_pid, :lock_acquired)
+-
+-          Process.sleep(:infinity)
+-        end)
+-      end
+-    })
+-
+-    {:ok, lock_breaker_pid} =
+-      Electric.Postgres.LockBreakerConnection.start(
+-        connection_opts: ctx.db_config,
+-        stack_id: ctx.stack_id
+-      )
+-
+-    lock_breaker_monitor = Process.monitor(lock_breaker_pid)
+-
+-    assert_receive :lock_acquired
+-
+-    # Verify there's an entry for the acquired lock in pg_locks
+-    assert %Postgrex.Result{rows: [_pg_backend_pid], num_rows: 1} =
+-             Postgrex.query!(
+-               ctx.db_conn,
+-               "SELECT pid FROM pg_locks WHERE objid::bigint = hashtext($1) AND locktype = 'advisory'",
+-               [ctx.slot_name]
+-             )
+-
+-    # Make sure we can stop the lock connection above, so we're not specifying current pid
+-    LockBreakerConnection.stop_backends_and_close(lock_breaker_pid, ctx.slot_name)
+-
+-    assert_receive {:DOWN, ^lock_breaker_monitor, :process, ^lock_breaker_pid, :shutdown}
+-
+-    # Verify that the pg_locks entry is gone
+-    assert %Postgrex.Result{rows: [], num_rows: 0} =
+-             Postgrex.query!(
+-               ctx.db_conn,
+-               "SELECT pid FROM pg_locks WHERE objid::bigint = hashtext($1) AND locktype = 'advisory'",
+-               [ctx.slot_name]
+-             )
+-  end
+-
+-  test "doesn't break the lock if it's taken from expected lock connection", ctx do
+-    Postgrex.query!(
+-      ctx.db_conn,
+-      "SELECT pg_create_logical_replication_slot('#{ctx.slot_name}', 'pgoutput')"
+-    )
+-
+-    {:ok, replication_client_pid} =
+-      start_supervised(
+-        {ReplicationClient,
+-         stack_id: ctx.stack_id,
+-         replication_opts: [
+-           connection_opts: ctx.db_config,
+-           stack_id: ctx.stack_id,
+-           publication_name: ctx.slot_name,
+-           try_creating_publication?: false,
+-           slot_name: ctx.slot_name,
+-           handle_event: nil,
+-           connection_manager: self()
+-         ]}
+-      )
+-
+-    replication_client_monitor = Process.monitor(replication_client_pid)
+-
+-    {:ok, lock_breaker_pid} =
+-      start_supervised(%{
+-        id: :lock_breaker,
+-        start:
+-          {Electric.Postgres.LockBreakerConnection, :start,
+-           [[connection_opts: ctx.db_config, stack_id: ctx.stack_id]]}
+-      })
+-
+-    lock_breaker_monitor = Process.monitor(lock_breaker_pid)
+-
+-    assert_receive {:"$gen_cast", {:pg_info_obtained, %{pg_backend_pid: pg_backend_pid}}}
+-    assert_receive {:"$gen_cast", :replication_client_lock_acquired}
+-
+-    LockBreakerConnection.stop_backends_and_close(lock_breaker_pid, ctx.slot_name, pg_backend_pid)
+-
+-    assert_receive {:DOWN, ^lock_breaker_monitor, :process, ^lock_breaker_pid, :shutdown}
+-    refute_received {:DOWN, ^replication_client_monitor, :process, _pid, _reason}
+-
+-    stop_supervised(ReplicationClient)
+-  end
+-end

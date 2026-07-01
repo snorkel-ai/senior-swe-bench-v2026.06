@@ -1,0 +1,615 @@
+diff --git a/models/issues/comment.go b/models/issues/comment.go
+index 25e74c01ea..34ce7f3500 100644
+--- a/models/issues/comment.go
++++ b/models/issues/comment.go
+@@ -7,6 +7,7 @@ package issues
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"html/template"
+ 	"slices"
+@@ -21,6 +22,7 @@ import (
+ 	user_model "code.gitea.io/gitea/models/user"
+ 	"code.gitea.io/gitea/modules/container"
+ 	"code.gitea.io/gitea/modules/htmlutil"
++	"code.gitea.io/gitea/modules/json"
+ 	"code.gitea.io/gitea/modules/log"
+ 	"code.gitea.io/gitea/modules/optional"
+ 	"code.gitea.io/gitea/modules/references"
+@@ -326,21 +328,34 @@ type Comment struct {
+ 	RefIssue   *Issue                 `xorm:"-"`
+ 	RefComment *Comment               `xorm:"-"`
+ 
+-	Commits     []*git_model.SignCommitWithStatuses `xorm:"-"`
+-	OldCommit   string                              `xorm:"-"`
+-	NewCommit   string                              `xorm:"-"`
+-	CommitsNum  int64                               `xorm:"-"`
+-	IsForcePush bool                                `xorm:"-"`
++	Commits    []*git_model.SignCommitWithStatuses `xorm:"-"`
++	OldCommit  string                              `xorm:"-"`
++	NewCommit  string                              `xorm:"-"`
++	CommitsNum int64                               `xorm:"-"`
++
++	// Templates still use it. It is not persisted in database, it is only set when creating or loading
++	IsForcePush bool `xorm:"-"`
+ }
+ 
+ func init() {
+ 	db.RegisterModel(new(Comment))
+ }
+ 
+-// PushActionContent is content of push pull comment
++// PushActionContent is content of pull request's push comment
+ type PushActionContent struct {
+-	IsForcePush bool     `json:"is_force_push"`
+-	CommitIDs   []string `json:"commit_ids"`
++	IsForcePush bool `json:"is_force_push"`
++	// if IsForcePush=true, CommitIDs contains the commit pair [old head, new head]
++	// if IsForcePush=false, CommitIDs contains the new commits newly pushed to the head branch
++	CommitIDs []string `json:"commit_ids"`
++}
++
++func (c *Comment) GetPushActionContent() (*PushActionContent, error) {
++	if c.Type != CommentTypePullRequestPush {
++		return nil, errors.New("not a pull request push comment")
++	}
++	var data PushActionContent
++	_ = json.Unmarshal(util.UnsafeStringToBytes(c.Content), &data)
++	return &data, nil
+ }
+ 
+ // LoadIssue loads the issue reference for the comment
+diff --git a/modules/git/repo_commit.go b/modules/git/repo_commit.go
+index c10f73690c..8ba3f83386 100644
+--- a/modules/git/repo_commit.go
++++ b/modules/git/repo_commit.go
+@@ -362,39 +362,6 @@ func (repo *Repository) CommitsBetweenLimit(last, before *Commit, limit, skip in
+ 	return repo.parsePrettyFormatLogToList(bytes.TrimSpace(stdout))
+ }
+ 
+-// CommitsBetweenNotBase returns a list that contains commits between [before, last), excluding commits in baseBranch.
+-// If before is detached (removed by reset + push) it is not included.
+-func (repo *Repository) CommitsBetweenNotBase(last, before *Commit, baseBranch string) ([]*Commit, error) {
+-	var stdout []byte
+-	var err error
+-	if before == nil {
+-		stdout, _, err = gitcmd.NewCommand("rev-list").
+-			AddDynamicArguments(last.ID.String()).
+-			AddOptionValues("--not", baseBranch).
+-			WithDir(repo.Path).
+-			RunStdBytes(repo.Ctx)
+-	} else {
+-		stdout, _, err = gitcmd.NewCommand("rev-list").
+-			AddDynamicArguments(before.ID.String()+".."+last.ID.String()).
+-			AddOptionValues("--not", baseBranch).
+-			WithDir(repo.Path).
+-			RunStdBytes(repo.Ctx)
+-		if err != nil && strings.Contains(err.Error(), "no merge base") {
+-			// future versions of git >= 2.28 are likely to return an error if before and last have become unrelated.
+-			// previously it would return the results of git rev-list before last so let's try that...
+-			stdout, _, err = gitcmd.NewCommand("rev-list").
+-				AddDynamicArguments(before.ID.String(), last.ID.String()).
+-				AddOptionValues("--not", baseBranch).
+-				WithDir(repo.Path).
+-				RunStdBytes(repo.Ctx)
+-		}
+-	}
+-	if err != nil {
+-		return nil, err
+-	}
+-	return repo.parsePrettyFormatLogToList(bytes.TrimSpace(stdout))
+-}
+-
+ // CommitsBetweenIDs return commits between twoe commits
+ func (repo *Repository) CommitsBetweenIDs(last, before string) ([]*Commit, error) {
+ 	lastCommit, err := repo.GetCommit(last)
+diff --git a/modules/gitrepo/compare.go b/modules/gitrepo/compare.go
+index 06cf880d99..7e38d33e6f 100644
+--- a/modules/gitrepo/compare.go
++++ b/modules/gitrepo/compare.go
+@@ -42,3 +42,30 @@ func GetDivergingCommits(ctx context.Context, repo Repository, baseBranch, targe
+ 	}
+ 	return &DivergeObject{Ahead: ahead, Behind: behind}, nil
+ }
++
++// GetCommitIDsBetweenReverse returns the last commit IDs between two commits in reverse order (from old to new) with limit.
++// If the result exceeds the limit, the old commits IDs will be ignored
++func GetCommitIDsBetweenReverse(ctx context.Context, repo Repository, startRef, endRef, notRef string, limit int) ([]string, error) {
++	genCmd := func(reversions ...string) *gitcmd.Command {
++		cmd := gitcmd.NewCommand("rev-list", "--reverse").
++			AddArguments("-n").AddDynamicArguments(strconv.Itoa(limit)).
++			AddDynamicArguments(reversions...)
++		if notRef != "" { // --not should be kept as the last parameter of git command, otherwise the result will be wrong
++			cmd.AddOptionValues("--not", notRef)
++		}
++		return cmd
++	}
++	stdout, _, err := RunCmdString(ctx, repo, genCmd(startRef+".."+endRef))
++	// example git error message: fatal: origin/main..HEAD: no merge base
++	if err != nil && strings.Contains(err.Stderr(), "no merge base") {
++		// future versions of git >= 2.28 are likely to return an error if before and last have become unrelated.
++		// previously it would return the results of git rev-list before last so let's try that...
++		stdout, _, err = RunCmdString(ctx, repo, genCmd(startRef, endRef))
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	commitIDs := strings.Fields(strings.TrimSpace(stdout))
++	return commitIDs, nil
++}
+diff --git a/services/agit/agit.go b/services/agit/agit.go
+index fa2ddd9baf..55b98a65ae 100644
+--- a/services/agit/agit.go
++++ b/services/agit/agit.go
+@@ -282,12 +282,15 @@ func ProcReceive(ctx context.Context, repo *repo_model.Repository, gitRepo *git.
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to load pull issue. Error: %w", err)
+ 		}
+-		comment, err := pull_service.CreatePushPullComment(ctx, pusher, pr, oldCommitID, opts.NewCommitIDs[i], forcePush.Value())
+-		if err == nil && comment != nil {
++
++		isForcePush := forcePush.Value()
++		comment, commentCreated, err := pull_service.CreatePushPullComment(ctx, pusher, pr, oldCommitID, opts.NewCommitIDs[i], isForcePush)
++		if err != nil {
++			log.Error("CreatePushPullComment: %v", err)
++		} else if commentCreated {
+ 			notify_service.PullRequestPushCommits(ctx, pusher, pr, comment)
+ 		}
+ 		notify_service.PullRequestSynchronized(ctx, pusher, pr)
+-		isForcePush := comment != nil && comment.IsForcePush
+ 
+ 		results = append(results, private.HookProcReceiveRefResult{
+ 			OldOID:            oldCommitID,
+diff --git a/services/pull/comment.go b/services/pull/comment.go
+index a2eae2e1e2..1d055a0c1f 100644
+--- a/services/pull/comment.go
++++ b/services/pull/comment.go
+@@ -5,117 +5,166 @@ package pull
+ 
+ import (
+ 	"context"
++	"slices"
+ 
+ 	"code.gitea.io/gitea/models/db"
+ 	issues_model "code.gitea.io/gitea/models/issues"
+-	repo_model "code.gitea.io/gitea/models/repo"
+ 	user_model "code.gitea.io/gitea/models/user"
++	"code.gitea.io/gitea/modules/container"
++	"code.gitea.io/gitea/modules/git"
+ 	"code.gitea.io/gitea/modules/gitrepo"
+ 	"code.gitea.io/gitea/modules/json"
+ 	"code.gitea.io/gitea/modules/log"
+ )
+ 
+-// getCommitIDsFromRepo get commit IDs from repo in between oldCommitID and newCommitID
+-// Commit on baseBranch will skip
+-func getCommitIDsFromRepo(ctx context.Context, repo *repo_model.Repository, oldCommitID, newCommitID, baseBranch string) (commitIDs []string, err error) {
+-	gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpen(ctx, repo)
+-	if err != nil {
+-		return nil, err
++const maxPushCommitsInCommentCount = 1000
++
++func preparePushPullCommentPushActionContent(ctx context.Context, pr *issues_model.PullRequest, oldCommitID, newCommitID string, isForcePush bool) (data issues_model.PushActionContent, shouldCreate bool, err error) {
++	if isForcePush {
++		// if it's a force push, we need to get the whole pull request commits
++		// the force-push timeline comment should always be created, so all errors are ignored and logged only.
++		mergeBase, err := gitrepo.MergeBase(ctx, pr.BaseRepo, pr.BaseBranch, newCommitID)
++		if err != nil {
++			log.Debug("MergeBase %q..%q failed: %v", pr.BaseBranch, newCommitID, err)
++		} else {
++			data.CommitIDs, err = gitrepo.GetCommitIDsBetweenReverse(ctx, pr.BaseRepo, mergeBase, newCommitID, "", maxPushCommitsInCommentCount)
++			if err != nil {
++				log.Debug("GetCommitIDsBetweenReverse %q..%q failed: %v", mergeBase, newCommitID, err)
++			}
++		}
++		return data, true, nil
+ 	}
+-	defer closer.Close()
+ 
+-	oldCommit, err := gitRepo.GetCommit(oldCommitID)
+-	if err != nil {
+-		return nil, err
+-	}
++	// for a normal push, it maybe an empty pull request, only non-empty pull request need to create push comment
++	data.CommitIDs, err = gitrepo.GetCommitIDsBetweenReverse(ctx, pr.BaseRepo, oldCommitID, newCommitID, pr.BaseBranch, maxPushCommitsInCommentCount)
++	return data, len(data.CommitIDs) > 0, err
++}
+ 
+-	newCommit, err := gitRepo.GetCommit(newCommitID)
+-	if err != nil {
+-		return nil, err
++func reconcileOldCommitCommentsForForcePush(ctx context.Context, oldCommitComments []*issues_model.Comment, newData *issues_model.PushActionContent) (needDeleteCommentIDs []int64) {
++	newPushCommitIDMaps := container.SetOf(newData.CommitIDs...)
++	for _, oldCommitComment := range oldCommitComments {
++		oldData, err := oldCommitComment.GetPushActionContent()
++		if err != nil {
++			continue
++		}
++		if oldData.IsForcePush {
++			// old comment is for force push, it should be kept
++			continue
++		}
++
++		// remove the old comment's commit IDs which are not in the new "force" push
++		oldData.CommitIDs = slices.DeleteFunc(oldData.CommitIDs, func(oldCommitID string) bool { return !newPushCommitIDMaps.Contains(oldCommitID) })
++		// if old comment doesn't contain any commit ID after the force push, then it can be deleted
++		if len(oldData.CommitIDs) == 0 {
++			needDeleteCommentIDs = append(needDeleteCommentIDs, oldCommitComment.ID)
++			continue
++		}
++		// remove new comment's commit IDs which are already in old comment
++		for _, oldCommitID := range oldData.CommitIDs {
++			newData.CommitIDs = slices.DeleteFunc(newData.CommitIDs, func(newCommitID string) bool { return newCommitID == oldCommitID })
++		}
++
++		// update the old comment's content (the commit IDs have been changed)
++		updatedOldContent, _ := json.Marshal(oldData)
++		_, err = db.GetEngine(ctx).ID(oldCommitComment.ID).Cols("content").NoAutoTime().Update(&issues_model.Comment{Content: string(updatedOldContent)})
++		if err != nil {
++			log.Error("Update Comment content failed: %v", err)
++		}
+ 	}
++	return needDeleteCommentIDs
++}
+ 
+-	// Find commits between new and old commit excluding base branch commits
+-	commits, err := gitRepo.CommitsBetweenNotBase(newCommit, oldCommit, baseBranch)
++func cleanUpOldCommitCommentsForNewForcePush(ctx context.Context, pr *issues_model.PullRequest, data *issues_model.PushActionContent) error {
++	// All old non-force-push commit comments will be deleted if they are not in the new commit list.
++	var oldCommitComments []*issues_model.Comment
++	err := db.GetEngine(ctx).Table("comment").
++		Where("issue_id = ?", pr.IssueID).And("type = ?", issues_model.CommentTypePullRequestPush).
++		Find(&oldCommitComments)
+ 	if err != nil {
+-		return nil, err
++		return err
+ 	}
+ 
+-	commitIDs = make([]string, 0, len(commits))
+-	for i := len(commits) - 1; i >= 0; i-- {
+-		commitIDs = append(commitIDs, commits[i].ID.String())
++	needDeleteCommentIDs := reconcileOldCommitCommentsForForcePush(ctx, oldCommitComments, data)
++	if len(needDeleteCommentIDs) == 0 {
++		return nil
+ 	}
+-
+-	return commitIDs, err
++	_, err = db.GetEngine(ctx).In("id", needDeleteCommentIDs).Delete(&issues_model.Comment{})
++	return err
+ }
+ 
+ // CreatePushPullComment create push code to pull base comment
+-func CreatePushPullComment(ctx context.Context, pusher *user_model.User, pr *issues_model.PullRequest, oldCommitID, newCommitID string, isForcePush bool) (comment *issues_model.Comment, err error) {
+-	if pr.HasMerged || oldCommitID == "" || newCommitID == "" {
+-		return nil, nil //nolint:nilnil // return nil because no comment needs to be created
++func CreatePushPullComment(ctx context.Context, pusher *user_model.User, pr *issues_model.PullRequest, oldRef, newRef string, isForcePush bool) (comment *issues_model.Comment, created bool, err error) {
++	if pr.HasMerged || oldRef == "" || newRef == "" {
++		return nil, false, nil
+ 	}
+ 
+-	opts := &issues_model.CreateCommentOptions{
+-		Type:  issues_model.CommentTypePullRequestPush,
+-		Doer:  pusher,
+-		Repo:  pr.BaseRepo,
+-		Issue: pr.Issue,
++	gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpen(ctx, pr.BaseRepo)
++	if err != nil {
++		return nil, false, err
+ 	}
++	defer closer.Close()
+ 
+-	var data issues_model.PushActionContent
+-	data.CommitIDs, err = getCommitIDsFromRepo(ctx, pr.BaseRepo, oldCommitID, newCommitID, pr.BaseBranch)
+-	if err != nil {
+-		// For force-push events, a missing/unreachable old commit should not prevent
+-		// deleting stale push comments or creating the force-push timeline entry.
+-		if !isForcePush {
+-			return nil, err
++	oldCommitID := oldRef
++	if !git.IsEmptyCommitID(oldRef) {
++		oldCommitID, err = gitRepo.GetRefCommitID(oldRef)
++		if err != nil {
++			return nil, false, err
+ 		}
+-		log.Error("getCommitIDsFromRepo: %v", err)
+ 	}
+-	// It maybe an empty pull request. Only non-empty pull request need to create push comment
+-	// for force push, we always need to delete the old push comment so don't return here.
+-	if len(data.CommitIDs) == 0 && !isForcePush {
+-		return nil, nil //nolint:nilnil // return nil because no comment needs to be created
++	newCommitID, err := gitRepo.GetRefCommitID(newRef)
++	if err != nil {
++		return nil, false, err
++	}
++
++	data, shouldCreate, err := preparePushPullCommentPushActionContent(ctx, pr, oldCommitID, newCommitID, isForcePush)
++	if !shouldCreate {
++		return nil, false, err
+ 	}
+ 
+-	return db.WithTx2(ctx, func(ctx context.Context) (*issues_model.Comment, error) {
++	comment, err = db.WithTx2(ctx, func(ctx context.Context) (comment *issues_model.Comment, err error) {
+ 		if isForcePush {
+-			// Push commits comment should not have history, cross references, reactions and other
+-			// plain comment related records, so that we just need to delete the comment itself.
+-			if _, err := db.GetEngine(ctx).Where("issue_id = ?", pr.IssueID).
+-				And("type = ?", issues_model.CommentTypePullRequestPush).
+-				NoAutoCondition().
+-				Delete(new(issues_model.Comment)); err != nil {
+-				return nil, err
++			err := cleanUpOldCommitCommentsForNewForcePush(ctx, pr, &data)
++			if err != nil {
++				log.Error("CleanUpOldCommitComments failed: %v", err)
+ 			}
+ 		}
+ 
+ 		if len(data.CommitIDs) > 0 {
+-			dataJSON, err := json.Marshal(data)
+-			if err != nil {
+-				return nil, err
++			// if the push has commit IDs, add a "normal push" commit comment
++			dataJSON, _ := json.Marshal(data)
++			opts := &issues_model.CreateCommentOptions{
++				Type:    issues_model.CommentTypePullRequestPush,
++				Doer:    pusher,
++				Repo:    pr.BaseRepo,
++				Issue:   pr.Issue,
++				Content: string(dataJSON),
+ 			}
+-			opts.Content = string(dataJSON)
+ 			comment, err = issues_model.CreateComment(ctx, opts)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+ 		}
+ 
+-		if isForcePush { // if it's a force push, we need to add a force push comment
+-			data.CommitIDs = []string{oldCommitID, newCommitID}
+-			data.IsForcePush = true
+-			dataJSON, err := json.Marshal(data)
+-			if err != nil {
+-				return nil, err
++		if isForcePush {
++			// if it's a force push, we need to add a force push comment
++			forcePushDataJSON, _ := json.Marshal(&issues_model.PushActionContent{IsForcePush: true, CommitIDs: []string{oldCommitID, newCommitID}})
++			opts := &issues_model.CreateCommentOptions{
++				Type:    issues_model.CommentTypePullRequestPush,
++				Doer:    pusher,
++				Repo:    pr.BaseRepo,
++				Issue:   pr.Issue,
++				Content: string(forcePushDataJSON),
++
++				// It seems the field is unnecessary anymore because PushActionContent includes IsForcePush field.
++				// However, it can't be simply removed.
++				IsForcePush: true, // See the comment of "Comment.IsForcePush"
+ 			}
+-			opts.Content = string(dataJSON)
+-			opts.IsForcePush = true // FIXME: it seems the field is unnecessary any more because PushActionContent includes IsForcePush field
+ 			comment, err = issues_model.CreateComment(ctx, opts)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+ 		}
+-
+-		return comment, err
++		return comment, nil
+ 	})
++	return comment, comment != nil, err
+ }
+diff --git a/services/pull/pull.go b/services/pull/pull.go
+index 779d2b13e1..891e358b68 100644
+--- a/services/pull/pull.go
++++ b/services/pull/pull.go
+@@ -136,7 +136,7 @@ func NewPullRequest(ctx context.Context, opts *NewPullRequestOptions) error {
+ 		}
+ 
+ 		// add first push codes comment
+-		if _, err := CreatePushPullComment(ctx, issue.Poster, pr, git.BranchPrefix+pr.BaseBranch, pr.GetGitHeadRefName(), false); err != nil {
++		if _, _, err := CreatePushPullComment(ctx, issue.Poster, pr, git.BranchPrefix+pr.BaseBranch, pr.GetGitHeadRefName(), false); err != nil {
+ 			return err
+ 		}
+ 
+@@ -343,7 +343,7 @@ func ChangeTargetBranch(ctx context.Context, pr *issues_model.PullRequest, doer
+ 			return err
+ 		}
+ 
+-		_, err = CreatePushPullComment(ctx, doer, pr, git.BranchPrefix+pr.BaseBranch, pr.GetGitHeadRefName(), false)
++		_, _, err = CreatePushPullComment(ctx, doer, pr, git.BranchPrefix+pr.BaseBranch, pr.GetGitHeadRefName(), false)
+ 		return err
+ 	})
+ }
+@@ -411,8 +411,10 @@ func AddTestPullRequestTask(opts TestPullRequestOptions) {
+ 
+ 			// create push comment before check pull request status,
+ 			// then when the status is mergeable, the comment is already in database, to make testing easy and stable
+-			comment, err := CreatePushPullComment(ctx, opts.Doer, pr, opts.OldCommitID, opts.NewCommitID, opts.IsForcePush)
+-			if err == nil && comment != nil {
++			comment, commentCreated, err := CreatePushPullComment(ctx, opts.Doer, pr, opts.OldCommitID, opts.NewCommitID, opts.IsForcePush)
++			if err != nil {
++				log.Error("CreatePushPullComment: %v", err)
++			} else if commentCreated {
+ 				notify_service.PullRequestPushCommits(ctx, opts.Doer, pr, comment)
+ 			}
+ 			// The caller can be in a goroutine or a "push queue", "conflict check" can be time-consuming,
+diff --git a/services/pull/comment_test.go b/services/pull/comment_test.go
+deleted file mode 100644
+index 580c1bb0b1..0000000000
+--- a/services/pull/comment_test.go
++++ /dev/null
+@@ -1,173 +0,0 @@
+-// Copyright 2025 The Gitea Authors. All rights reserved.
+-// SPDX-License-Identifier: MIT
+-
+-package pull
+-
+-import (
+-	"testing"
+-
+-	issues_model "code.gitea.io/gitea/models/issues"
+-	"code.gitea.io/gitea/models/unittest"
+-	user_model "code.gitea.io/gitea/models/user"
+-	"code.gitea.io/gitea/modules/gitrepo"
+-	"code.gitea.io/gitea/modules/json"
+-
+-	"github.com/stretchr/testify/assert"
+-)
+-
+-func TestCreatePushPullCommentForcePushDeletesOldComments(t *testing.T) {
+-	t.Run("base-branch-only", func(t *testing.T) {
+-		assert.NoError(t, unittest.PrepareTestDatabase())
+-
+-		pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: 2})
+-		assert.NoError(t, pr.LoadIssue(t.Context()))
+-		assert.NoError(t, pr.LoadBaseRepo(t.Context()))
+-
+-		pusher := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
+-
+-		_, err := issues_model.CreateComment(t.Context(), &issues_model.CreateCommentOptions{
+-			Type:    issues_model.CommentTypePullRequestPush,
+-			Doer:    pusher,
+-			Repo:    pr.BaseRepo,
+-			Issue:   pr.Issue,
+-			Content: "{}",
+-		})
+-		assert.NoError(t, err)
+-		_, err = issues_model.CreateComment(t.Context(), &issues_model.CreateCommentOptions{
+-			Type:    issues_model.CommentTypePullRequestPush,
+-			Doer:    pusher,
+-			Repo:    pr.BaseRepo,
+-			Issue:   pr.Issue,
+-			Content: "{}",
+-		})
+-		assert.NoError(t, err)
+-
+-		comments, err := issues_model.FindComments(t.Context(), &issues_model.FindCommentsOptions{
+-			IssueID: pr.IssueID,
+-			Type:    issues_model.CommentTypePullRequestPush,
+-		})
+-		assert.NoError(t, err)
+-		assert.Len(t, comments, 2)
+-
+-		gitRepo, err := gitrepo.OpenRepository(t.Context(), pr.BaseRepo)
+-		assert.NoError(t, err)
+-		defer gitRepo.Close()
+-
+-		headCommit, err := gitRepo.GetBranchCommit(pr.BaseBranch)
+-		assert.NoError(t, err)
+-		oldCommit := headCommit
+-		if headCommit.ParentCount() > 0 {
+-			parentCommit, err := headCommit.Parent(0)
+-			assert.NoError(t, err)
+-			oldCommit = parentCommit
+-		}
+-
+-		comment, err := CreatePushPullComment(t.Context(), pusher, pr, oldCommit.ID.String(), headCommit.ID.String(), true)
+-		assert.NoError(t, err)
+-		assert.NotNil(t, comment)
+-		var createdData issues_model.PushActionContent
+-		assert.NoError(t, json.Unmarshal([]byte(comment.Content), &createdData))
+-		assert.True(t, createdData.IsForcePush)
+-
+-		// When both commits are on the base branch, CommitsBetweenNotBase should
+-		// typically return no commits, so only the force-push comment is expected.
+-		commits, err := gitRepo.CommitsBetweenNotBase(headCommit, oldCommit, pr.BaseBranch)
+-		assert.NoError(t, err)
+-		assert.Empty(t, commits)
+-
+-		comments, err = issues_model.FindComments(t.Context(), &issues_model.FindCommentsOptions{
+-			IssueID: pr.IssueID,
+-			Type:    issues_model.CommentTypePullRequestPush,
+-		})
+-		assert.NoError(t, err)
+-		assert.Len(t, comments, 1)
+-
+-		forcePushCount := 0
+-		for _, comment := range comments {
+-			var pushData issues_model.PushActionContent
+-			assert.NoError(t, json.Unmarshal([]byte(comment.Content), &pushData))
+-			if pushData.IsForcePush {
+-				forcePushCount++
+-			}
+-		}
+-		assert.Equal(t, 1, forcePushCount)
+-	})
+-
+-	t.Run("head-vs-base-branch", func(t *testing.T) {
+-		assert.NoError(t, unittest.PrepareTestDatabase())
+-
+-		pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: 2})
+-		assert.NoError(t, pr.LoadIssue(t.Context()))
+-		assert.NoError(t, pr.LoadBaseRepo(t.Context()))
+-
+-		pusher := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
+-
+-		_, err := issues_model.CreateComment(t.Context(), &issues_model.CreateCommentOptions{
+-			Type:    issues_model.CommentTypePullRequestPush,
+-			Doer:    pusher,
+-			Repo:    pr.BaseRepo,
+-			Issue:   pr.Issue,
+-			Content: "{}",
+-		})
+-		assert.NoError(t, err)
+-		_, err = issues_model.CreateComment(t.Context(), &issues_model.CreateCommentOptions{
+-			Type:    issues_model.CommentTypePullRequestPush,
+-			Doer:    pusher,
+-			Repo:    pr.BaseRepo,
+-			Issue:   pr.Issue,
+-			Content: "{}",
+-		})
+-		assert.NoError(t, err)
+-
+-		comments, err := issues_model.FindComments(t.Context(), &issues_model.FindCommentsOptions{
+-			IssueID: pr.IssueID,
+-			Type:    issues_model.CommentTypePullRequestPush,
+-		})
+-		assert.NoError(t, err)
+-		assert.Len(t, comments, 2)
+-
+-		gitRepo, err := gitrepo.OpenRepository(t.Context(), pr.BaseRepo)
+-		assert.NoError(t, err)
+-		defer gitRepo.Close()
+-
+-		// In this subtest, use the head branch for the new commit and the base branch
+-		// for the old commit so that CommitsBetweenNotBase returns non-empty results.
+-		headCommit, err := gitRepo.GetBranchCommit(pr.HeadBranch)
+-		assert.NoError(t, err)
+-
+-		baseCommit, err := gitRepo.GetBranchCommit(pr.BaseBranch)
+-		assert.NoError(t, err)
+-		oldCommit := baseCommit
+-
+-		comment, err := CreatePushPullComment(t.Context(), pusher, pr, oldCommit.ID.String(), headCommit.ID.String(), true)
+-		assert.NoError(t, err)
+-		assert.NotNil(t, comment)
+-		var createdData issues_model.PushActionContent
+-		assert.NoError(t, json.Unmarshal([]byte(comment.Content), &createdData))
+-		assert.True(t, createdData.IsForcePush)
+-
+-		commits, err := gitRepo.CommitsBetweenNotBase(headCommit, oldCommit, pr.BaseBranch)
+-		assert.NoError(t, err)
+-		// For this scenario we expect at least one commit between head and base
+-		// that is not on the base branch, so data.CommitIDs should be non-empty.
+-		assert.NotEmpty(t, commits)
+-
+-		comments, err = issues_model.FindComments(t.Context(), &issues_model.FindCommentsOptions{
+-			IssueID: pr.IssueID,
+-			Type:    issues_model.CommentTypePullRequestPush,
+-		})
+-		assert.NoError(t, err)
+-		// Two comments should exist now: one regular push comment and one force-push comment.
+-		assert.Len(t, comments, 2)
+-
+-		forcePushCount := 0
+-		for _, comment := range comments {
+-			var pushData issues_model.PushActionContent
+-			assert.NoError(t, json.Unmarshal([]byte(comment.Content), &pushData))
+-			if pushData.IsForcePush {
+-				forcePushCount++
+-			}
+-		}
+-		assert.Equal(t, 1, forcePushCount)
+-	})
+-}

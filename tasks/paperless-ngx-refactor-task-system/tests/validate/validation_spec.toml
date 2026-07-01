@@ -1,0 +1,1417 @@
+# Validation spec for paperless-ngx-refactor-task-system.
+#
+# Every story drives the system through PUBLIC, version-stable interfaces and
+# observes the result through the same: nothing imports an agent-defined
+# symbol (handler functions, helper functions, the tracked-task map, the
+# result TypedDicts, the run allowlist, or any internal model field name).
+#
+# Two interface surfaces only:
+#   - Celery's PUBLIC lifecycle signals (before_task_publish / task_prerun /
+#     task_postrun / task_failure / task_revoked) drive PaperlessTask state IN.
+#     The harness dispatches them exactly as the worker would.
+#   - The version-stable HTTP endpoint /api/tasks/ (and its actions) reads
+#     state OUT, in either the v9 or v10 representation.
+#
+# The v10 representation field NAMES and the structured result-dict keys are
+# DESIGNED BY THE IMPLEMENTATION, so the stories DISCOVER them from the
+# serializer / model / consume task and assert on concrete VALUES. The v9
+# (legacy) field names are an external API contract and are reproduced
+# exactly. This makes every story architecture-agnostic: a valid
+# implementation that names its v10 fields, its consume-result keys, or its
+# internal helpers differently still passes.
+
+instructions = """
+This task redesigns paperless-ngx's background-task tracking system. Every
+Celery background job must be recorded automatically and uniformly through
+Celery's task-lifecycle signals, with a structured status lifecycle, queue/run
+timing, structured per-task input and result data, and the trigger source.
+A monitoring API (list / summary / active / run / acknowledge) sits on top,
+behind permissions, and the legacy v9 task wire-format must keep working
+unchanged for old clients while v10 clients get the richer representation.
+
+## Harness — read /tests/validate/test_harness.py
+
+The harness provides ONLY framework mechanics (no assertions, no
+implementation discovery by agent-invented name):
+
+- ``make_user(username, *, is_superuser=False, model_perms=None)`` — create a
+  User, optionally granting model-level permissions by codename.
+- ``api_client(user=None, *, version=10)`` — DRF ``APIClient`` authenticated
+  as ``user`` with the Accept header for the given API version (9 → legacy
+  shape, 10 → new shape; ``version=None`` → no explicit Accept header).
+- ``grant_object_perm(codename, user, obj)`` — Guardian ``assign_perm``.
+- ``make_document(*, owner=None, title=..., checksum=None)`` — a real
+  ``Document`` row (for the duplicate-documents permission story).
+- ``make_consumable_document(*, filename=..., mime_type=..., original_path=None,
+  mailrule_id=None)`` — a stand-in for the consumable-document input a consume
+  task carries (attribute access only).
+- ``make_overrides(**kwargs)`` — a REAL ``DocumentMetadataOverrides`` carrying
+  the given fields (e.g. ``owner_id``); used as the consume task's overrides
+  input.
+- ``new_task_id()`` — a fresh unique Celery task id.
+- Lifecycle-signal drivers (these are how you create / transition rows):
+  - ``publish_task(task_name, *, task_id, trigger_source=None, args=None,
+    kwargs=None)`` — fire ``before_task_publish`` (queues a task).
+  - ``start_task(task_id)`` — fire ``task_prerun`` (worker picks it up).
+  - ``finish_task(task_id, *, state="SUCCESS", retval=None)`` — fire
+    ``task_postrun`` with a terminal Celery state and return value. ``retval``
+    is the value the task returned; for a consume task this is the structured
+    consume result (see "Discovering the structured consume-result shape").
+  - ``fail_task(task_id, *, exception)`` — fire ``task_failure``.
+  - ``revoke_task(task_id)`` — fire ``task_revoked``.
+- Task-name constants: ``CONSUME_FILE_TASK``, ``TRAIN_CLASSIFIER_TASK``,
+  ``SANITY_CHECK_TASK``, ``LLM_INDEX_TASK``, ``MAIL_FETCH_TASK`` (the real
+  registered Celery task names a correct implementation must recognise), and
+  ``UNTRACKED_TASK`` (a task name that is NOT one of the tracked background
+  jobs).
+
+## How to create and observe task records
+
+Create records by dispatching Celery's lifecycle signals via the harness
+drivers — NEVER by importing the agent's signal handlers or constructing the
+model directly. Observe records by issuing HTTP requests to ``/api/tasks/``
+(and its actions) with an authenticated ``api_client`` and reading the JSON
+response. Filter a single record with ``client.get("/api/tasks/",
+{"task_id": <id>})`` (the ``task_id`` filter and field carry the Celery task
+id string — a pre-existing, stable key).
+
+## Versioning
+
+``api_client(user, version=10)`` negotiates the new representation (paginated
+``{count, results}`` envelope, new structured field names). ``version=9``
+negotiates the legacy representation (a plain, unpaginated list with the old
+field names/values). Both versions are served from the same endpoint. The
+``{count, results}`` envelope is the pre-existing standard pagination shape and
+may be referenced directly.
+
+## Discovering the redesigned (v10) representation shape
+
+The v10 ``/api/tasks/`` representation is BUILT BY THE IMPLEMENTATION, so its
+exact JSON key names are NOT prescribed. Where a story refers to a v10 field by
+CONCEPT — the lifecycle-status field, the task-type field, the trigger-source
+field, the structured input payload, the structured result payload, the
+queue-wait and run-duration timing fields, the started/finished timestamps, the
+related-document-ids list, the acknowledged flag — DISCOVER the implementation's
+actual key name from its task serializer / model and assert on the concrete
+expected VALUE. Likewise the ``summary`` action's per-type aggregate keys (the
+task-type grouping key, the per-state counts, the average-timing value) and the
+``run`` action's dispatched-task-id response key are implementation-named —
+discover them from the relevant view/serializer.
+
+The enumerated VALUES are contracted by the data model and are given concretely
+in each story (e.g. the freshly-published status value ``pending``; the
+trigger-source values ``web_ui`` / ``scheduled`` / the ``manual`` fallback; the
+task-type value ``consume_file``). PRESCRIBED (do not discover): the
+``/api/tasks/`` endpoint and its actions, the ``{count, results}`` v10 envelope,
+the ``task_id`` field/filter (Celery task id) and the database ``id`` primary
+key, HTTP status codes, and ALL version=9 legacy field names.
+
+## Discovering the structured consume-result shape
+
+A consume task returns a STRUCTURED result distinguishing a produced document
+from a detected duplicate; the key names in that result are the
+implementation's choice. Before any story that completes a consume task with a
+result, READ the consume task's return shape (its return type / result
+TypedDicts / the consume task in the documents app) to find the key it uses for
+the produced-document id and the key it uses for the duplicated-document id.
+Build the ``retval`` dict you pass to ``finish_task(..., retval=...)`` using
+THOSE discovered keys, then assert the CONTRACT-derived observable (the v10
+``related-document-ids`` list, or the v9 ``related_document`` /
+``duplicate_documents`` fields). Do NOT hardcode a result key name. For
+example, if the consume task returns its produced id under a key like
+``document_id`` you would pass ``retval={"document_id": 11}`` — but discover the
+actual name rather than assuming it.
+
+## Permissions
+
+Non-superuser users need model-level Django permissions for the operations
+they perform: ``documents.view_paperlesstask`` to LIST tasks,
+``documents.change_paperlesstask`` to acknowledge. The monitoring summary is
+gated by a renamed system-monitoring permission (the redesign renames the
+pre-existing ``view_system_status`` custom permission to a monitoring-scoped
+codename). Its exact new codename is NOT prescribed — DISCOVER it (see
+"Discovering the system-monitoring permission") and grant THAT codename via
+``model_perms``. Use ``make_user(is_superuser=True)`` for tests that don't
+exercise a permission edge.
+
+## Discovering the system-monitoring permission
+
+The summary action is gated by a single custom permission that the redesign
+renames from the pre-existing ``view_system_status``; its new codename is the
+implementation's choice (e.g. ``view_monitoring`` / ``view_system_monitoring``).
+Do NOT hardcode it and do NOT guess it by keyword — DISCOVER the exact codename by
+reading how THIS implementation gates the monitoring summary, then grant THAT
+codename:
+
+- Read the permission gate the summary endpoint actually uses: the
+  ``GET /api/tasks/summary/`` view (its DRF permission class, or a
+  ``user.has_perm("paperless.<codename>")`` check) and/or the monitoring
+  permission helper in ``src/documents/permissions.py``. The codename it requires
+  for global monitoring visibility IS the renamed permission — read it verbatim
+  from the source.
+- Cross-check it against the custom permission the redesign declares in its
+  model ``Meta.permissions`` (pre-fix this permission lived on
+  ``ApplicationConfiguration``). The pre-existing ``view_global_statistics`` is a
+  separate, unrelated permission — not this one.
+
+Use the bare codename you read from the gate (e.g. ``view_monitoring`` — WITHOUT
+the ``paperless.`` app-label prefix) as ``mon_perm`` and grant it via
+``model_perms=[mon_perm]``.
+
+## Sentinels
+
+TOML cannot express ``None``. Where a value may be absent, the procedure maps
+it to the string ``"__absent__"`` (or ``"__none__"``) and the expected value
+uses that sentinel.
+"""
+
+[settings.pytest]
+# Run pytest inside paperless's uv-managed venv so Django, DRF, guardian,
+# factory_boy, celery etc. all resolve.
+python = "uv run --frozen --no-sync python"
+django_settings = "paperless.settings"
+extra_pythonpath = ["src"]
+
+
+# =============================================================================
+# Lifecycle: publish → start → terminal, observed via the v10 representation
+# (merges automatic-recording-on-publish, start/finish timing, and the
+#  failure/revoked transitions — one signals-in / v10-out path, many outcomes)
+# =============================================================================
+
+[[story]]
+id = "lifecycle"
+driver = "pytest"
+description = """
+Every tracked job gets recorded automatically as it goes through the queue.
+Gets created pending on publish (capture its kind, trigger source, and
+structured inputs; default to manual), advanced through started, and finalized
+on success, failure (owned by the failure path, not the success path), or
+revocation. Untracked jobs are ignored.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    import json
+    import pytest
+    from test_harness import (
+        api_client, make_user, new_task_id,
+        publish_task, start_task, finish_task, fail_task, revoke_task,
+        make_consumable_document, make_overrides,
+        CONSUME_FILE_TASK, TRAIN_CLASSIFIER_TASK, UNTRACKED_TASK,
+    )
+
+This test must be decorated with ``@pytest.mark.django_db``.
+
+Discover the v10 field names you need (see "Discovering the redesigned (v10)
+representation shape"): the lifecycle-status field, the task-type field, the
+trigger-source field, the structured input payload (and within it the captured
+original filename), the structured result payload, the started/finished
+timestamp fields, and the queue-wait and run-duration timing fields.
+
+Steps:
+
+1. ``admin = make_user(username=f"admin_{inputs['case_label']}", is_superuser=True)``;
+   ``client = api_client(user=admin, version=10)``.
+2. ``tid = new_task_id()``.
+3. Pick the task name + kwargs from ``inputs["task_key"]``:
+   - ``"consume"``: ``input_doc = make_consumable_document(filename="invoice.pdf",
+     mime_type="application/pdf")``; ``kwargs = {"input_doc": input_doc,
+     "overrides": make_overrides()}``; ``task_name = CONSUME_FILE_TASK``.
+   - ``"train"``: ``kwargs = {}``; ``task_name = TRAIN_CLASSIFIER_TASK``.
+   - ``"untracked"``: ``kwargs = {}``; ``task_name = UNTRACKED_TASK``.
+4. Resolve the trigger: ``trig = None if inputs["trigger"] == "__omit__" else
+   inputs["trigger"]``.
+5. Drive the lifecycle per ``inputs["outcome"]``:
+   - ``"publish_only"``: ``publish_task(task_name, task_id=tid,
+     trigger_source=trig, kwargs=kwargs)``.
+   - ``"success"``: publish (as above); ``start_task(tid)``;
+     ``finish_task(tid, state="SUCCESS", retval=None)``.
+   - ``"postrun_failure_state"``: publish; ``start_task(tid)``;
+     ``finish_task(tid, state="FAILURE", retval=None)``.
+   - ``"failure"``: publish; ``start_task(tid)``;
+     ``fail_task(tid, exception=ValueError("boom"))``.
+   - ``"revoked"``: publish; ``start_task(tid)``; ``revoke_task(tid)``.
+6. ``response = client.get("/api/tasks/", {"task_id": tid})``:
+       data = response.data
+       results = data["results"] if isinstance(data, dict) else data
+       row_count = len(results)
+       first = results[0] if results else {}
+   Compute these observables, reading each v10 field by its DISCOVERED name:
+       status_v   = <discovered status field>            or "__absent__"
+       task_type_v= <discovered task-type field>          or "__absent__"
+       trigger_v  = <discovered trigger-source field>     or "__absent__"
+       payload    = <discovered input payload> or {}
+       filename_v = payload.get("filename", "__absent__")
+       started_present = <discovered date-started> is not None
+       done_present    = <discovered date-finished> is not None
+       dur  = <discovered run-duration field>
+       wait = <discovered queue-wait field>
+       duration_nonneg = (dur is not None and dur >= 0)
+       wait_nonneg     = (wait is not None and wait >= 0)
+       result_payload  = <discovered structured result payload> or {}
+       err_dump = json.dumps(result_payload)
+       error_tokens_present = ("boom" in err_dump and "ValueError" in err_dump)
+   Every case's ``expected`` dict carries the SAME key set. For EACH key below,
+   SKIP the assertion when the case's expected value is the string
+   ``"__skip__"`` (that key is irrelevant to this case's outcome); otherwise
+   assert the matching observable equals it (``"__absent__"`` means assert the
+   observable is missing/None — the observables above already default missing
+   fields to ``"__absent__"``):
+   - EXPECTED: row_count equals expected["row_count"]
+   - EXPECTED: status equals expected["status"]
+   - EXPECTED: task_type equals expected["task_type"]
+   - EXPECTED: trigger_source equals expected["trigger_source"]
+   - EXPECTED: filename equals expected["filename"]
+   - EXPECTED: started_present equals expected["started_present"]
+   - EXPECTED: done_present equals expected["done_present"]
+   - EXPECTED: duration_nonneg equals expected["duration_nonneg"]
+   - EXPECTED: wait_nonneg equals expected["wait_nonneg"]
+   - EXPECTED: error_tokens_present equals expected["error_tokens_present"]
+
+Reasoning: pending cases prove automatic recording + trigger-source fallback +
+input capture + tracked-task gating (untracked → row_count 0). The success case
+proves started→success with both timing values populated and non-negative. The
+postrun-failure-state case proves the success/postrun path does NOT claim a
+FAILURE-state task (it stays started, no finish stamp). The failure case proves
+a raise yields a failure status with the exception type+message captured in the
+structured result. The revoked case proves a revoke yields a revoked status with
+the finish timestamp stamped. Every case fails pre-fix (no signal-driven
+tracking of non-consume tasks, no structured fields, no lifecycle states).
+"""
+
+# Every case carries the same 10 expected keys; "__skip__" marks the keys an
+# outcome does not exercise (see the procedure's skip rule).
+# --- automatic recording on publish + trigger-source resolution -------------
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "publish_consume_web_ui"
+task_key = "consume"
+trigger = "web_ui"
+outcome = "publish_only"
+[story.test_case.expected]
+row_count = 1
+status = "pending"
+task_type = "consume_file"
+trigger_source = "web_ui"
+filename = "invoice.pdf"
+started_present = "__skip__"
+done_present = "__skip__"
+duration_nonneg = "__skip__"
+wait_nonneg = "__skip__"
+error_tokens_present = "__skip__"
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "publish_consume_scheduled"
+task_key = "consume"
+trigger = "scheduled"
+outcome = "publish_only"
+[story.test_case.expected]
+row_count = 1
+status = "pending"
+task_type = "consume_file"
+trigger_source = "scheduled"
+filename = "invoice.pdf"
+started_present = "__skip__"
+done_present = "__skip__"
+duration_nonneg = "__skip__"
+wait_nonneg = "__skip__"
+error_tokens_present = "__skip__"
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "publish_missing_trigger_defaults_manual"
+task_key = "consume"
+trigger = "__omit__"
+outcome = "publish_only"
+[story.test_case.expected]
+row_count = 1
+status = "pending"
+task_type = "consume_file"
+trigger_source = "manual"
+filename = "invoice.pdf"
+started_present = "__skip__"
+done_present = "__skip__"
+duration_nonneg = "__skip__"
+wait_nonneg = "__skip__"
+error_tokens_present = "__skip__"
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "publish_bogus_trigger_defaults_manual"
+task_key = "consume"
+trigger = "not_a_real_source"
+outcome = "publish_only"
+[story.test_case.expected]
+row_count = 1
+status = "pending"
+task_type = "consume_file"
+trigger_source = "manual"
+filename = "invoice.pdf"
+started_present = "__skip__"
+done_present = "__skip__"
+duration_nonneg = "__skip__"
+wait_nonneg = "__skip__"
+error_tokens_present = "__skip__"
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "untracked_ignored"
+task_key = "untracked"
+trigger = "web_ui"
+outcome = "publish_only"
+[story.test_case.expected]
+row_count = 0
+status = "__absent__"
+task_type = "__absent__"
+trigger_source = "__absent__"
+filename = "__skip__"
+started_present = "__skip__"
+done_present = "__skip__"
+duration_nonneg = "__skip__"
+wait_nonneg = "__skip__"
+error_tokens_present = "__skip__"
+
+# --- start/finish timing -----------------------------------------------------
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "success_timing"
+task_key = "consume"
+trigger = "web_ui"
+outcome = "success"
+[story.test_case.expected]
+row_count = 1
+status = "success"
+task_type = "__skip__"
+trigger_source = "__skip__"
+filename = "__skip__"
+started_present = true
+done_present = true
+duration_nonneg = true
+wait_nonneg = true
+error_tokens_present = false
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "postrun_skips_failure_state"
+task_key = "consume"
+trigger = "web_ui"
+outcome = "postrun_failure_state"
+[story.test_case.expected]
+row_count = 1
+status = "started"
+task_type = "__skip__"
+trigger_source = "__skip__"
+filename = "__skip__"
+started_present = true
+done_present = false
+duration_nonneg = false
+wait_nonneg = false
+error_tokens_present = "__skip__"
+
+# --- failure + revoked transitions ------------------------------------------
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "failure_captures_error"
+task_key = "train"
+trigger = "scheduled"
+outcome = "failure"
+[story.test_case.expected]
+row_count = 1
+status = "failure"
+task_type = "__skip__"
+trigger_source = "__skip__"
+filename = "__skip__"
+started_present = "__skip__"
+done_present = true
+duration_nonneg = "__skip__"
+wait_nonneg = "__skip__"
+error_tokens_present = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "revoked"
+task_key = "train"
+trigger = "scheduled"
+outcome = "revoked"
+[story.test_case.expected]
+row_count = 1
+status = "revoked"
+task_type = "__skip__"
+trigger_source = "__skip__"
+filename = "__skip__"
+started_present = "__skip__"
+done_present = true
+duration_nonneg = "__skip__"
+wait_nonneg = "__skip__"
+error_tokens_present = false
+
+
+# =============================================================================
+# v10 representation: paginated envelope + new structured fields + the
+# related-document-ids derived from the structured consume result
+# (merges the envelope/field-presence story and the related-document-ids story)
+# =============================================================================
+
+[[story]]
+id = "v10_representation"
+driver = "pytest"
+description = """
+v10 clients get the richer, paginated representation. Each task exposes the new
+structured fields (type, trigger, status, structured inputs/results, queue/run
+timing) and a related-doc-ids list derived from the structured result.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    import pytest
+    from test_harness import (
+        api_client, make_user, new_task_id,
+        publish_task, start_task, finish_task,
+        CONSUME_FILE_TASK, make_consumable_document, make_overrides,
+    )
+
+This test must be decorated with ``@pytest.mark.django_db``.
+
+Discover (see the discovery notes): the set of new v10 field names the listing
+exposes per item (task-type, trigger-source, lifecycle-status, input payload,
+result payload, run-duration, queue-wait, related-document-ids), the
+related-document-ids field name, and — for the result-bearing cases — the
+consume task's produced-document-id and duplicate-document-id result keys.
+
+Steps:
+
+1. ``admin = make_user(username=f"admin_{inputs['case_label']}", is_superuser=True)``;
+   ``client = api_client(user=admin, version=10)``.
+2. ``tid = new_task_id()``; publish a consume task:
+       publish_task(CONSUME_FILE_TASK, task_id=tid, trigger_source="web_ui",
+                    kwargs={"input_doc": make_consumable_document(),
+                            "overrides": make_overrides()})
+3. Apply the result per ``inputs["result_kind"]``:
+   - ``"empty"``: leave the task pending (do not start/finish).
+   - ``"produced"``: ``start_task(tid)``; ``finish_task(tid, state="SUCCESS",
+     retval={<discovered produced-document-id key>: inputs["result_id"]})``.
+   - ``"duplicate"``: ``start_task(tid)``; ``finish_task(tid, state="SUCCESS",
+     retval={<discovered duplicate-document-id key>: inputs["result_id"]})``.
+4. ``response = client.get("/api/tasks/")``:
+       data = response.data
+       is_dict = isinstance(data, dict)
+       has_count = is_dict and "count" in data
+       has_results = is_dict and "results" in data
+       results = data["results"] if has_results else []
+       results_len = len(results)
+       first = results[0] if results else {}
+   Build the list of expected new v10 field names from the concepts you
+   discovered and set ``has_new_fields`` to whether every one is present on
+   ``first``. Read (by discovered name): ``task_type_v`` (the task-type field),
+   ``status_v`` (the status field), and ``rdi`` (the related-document-ids list,
+   defaulting to ``"__absent__"`` if missing).
+   Every case's ``expected`` carries the same keys; for each, SKIP it when its
+   value is ``"__skip__"`` otherwise assert (observable in parentheses):
+   - EXPECTED: has_count equals expected["has_count"]
+   - EXPECTED: has_results equals expected["has_results"]
+   - EXPECTED: results_len equals expected["results_len"]
+   - EXPECTED: has_new_fields equals expected["has_new_fields"]
+   - EXPECTED: task_type equals expected["task_type"]   (observable task_type_v)
+   - EXPECTED: status equals expected["status"]   (observable status_v; "__skip__" for the result-bearing cases)
+   - EXPECTED: related_document_ids equals expected["related_document_ids"]   (observable rdi)
+
+Reasoning: the {count, results} envelope plus the full set of new structured
+field names is the v10 contract, and the related-document-ids list reflects the
+structured result — [produced id], [duplicate id], or [] when there is no result
+yet. Pre-fix there is no envelope of new fields and no parsed related-document
+list, so every case fails.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "pending_empty"
+result_kind = "empty"
+result_id = 0
+[story.test_case.expected]
+has_count = true
+has_results = true
+results_len = 1
+has_new_fields = true
+task_type = "consume_file"
+status = "pending"
+related_document_ids = []
+
+# produced/duplicate cases assert the envelope + new-field presence + the
+# derived related-document-ids; the v10 status is "__skip__" here (status on a
+# result-bearing consume is exercised in the dedicated `lifecycle` story, not
+# pinned here).
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "produced_document"
+result_kind = "produced"
+result_id = 11
+[story.test_case.expected]
+has_count = true
+has_results = true
+results_len = 1
+has_new_fields = true
+task_type = "consume_file"
+status = "__skip__"
+related_document_ids = [11]
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "detected_duplicate"
+result_kind = "duplicate"
+result_id = 22
+[story.test_case.expected]
+has_count = true
+has_results = true
+results_len = 1
+has_new_fields = true
+task_type = "consume_file"
+status = "__skip__"
+related_document_ids = [22]
+
+
+# =============================================================================
+# v9 representation: plain unpaginated list, legacy field NAMES (external
+# contract) + legacy value remaps reconstructed from the structured result
+# (merges the plain-list/legacy-keys story and the value-mappings story)
+# =============================================================================
+
+[[story]]
+id = "v9_representation"
+driver = "pytest"
+description = """
+v9 clients get the unchanged legacy list using the old field names and values:
+legacy task names, the type derived from the trigger (scheduled → scheduled_task;
+system/email/folder → auto_task; else manual_task), status, the reconstructed
+result string, the related document, and the duplicate-docs list. A detected
+duplicate counts as a failure.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    import pytest
+    from test_harness import (
+        api_client, make_user, new_task_id,
+        publish_task, start_task, finish_task,
+        CONSUME_FILE_TASK, SANITY_CHECK_TASK, LLM_INDEX_TASK,
+        make_consumable_document, make_overrides,
+    )
+
+This test must be decorated with ``@pytest.mark.django_db``.
+
+The version=9 field names are an external API contract — use them exactly:
+``task_name``, ``task_file_name``, ``type``, ``status``, ``result``,
+``related_document``, ``duplicate_documents``. For a result-bearing consume
+case, build the ``retval`` using the DISCOVERED consume-result key (the
+produced-document-id key for a success, the duplicate-document-id key for a
+duplicate) — see "Discovering the structured consume-result shape".
+
+Steps:
+
+1. ``admin = make_user(username=f"admin_{inputs['case_label']}", is_superuser=True)``;
+   ``client = api_client(user=admin, version=9)``.
+2. ``tid = new_task_id()``. Choose the task per ``inputs["task_key"]``:
+   ``{"sanity": SANITY_CHECK_TASK, "llm": LLM_INDEX_TASK,
+   "consume": CONSUME_FILE_TASK}[inputs["task_key"]]``. For a consume task pass
+   ``kwargs={"input_doc": make_consumable_document(filename=inputs["filename"]),
+   "overrides": make_overrides()}``; for the others pass ``kwargs={}``.
+3. ``publish_task(task_name, task_id=tid, trigger_source=inputs["trigger"],
+   kwargs=kwargs)``.
+4. Apply a result per ``inputs["result_kind"]``:
+   - ``"none"``: leave pending.
+   - ``"produced"``: ``start_task(tid)``; ``finish_task(tid, state="SUCCESS",
+     retval={<discovered produced-document-id key>: inputs["result_id"]})``.
+   - ``"duplicate"``: ``start_task(tid)``; ``finish_task(tid, state="SUCCESS",
+     retval={<discovered duplicate-document-id key>: inputs["result_id"]})``.
+5. ``response = client.get("/api/tasks/", {"task_id": tid})``:
+       data = response.data
+       is_plain_list = isinstance(data, list)
+       item = data[0] if (is_plain_list and data) else {}
+       legacy = ["task_name", "task_file_name", "type", "status", "result",
+                 "related_document", "duplicate_documents"]
+       has_legacy_keys = all(k in item for k in legacy)
+       # the new v10 field names must be absent — probe with the concepts you
+       # discovered for the v10 representation (e.g. the task-type field name
+       # and the related-document-ids field name, which differ from the v9
+       # `type` / `related_document`):
+       has_v10_only = any(k in item for k in <discovered v10-only field names>)
+       task_name_v = item.get("task_name", "__absent__")
+       type_v = item.get("type", "__absent__")
+       status_v = item.get("status", "__absent__")
+       file_v = item.get("task_file_name", "__absent__")
+       related_document = item.get("related_document", "__absent__")
+       dup_docs = item.get("duplicate_documents")
+       dup_len = len(dup_docs) if isinstance(dup_docs, list) else -1
+       result_v = item.get("result")
+       result_str = result_v if result_v is not None else "__none__"
+       # for the duplicate case, match contract tokens rather than an exact
+       # reconstructed sentence (the exact phrasing is implementation-chosen):
+       rid = str(inputs["result_id"])
+       result_dup_ok = (result_v is not None
+                        and ("#" + rid) in result_v
+                        and ("duplicate" in result_v.lower()
+                             or "not consuming" in result_v.lower()))
+   Every case's ``expected`` dict carries the SAME key set; for each key, SKIP
+   it when its value is the string ``"__skip__"`` otherwise assert (observable
+   in parentheses; ``"__none__"`` for ``result`` means assert result_str ==
+   "__none__"):
+   - EXPECTED: is_plain_list equals expected["is_plain_list"]
+   - EXPECTED: has_legacy_keys equals expected["has_legacy_keys"]
+   - EXPECTED: has_v10_only equals expected["has_v10_only"]
+   - EXPECTED: task_name equals expected["task_name"]   (observable task_name_v)
+   - EXPECTED: type equals expected["type"]   (observable type_v)
+   - EXPECTED: status equals expected["status"]   (observable status_v)
+   - EXPECTED: task_file_name equals expected["task_file_name"]   (observable file_v)
+   - EXPECTED: related_document equals expected["related_document"]
+   - EXPECTED: duplicate_documents_len equals expected["duplicate_documents_len"]   (observable dup_len)
+   - EXPECTED: result equals expected["result"]   (observable result_str, exact)
+   - EXPECTED: result_dup_ok equals expected["result_dup_ok"]   (token match)
+
+Reasoning: a v9 client receives a plain list whose items carry the legacy keys
+with legacy semantics (uppercase status, reconstructed result string, related
+document id) and never the new v10-only keys. Each case pins a distinct legacy
+remap: the renamed sanity-check / llm-index task names, the
+scheduled/auto/manual type derivation, the exact pre-existing success string,
+and the duplicate-as-FAILURE with the duplicated id surfaced in the result and
+the duplicate-documents list. Pre-fix there is no version split.
+"""
+
+# happy path: consume success — carries the plain-list / legacy-keys / no-v10
+# invariants AND the exact pre-existing success string + related_document
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "consume_web_ui_success"
+task_key = "consume"
+filename = "invoice.pdf"
+trigger = "web_ui"
+result_kind = "produced"
+result_id = 5
+# Every case carries the same 11 expected keys; "__skip__" marks the keys a
+# case does not exercise (see the procedure's skip rule).
+[story.test_case.expected]
+is_plain_list = true
+has_legacy_keys = true
+has_v10_only = false
+task_name = "consume_file"
+type = "manual_task"
+status = "SUCCESS"
+task_file_name = "invoice.pdf"
+result = "Success. New document id 5 created"
+related_document = 5
+duplicate_documents_len = 0
+result_dup_ok = "__skip__"
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "sanity_scheduled"
+task_key = "sanity"
+filename = "__none__"
+trigger = "scheduled"
+result_kind = "none"
+result_id = 0
+[story.test_case.expected]
+is_plain_list = "__skip__"
+has_legacy_keys = "__skip__"
+has_v10_only = "__skip__"
+task_name = "check_sanity"
+type = "scheduled_task"
+status = "PENDING"
+task_file_name = "__skip__"
+result = "__none__"
+related_document = "__skip__"
+duplicate_documents_len = "__skip__"
+result_dup_ok = "__skip__"
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "llm_system"
+task_key = "llm"
+filename = "__none__"
+trigger = "system"
+result_kind = "none"
+result_id = 0
+[story.test_case.expected]
+is_plain_list = "__skip__"
+has_legacy_keys = "__skip__"
+has_v10_only = "__skip__"
+task_name = "llmindex_update"
+type = "auto_task"
+status = "PENDING"
+task_file_name = "__skip__"
+result = "__none__"
+related_document = "__skip__"
+duplicate_documents_len = "__skip__"
+result_dup_ok = "__skip__"
+
+# duplicate: recorded as FAILURE; result matched by tokens (#9 + duplicate
+# signal), not the exact implementation-chosen sentence
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "consume_email_duplicate"
+task_key = "consume"
+filename = "scan.pdf"
+trigger = "email_consume"
+result_kind = "duplicate"
+result_id = 9
+[story.test_case.expected]
+is_plain_list = "__skip__"
+has_legacy_keys = "__skip__"
+has_v10_only = "__skip__"
+task_name = "consume_file"
+type = "auto_task"
+status = "FAILURE"
+task_file_name = "__skip__"
+result = "__skip__"
+related_document = "__skip__"
+duplicate_documents_len = "__skip__"
+result_dup_ok = true
+
+
+# =============================================================================
+# Monitoring summary: per-type aggregation + day-window clamping
+# =============================================================================
+
+[[story]]
+id = "summary_aggregation"
+driver = "pytest"
+description = """
+The monitoring summary aggregates per task type (counts by state, average
+timing) over a day-window query parameter (clamp to a maximum, floor at 1,
+reject invalid).
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    import pytest
+    from test_harness import (
+        api_client, make_user, new_task_id,
+        publish_task, start_task, finish_task, fail_task,
+        CONSUME_FILE_TASK, make_consumable_document, make_overrides,
+    )
+
+This test must be decorated with ``@pytest.mark.django_db``.
+
+Discover (see the discovery notes) the summary entry's keys: the task-type
+grouping key (value ``consume_file``), the total count, the per-state counts
+(pending / success / failure), and the average run-duration value.
+
+Steps:
+
+1. ``admin = make_user(username=f"admin_{inputs['case_label']}", is_superuser=True)``;
+   ``client = api_client(user=admin, version=10)``.
+2. Create three consume tasks in distinct terminal states:
+       def new_consume():
+           t = new_task_id()
+           publish_task(CONSUME_FILE_TASK, task_id=t, trigger_source="web_ui",
+                        kwargs={"input_doc": make_consumable_document(),
+                                "overrides": make_overrides()})
+           return t
+       new_consume()                                              # pending
+       t_ok = new_consume(); start_task(t_ok); finish_task(t_ok, state="SUCCESS")
+       t_err = new_consume(); start_task(t_err)
+       fail_task(t_err, exception=RuntimeError("explode"))
+3. Build params from ``inputs["days"]`` (omit when ``"__omit__"``) and
+   ``response = client.get("/api/tasks/summary/", params)``:
+       status_code = response.status_code
+       has_days_error = (status_code == 400 and isinstance(response.data, dict)
+                         and "days" in response.data)
+       entry = None
+       if status_code == 200 and isinstance(response.data, list):
+           # locate the consume_file entry by the discovered task-type key:
+           entry = next((e for e in response.data
+                         if e.get(<discovered task-type key>) == "consume_file"),
+                        None)
+       total   = entry[<discovered total-count key>]   if entry else -1
+       pending = entry[<discovered pending-count key>] if entry else -1
+       success = entry[<discovered success-count key>] if entry else -1
+       failure = entry[<discovered failure-count key>] if entry else -1
+       avg_present = bool(entry and entry.get(<discovered avg-duration key>) is not None)
+   - EXPECTED: status_code equals expected["status_code"]
+   - EXPECTED: has_days_error equals expected["has_days_error"]
+   - EXPECTED: total equals expected["total_count"]
+   - EXPECTED: pending equals expected["pending_count"]
+   - EXPECTED: success equals expected["success_count"]
+   - EXPECTED: failure equals expected["failure_count"]
+   - EXPECTED: avg_present equals expected["avg_duration_present"]
+
+Reasoning: with one pending, one success, one failure consume task the default
+window aggregates total=3 with the per-state breakdown and a populated average
+duration. A non-integer ``days`` is rejected (400, ``days`` field error). A huge
+``days`` is accepted and clamped (200, same counts). ``days=0`` is floored to 1
+(200, same counts) — an implementation that omits the floor computes a
+zero-width window and drops the just-created rows.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "default_window"
+days = "__omit__"
+[story.test_case.expected]
+status_code = 200
+has_days_error = false
+total_count = 3
+pending_count = 1
+success_count = 1
+failure_count = 1
+avg_duration_present = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "invalid_days"
+days = "abc"
+[story.test_case.expected]
+status_code = 400
+has_days_error = true
+total_count = -1
+pending_count = -1
+success_count = -1
+failure_count = -1
+avg_duration_present = false
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "huge_days_clamped"
+days = 100000
+[story.test_case.expected]
+status_code = 200
+has_days_error = false
+total_count = 3
+pending_count = 1
+success_count = 1
+failure_count = 1
+avg_duration_present = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "zero_days_floored"
+days = 0
+[story.test_case.expected]
+status_code = 200
+has_days_error = false
+total_count = 3
+pending_count = 1
+success_count = 1
+failure_count = 1
+avg_duration_present = true
+
+
+# =============================================================================
+# Monitoring summary: permission gate (global vs scoped)
+# =============================================================================
+
+[[story]]
+id = "summary_permission"
+driver = "pytest"
+description = """
+Global summary statistics require the system-monitoring permission.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    import pytest
+    from test_harness import (
+        api_client, make_user, new_task_id,
+        publish_task, start_task, finish_task,
+        CONSUME_FILE_TASK, make_consumable_document, make_overrides,
+    )
+
+This test must be decorated with ``@pytest.mark.django_db``.
+
+Discover the summary entry's task-type grouping key and total-count key (see the
+discovery notes) and the consume task's produced-document-id result key.
+
+Steps:
+
+1. ``other = make_user(username=f"other_{inputs['case_label']}")``.
+2. Create one consume task OWNED BY ``other`` and complete it successfully:
+       tid = new_task_id()
+       publish_task(CONSUME_FILE_TASK, task_id=tid, trigger_source="web_ui",
+                    kwargs={"input_doc": make_consumable_document(),
+                            "overrides": make_overrides(owner_id=other.id)})
+       start_task(tid)
+       finish_task(tid, state="SUCCESS",
+                   retval={<discovered produced-document-id key>: 3})
+3. Discover the renamed system-monitoring permission codename ``mon_perm`` (see
+   "Discovering the system-monitoring permission"). Build the requesting user per
+   ``inputs["grant"]`` (always non-staff):
+   - ``"monitoring"``: ``make_user(username=f"req_{inputs['case_label']}",
+     model_perms=[mon_perm])``.
+   - ``"scoped"``: ``make_user(username=f"req_{inputs['case_label']}",
+     model_perms=["view_paperlesstask"])``.
+   ``client = api_client(user=requester, version=10)``.
+4. ``response = client.get("/api/tasks/summary/")``:
+       status_code = response.status_code
+       entry = None
+       if status_code == 200 and isinstance(response.data, list):
+           entry = next((e for e in response.data
+                         if e.get(<discovered task-type key>) == "consume_file"),
+                        None)
+       total_for_consume = entry[<discovered total-count key>] if entry else -1
+   - EXPECTED: status_code equals expected["status_code"]
+   - EXPECTED: total_for_consume equals expected["total_for_consume"]
+
+Reasoning: the only task is owned by ``other``. A monitoring-permission holder
+sees it globally (total 1); a user without the permission gets a summary scoped
+to own + unowned tasks, which excludes ``other``'s task (no consume_file entry,
+sentinel -1). Both requests succeed (200) — visibility of other users' tasks is
+the discriminator.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "with_monitoring_perm"
+grant = "monitoring"
+[story.test_case.expected]
+status_code = 200
+total_for_consume = 1
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "scoped_only"
+grant = "scoped"
+[story.test_case.expected]
+status_code = 200
+total_for_consume = -1
+
+
+# =============================================================================
+# Active tasks: only pending + started
+# =============================================================================
+
+[[story]]
+id = "active_tasks"
+driver = "pytest"
+description = """
+The active-tasks endpoint returns only in-flight (pending or started) tasks.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    import pytest
+    from test_harness import (
+        api_client, make_user, new_task_id,
+        publish_task, start_task, finish_task, revoke_task,
+        TRAIN_CLASSIFIER_TASK,
+    )
+
+This test must be decorated with ``@pytest.mark.django_db``.
+
+Discover the lifecycle-status field name (see the discovery notes); the
+``task_id`` field is the pre-existing Celery id.
+
+Steps:
+
+1. ``admin = make_user(username="admin_active", is_superuser=True)``;
+   ``client = api_client(user=admin, version=10)``.
+2. Create four tasks in four states:
+       def pub():
+           t = new_task_id()
+           publish_task(TRAIN_CLASSIFIER_TASK, task_id=t, trigger_source="scheduled")
+           return t
+       tid_pending = pub()
+       tid_started = pub(); start_task(tid_started)
+       tid_done = pub(); start_task(tid_done); finish_task(tid_done, state="SUCCESS")
+       tid_revoked = pub(); revoke_task(tid_revoked)
+3. ``response = client.get("/api/tasks/active/")`` (a plain list):
+       data = response.data
+       rows = data if isinstance(data, list) else data.get("results", [])
+       ids = {row["task_id"] for row in rows}
+       statuses = sorted({row[<discovered status field>] for row in rows})
+       pending_present = tid_pending in ids
+       started_present = tid_started in ids
+       done_present = tid_done in ids
+       revoked_present = tid_revoked in ids
+       active_count = len(rows)
+   - EXPECTED: pending_present equals expected["pending_present"]
+   - EXPECTED: started_present equals expected["started_present"]
+   - EXPECTED: done_present equals expected["done_present"]
+   - EXPECTED: revoked_present equals expected["revoked_present"]
+   - EXPECTED: active_count equals expected["active_count"]
+   - EXPECTED: statuses equals expected["statuses"]
+
+Reasoning: only pending and started tasks are in-flight; completed and revoked
+ones are excluded. Set membership plus count plus the sorted status set
+characterize the contract concretely.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "mixed_states"
+[story.test_case.expected]
+pending_present = true
+started_present = true
+done_present = false
+revoked_present = false
+active_count = 2
+statuses = ["pending", "started"]
+
+
+# =============================================================================
+# Manual run: superuser dispatch of allowlisted tasks only
+# =============================================================================
+
+[[story]]
+id = "run_superuser_dispatch"
+driver = "pytest"
+description = """
+An admin can manually trigger an allowlisted task and gets back the dispatched
+task id.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    import pytest
+    from types import SimpleNamespace
+    from unittest import mock
+    from test_harness import api_client, make_user
+
+This test must be decorated with ``@pytest.mark.django_db``.
+
+Discover the run-response dispatched-task-id key (see the discovery notes).
+
+Steps:
+
+1. Build the actor per ``inputs["actor"]``:
+   - ``"superuser"``: ``make_user(username=f"su_{inputs['case_label']}", is_superuser=True)``.
+   - ``"regular"``: ``make_user(username=f"reg_{inputs['case_label']}")``.
+   ``client = api_client(user=actor, version=10)``.
+2. Issue the run request. When ``inputs["mock_dispatch"]`` is true, patch the
+   dispatch of the train-classifier task so no real broker is touched and a known
+   id is returned:
+       payload = {"task_type": inputs["task_type"]}
+       if inputs["mock_dispatch"]:
+           with mock.patch(
+               "documents.tasks.train_classifier.apply_async",
+               return_value=SimpleNamespace(id="fake-run-id"),
+           ):
+               response = client.post("/api/tasks/run/", payload, format="json")
+       else:
+           response = client.post("/api/tasks/run/", payload, format="json")
+       status_code = response.status_code
+       task_id_v = (response.data.get(<discovered dispatched-id key>)
+                    if (status_code == 200 and isinstance(response.data, dict))
+                    else "__none__")
+   - EXPECTED: status_code equals expected["status_code"]
+   - EXPECTED: task_id_v equals expected["task_id"]
+
+Reasoning: a superuser running an allowlisted task gets the dispatched id back
+(dispatch mocked); a non-superuser is forbidden (403); a valid-but-not-runnable
+task type and an entirely invalid task type are both rejected (400). This proves
+the allowlist + superuser gate without running Celery for real.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "superuser_runnable"
+actor = "superuser"
+task_type = "train_classifier"
+mock_dispatch = true
+[story.test_case.expected]
+status_code = 200
+task_id = "fake-run-id"
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "non_superuser_forbidden"
+actor = "regular"
+task_type = "train_classifier"
+mock_dispatch = false
+[story.test_case.expected]
+status_code = 403
+task_id = "__none__"
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "not_runnable"
+actor = "superuser"
+task_type = "consume_file"
+mock_dispatch = false
+[story.test_case.expected]
+status_code = 400
+task_id = "__none__"
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "invalid_type"
+actor = "superuser"
+task_type = "not_a_real_type"
+mock_dispatch = false
+[story.test_case.expected]
+status_code = 400
+task_id = "__none__"
+
+
+# =============================================================================
+# Acknowledge: marks tasks acknowledged, gated by change permission
+# =============================================================================
+
+[[story]]
+id = "acknowledge_tasks"
+driver = "pytest"
+description = """
+Acknowledging tasks (requiring the change permission) marks them and returns the
+count affected.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    import pytest
+    from test_harness import (
+        api_client, make_user, new_task_id,
+        publish_task, TRAIN_CLASSIFIER_TASK,
+    )
+
+This test must be decorated with ``@pytest.mark.django_db``.
+
+Discover the acknowledged-flag field name and the acknowledge-response
+affected-count key (see the discovery notes); ``id`` is the database primary key
+and ``task_id`` the Celery id.
+
+Steps:
+
+1. ``admin = make_user(username=f"admin_{inputs['case_label']}", is_superuser=True)``;
+   ``admin_client = api_client(user=admin, version=10)``.
+2. Publish two unowned tasks and read their database ids via the v10 listing:
+       t1 = new_task_id(); t2 = new_task_id()
+       publish_task(TRAIN_CLASSIFIER_TASK, task_id=t1, trigger_source="scheduled")
+       publish_task(TRAIN_CLASSIFIER_TASK, task_id=t2, trigger_source="scheduled")
+       listing = admin_client.get("/api/tasks/").data["results"]
+       by_task_id = {row["task_id"]: row["id"] for row in listing}
+       id1 = by_task_id[t1]; id2 = by_task_id[t2]
+3. Select actor + ids per ``inputs["actor"]``:
+   - ``"superuser"``: ``client = admin_client``; ``ack_ids = [id1, id2]``.
+   - ``"regular_no_perm"``: ``user = make_user(username=f"reg_{inputs['case_label']}")``;
+     ``client = api_client(user=user, version=10)``; ``ack_ids = [id1]``.
+   - ``"regular_with_perm"``: ``user = make_user(
+     username=f"reg_{inputs['case_label']}",
+     model_perms=["change_paperlesstask"])``;
+     ``client = api_client(user=user, version=10)``; ``ack_ids = [id1]``.
+4. ``response = client.post("/api/tasks/acknowledge/", {"tasks": ack_ids}, format="json")``:
+       status_code = response.status_code
+       result_count = (response.data.get(<discovered affected-count key>)
+                       if (status_code == 200 and isinstance(response.data, dict))
+                       else -1)
+5. If ``status_code == 200``, re-read via the admin client and count how many of
+   ``ack_ids`` are now acknowledged (read the acknowledged flag by its discovered
+   name):
+       acked_count = 0
+       if status_code == 200:
+           rows = admin_client.get("/api/tasks/").data["results"]
+           acked_count = sum(1 for r in rows
+                             if r["id"] in ack_ids
+                             and r[<discovered acknowledged flag>] is True)
+   - EXPECTED: status_code equals expected["status_code"]
+   - EXPECTED: result_count equals expected["result_count"]
+   - EXPECTED: acked_count equals expected["acked_count"]
+
+Reasoning: a superuser acknowledges both tasks (count 2, both flipped); a user
+holding the change permission acknowledges one unowned task (count 1, flipped); a
+user without the change permission is forbidden (403, nothing changed).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "superuser_both"
+actor = "superuser"
+[story.test_case.expected]
+status_code = 200
+result_count = 2
+acked_count = 2
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "regular_no_perm"
+actor = "regular_no_perm"
+[story.test_case.expected]
+status_code = 403
+result_count = -1
+acked_count = 0
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "regular_with_perm"
+actor = "regular_with_perm"
+[story.test_case.expected]
+status_code = 200
+result_count = 1
+acked_count = 1
+
+
+# =============================================================================
+# Non-staff visibility scoping: own + unowned only
+# =============================================================================
+
+[[story]]
+id = "nonstaff_scoping"
+driver = "pytest"
+description = """
+A non-staff user can list their own and unowned tasks.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    import pytest
+    from test_harness import (
+        api_client, make_user, new_task_id,
+        publish_task, TRAIN_CLASSIFIER_TASK,
+        CONSUME_FILE_TASK, make_consumable_document, make_overrides,
+    )
+
+This test must be decorated with ``@pytest.mark.django_db``.
+
+Steps:
+
+1. ``requester = make_user(username="req_scope", model_perms=["view_paperlesstask"])``;
+   ``other = make_user(username="other_scope")``;
+   ``client = api_client(user=requester, version=10)``.
+2. Create three tasks:
+       tid_own = new_task_id()
+       publish_task(CONSUME_FILE_TASK, task_id=tid_own, trigger_source="web_ui",
+                    kwargs={"input_doc": make_consumable_document(),
+                            "overrides": make_overrides(owner_id=requester.id)})
+       tid_unowned = new_task_id()
+       publish_task(TRAIN_CLASSIFIER_TASK, task_id=tid_unowned, trigger_source="scheduled")
+       tid_other = new_task_id()
+       publish_task(CONSUME_FILE_TASK, task_id=tid_other, trigger_source="web_ui",
+                    kwargs={"input_doc": make_consumable_document(),
+                            "overrides": make_overrides(owner_id=other.id)})
+3. ``response = client.get("/api/tasks/")``:
+       rows = response.data["results"]
+       ids = {row["task_id"] for row in rows}
+       own_visible = tid_own in ids
+       unowned_visible = tid_unowned in ids
+       other_visible = tid_other in ids
+       visible_count = len(rows)
+   - EXPECTED: own_visible equals expected["own_visible"]
+   - EXPECTED: unowned_visible equals expected["unowned_visible"]
+   - EXPECTED: other_visible equals expected["other_visible"]
+   - EXPECTED: visible_count equals expected["visible_count"]
+
+Reasoning: the requester sees their own task and the unowned task (count 2) but
+never the task owned by ``other``. This is the non-staff scoping contract.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "own_and_unowned_only"
+[story.test_case.expected]
+own_visible = true
+unowned_visible = true
+other_visible = false
+visible_count = 2
+
+
+# =============================================================================
+# v9 duplicate_documents is permission-filtered
+# =============================================================================
+
+[[story]]
+id = "duplicate_documents_permission"
+driver = "pytest"
+description = """
+In v9, a duplicate's duplicate-documents entry appears only when the caller can
+view that document. Otherwise it's empty.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    import pytest
+    from test_harness import (
+        api_client, make_user, new_task_id, make_document, grant_object_perm,
+        publish_task, start_task, finish_task,
+        CONSUME_FILE_TASK, make_consumable_document, make_overrides,
+    )
+
+This test must be decorated with ``@pytest.mark.django_db``.
+
+The version=9 ``duplicate_documents`` field name is external contract. Build the
+duplicate ``retval`` using the DISCOVERED duplicate-document-id result key (see
+"Discovering the structured consume-result shape").
+
+Steps:
+
+1. ``requester = make_user(username=f"req_{inputs['case_label']}",
+   model_perms=["view_paperlesstask"])``;
+   ``owner_user = make_user(username=f"owner_{inputs['case_label']}")``.
+2. Create the duplicated document per ``inputs["doc_owner"]``:
+   - ``"self"``: ``doc = make_document(owner=requester)``.
+   - ``"none"``: ``doc = make_document(owner=None)``.
+   - ``"other"``: ``doc = make_document(owner=owner_user)``.
+   - ``"other_with_perm"``: ``doc = make_document(owner=owner_user)``; then
+     ``grant_object_perm("view_document", requester, doc)``.
+3. Create a consume task OWNED BY the requester (so the task itself is always
+   visible) that resulted in a duplicate of ``doc``:
+       tid = new_task_id()
+       publish_task(CONSUME_FILE_TASK, task_id=tid, trigger_source="web_ui",
+                    kwargs={"input_doc": make_consumable_document(),
+                            "overrides": make_overrides(owner_id=requester.id)})
+       start_task(tid)
+       finish_task(tid, state="SUCCESS",
+                   retval={<discovered duplicate-document-id key>: doc.id})
+4. ``client = api_client(user=requester, version=9)``;
+   ``response = client.get("/api/tasks/", {"task_id": tid})``:
+       item = response.data[0] if (isinstance(response.data, list) and response.data) else {}
+       dup_docs = item.get("duplicate_documents") or []
+       dup_count = len(dup_docs)
+       dup_ids = {d.get("id") for d in dup_docs}
+       dup_contains_doc = doc.id in dup_ids
+   - EXPECTED: dup_count equals expected["dup_count"]
+   - EXPECTED: dup_contains_doc equals expected["dup_contains_doc"]
+
+Reasoning: the duplicate-documents list is permission-filtered to documents the
+requester may view — included when they own it, it is unowned, or they hold an
+object-level grant; excluded when owned by another user without a grant.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "doc_owned_by_self"
+doc_owner = "self"
+[story.test_case.expected]
+dup_count = 1
+dup_contains_doc = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "doc_unowned"
+doc_owner = "none"
+[story.test_case.expected]
+dup_count = 1
+dup_contains_doc = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "doc_owned_by_other_no_perm"
+doc_owner = "other"
+[story.test_case.expected]
+dup_count = 0
+dup_contains_doc = false
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "doc_owned_by_other_with_perm"
+doc_owner = "other_with_perm"
+[story.test_case.expected]
+dup_count = 1
+dup_contains_doc = true

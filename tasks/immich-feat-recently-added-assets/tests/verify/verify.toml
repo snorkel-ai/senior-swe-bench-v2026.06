@@ -1,0 +1,32 @@
+# Verifier runner configuration for the harbor JS runner
+# (src/python/ssb_lib/runners/js.py).
+#
+# Discovery: the runner globs verify*.test.ts in this directory. The
+# filename MUST be *.test.ts (the runner does not discover *.spec.ts).
+#
+# Execution: the runner copies the file into
+# `repo_dir/<test_parent>`, then runs from `repo_dir/<config_dir>`:
+#   npx vitest run <copied-file> --reporter=json --testTimeout=<timeout*1000>
+# No --config is passed, so vitest auto-resolves the config in the cwd.
+#
+# Medium tier (real Postgres):
+# - config_dir = "server" — vitest runs from inside the server workspace.
+#   `tests/test-setup.sh` writes `server/vitest.config.mjs` (auto-resolved by
+#   vitest from this cwd) mirroring immich's medium config: swc +
+#   tsconfigPaths plugins, globals, `include: test/medium/**`, and a
+#   globalSetup that runs the migration set into the local `mich` template
+#   (the non-testcontainers variant — the container ships a local
+#   Postgres+vchord cluster and exports IMMICH_TEST_POSTGRES_URL).
+# - test_parent = "server/test/medium/specs/__verification__" — the verifier
+#   spec lands under test/medium/** so it matches the config's `include`, and
+#   its `src/...` / `test/...` alias imports resolve via tsconfig paths.
+# - timeout = 600 — covers vitest cold-start + the one-time migration run in
+#   globalSetup (~15-30s) + per-test template clone + the spec itself
+#   (measured ~7s after migrations on the existing timeline medium spec).
+#   Well within task.toml's [verifier].timeout_sec = 1800.
+
+[jest]
+config_dir = "server"
+test_parent = "server/test/medium/specs/__verification__"
+runner = "vitest"
+timeout = 600

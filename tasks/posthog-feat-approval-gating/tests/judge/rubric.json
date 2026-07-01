@@ -1,0 +1,19 @@
+{
+  "files": [
+    "posthog/api/feature_flag.py",
+    "posthog/approvals/actions/",
+    "frontend/src/scenes/settings/organization/Approvals/",
+    "frontend/src/scenes/approvals/"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "frontend_action_type_selector",
+      "description": "The policy create/edit UI exposes a selector or dropdown where admins can pick the new rollout-change action type in addition to the pre-existing enable/disable actions."
+    },
+    {
+      "name": "frontend_condition_builder_form",
+      "description": "When the rollout-change action is selected, the policy modal renders a condition-builder form with interactive controls for specifying the gating rule — at minimum a field selector (which rollout field to gate) and a condition-type control (any change, threshold, delta)."
+    }
+  ],
+  "pass_to_pass": []
+}

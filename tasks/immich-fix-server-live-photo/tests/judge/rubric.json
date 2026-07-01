@@ -1,0 +1,13 @@
+{
+  "files": [
+    "server/src/services/storage-template.service.ts",
+    "server/src/repositories/asset-job.repository.ts"
+  ],
+  "fail_to_pass": [],
+  "pass_to_pass": [
+    {
+      "name": "motion_video_independent_migration_does_not_double_move",
+      "description": "The implementation must avoid moving a Live Photo's motion-video half twice during a bulk migration. Acceptable mechanisms include filtering hidden / motion-video assets out of the bulk migration's asset stream at the query level, skipping them inside the iteration loop, or any other approach that ensures the motion video is moved exactly once per migration cycle and only via its parent still photo (so the still's album / date / EXIF metadata is used for path computation). A naive implementation that fixes the path-computation bug but leaves motion videos visible to the bulk migration loop as standalone iteration items produces a double-move (motion first goes to the {{else}} branch, then again to the album folder via the still) and is not acceptable."
+    }
+  ]
+}

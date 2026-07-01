@@ -1,0 +1,147 @@
+version = "1.0"
+
+[environment]
+base_image = "prefect-fix-resolve-race-condition:latest"
+build_timeout_sec = 1200.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "prefect"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "prefect"
+
+[metadata]
+family = "prefect-fix-resolve-race-condition"
+variant = "hard"
+segment = "investigate"
+repo = "prefect"
+tags = ["prefect", "python-service", "sql-database"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """A few enterprise customers running Prefect Server with compound automations
+(parent triggers that require multiple child triggers to fire together) report
+that under busy event traffic the same automation sometimes never fires even
+though all the child events were received, and at other times the same
+automation fires twice from a single batch of child events. Quiet periods look
+fine; the problem appears to scale with concurrent event load. The agent must
+investigate the compound-trigger evaluation path on the server and fix it so
+the parent fires exactly once per legitimate batch of child firings.
+"""
+context = """The bug lives in `evaluate_composite_trigger` in
+`src/prefect/server/events/triggers.py`, which is called from `triggers.fire`
+whenever a child of a compound (require=all/any-with-N>1) trigger fires. The
+function (a) upserts a `CompositeTriggerChildFiring` row for the firing
+child, (b) SELECTs all child firings for the parent, (c) decides whether the
+parent is `ready_to_fire`, (d) DELETEs those firings, (e) calls `fire(...)` on
+the parent. There are two concurrent failure modes:
+
+1. NEVER-FIRE under transactional sessions (READ COMMITTED). Two children
+   fire in separate transactions; each upserts its row but neither's
+   uncommitted insert is visible to the other's SELECT, so both read only one
+   firing, neither passes `ready_to_fire?`, both commit. Parent never fires.
+
+2. DOUBLE-FIRE under autocommit / when both inserts are committed before
+   either SELECT. Both workers see both firings, both decide
+   `ready_to_fire?`, both DELETE (the second is a no-op against an empty
+   row set), both call fire. Parent fires twice.
+
+A correct fix MUST address both modes. Prefect runs on both SQLite and
+PostgreSQL. SQLite serialises writes at the database level so neither race
+manifests reliably; the bug is most reproducible under PostgreSQL. The
+shipped image pre-installs and pre-configures PostgreSQL (user/db `prefect`)
+and the test-setup.sh starts it and points Prefect at it via
+`PREFECT_API_DATABASE_CONNECTION_URL` / `PREFECT_SERVER_DATABASE_CONNECTION_URL`.
+
+The investigation evidence available from the merged PR: detailed
+transaction-timeline diagrams of both races, regression tests using
+`asyncio.gather` over `triggers.reactive_evaluation`, and the choice of
+`pg_advisory_xact_lock(int(trigger.id) % 2**63)` as the serialization
+primitive (a transaction-scoped lock that is released automatically on
+commit/rollback).
+"""
+solution = """Canonical fix (the merged PR): introduce a per-trigger PostgreSQL advisory
+lock (`pg_advisory_xact_lock(int(trigger.id) % 2**63)`) acquired at the
+start of `evaluate_composite_trigger`, AND change `clear_child_firings` to
+use `DELETE ... RETURNING child_firing_id` so the caller can compare
+expected firing_ids against actually-deleted ids and skip the parent fire
+when its claim is incomplete. Both pieces are needed: the advisory lock
+serialises evaluations and prevents the never-fire race; the atomic claim
+prevents the double-fire race because only the worker that wins the
+DELETE...RETURNING proceeds to fire.
+
+Equally valid alternative fixes the verifier accepts:
+- `SELECT ... FOR UPDATE` on a parent-scoped row instead of
+  `pg_advisory_xact_lock` — different pessimistic primitive, same
+  semantics.
+- Atomic claim via `UPDATE ... RETURNING` on a new claim column
+  (e.g., a `claimed_at` field) instead of DELETE...RETURNING.
+- Idempotency key on the parent fire keyed on
+  `(parent_trigger_id, sorted_child_firing_ids)` with a unique index.
+- Application-layer asyncio mutex per parent trigger id (works in
+  single-process tests, weaker in multi-replica deployments but accepted
+  by the in-process behavioural verifier).
+
+Wrong/non-optimal fixes the verifier and rubric REJECT:
+- Wrapping evaluation in a try/except + retry — the underlying race is
+  still there; the test still flakes 0/2 fires.
+- `await asyncio.sleep(...)` jitter — superstition, not serialization.
+- Stricter isolation level WITHOUT also serializing the evaluation — the
+  never-fire race still happens under READ COMMITTED, or flips into a
+  Serializable retry storm.
+- Catching the duplicate fire in the action handler — moves the problem
+  downstream, doesn't fix it.
+
+Red herrings the agent may chase:
+- Recent unrelated commits to triggers.py around bucketing or causal
+  ordering — none of these touch the compound-trigger evaluation path.
+- `prefect.server.events.actions` / messaging publisher — `act()` is
+  mocked in tests, so anything downstream of it is not the issue.
+- Trigger threshold / posture configuration — irrelevant; the bug fires
+  regardless of threshold values as long as `num_expected_firings > 1`.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["python-service", "sql-database"]
+runtime_dependence = "runtime-essential"
+skills = ["codebase-exploration", "fault-localization", "concurrency-reasoning", "framework-fluency", "logic-fix", "distributed-systems"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 58
+files = 2
+hunks = 5
+scope = "broad"
+
+[metadata.origin]
+repo = "PrefectHQ/prefect"
+pr_numbers = [20106]
+base_commit = "c863006666a82e5396b6a7e2c1f0dc71279d4ffd"
+base_commit_date = "2026-01-05"
+merged_at = "2026-01-05"
+
+
+
+

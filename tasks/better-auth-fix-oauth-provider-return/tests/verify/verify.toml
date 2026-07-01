@@ -1,0 +1,15 @@
+# Verifier runner configuration.
+#
+# test_parent places the copied test inside the @better-auth/oauth-provider
+# workspace project so it runs under that project's defineProject config and
+# resolves the workspace package imports it relies on.
+# config_dir = "" (repo root) so vitest finds the root workspace config and
+# resolves the projects.
+# runner = "vitest" routes to the vitest invocation rather than the jest default.
+# timeout = 600s: token-minting cases run a full authorize->token code flow,
+# and 18 cases on a cold cache fit comfortably inside this.
+
+[jest]
+runner = "vitest"
+test_parent = "packages/oauth-provider/src"
+timeout = 600

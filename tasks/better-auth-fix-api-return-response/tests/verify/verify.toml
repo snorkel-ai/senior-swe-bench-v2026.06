@@ -1,0 +1,11 @@
+# runner = "vitest": better-auth uses vitest, not the jest default.
+# test_parent: the runner copies verify.test.ts here so its RELATIVE
+#   imports (../test-utils/test-instance, ../context/init,
+#   ./to-auth-endpoints) resolve against the better-auth source tree.
+# timeout = 540s: covers cold-start vite transform + workspace config
+#   load on first invocation; steady-state runs finish under a minute.
+
+[jest]
+runner = "vitest"
+test_parent = "packages/better-auth/src/api"
+timeout = 540

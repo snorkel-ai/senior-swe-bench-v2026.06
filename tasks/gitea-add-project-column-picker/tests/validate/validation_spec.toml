@@ -1,0 +1,639 @@
+stack_profile = "go-server"
+
+# ---------------------------------------------------------------------------
+# Global settings passed to the go-test driver for every story.
+#
+# The gitea integration package boots a full in-memory server (sqlite +
+# YAML fixtures). It needs the cgo sqlite driver (build tags sqlite +
+# sqlite_unlock_notify) and CGO; GITEA_TEST_CONF points at the sqlite
+# integration config materialised by tests/test-setup.sh /
+# validation-setup.sh. GOTOOLCHAIN=local pins the bundled 1.26.2.
+# ---------------------------------------------------------------------------
+[settings]
+[settings.go]
+command = "go test -tags sqlite,sqlite_unlock_notify"
+env = { CGO_ENABLED = "1", GOEXPERIMENT = "jsonv2", GOTOOLCHAIN = "local", GITEA_TEST_CONF = "tests/sqlite.ini" }
+
+instructions = """
+All stories use the **go-test** driver. The framework injects a
+`validation_params_test.go` helper alongside your test file that exposes
+`GetValidationTestCases(t) []ValidationTestCase` (each case has
+`Name`, `Inputs map[string]interface{}`, `Expected map[string]interface{}`).
+
+Your test file MUST:
+
+- Live under `tests/integration/` (the `go_package` for every story).
+- Use `package integration` (no `_test` suffix). The framework picks up
+  `TestMain` from `tests/integration/integration_test.go` — DO NOT
+  redefine it. Build tags are sqlite + sqlite_unlock_notify; the harness
+  sets these for you.
+- Call `GetValidationTestCases(t)` once and iterate via
+  `t.Run(tc.Name, func(t *testing.T) { ... })`. `tc.Name` is literally
+  `case_0`, `case_1`, ... — DO NOT rename.
+- Read each `tc.Inputs[...]` / `tc.Expected[...]` value as
+  `map[string]interface{}`; type-assert with `.(string)`, `.(bool)`, etc.
+  Numeric values decode as `float64` — cast with
+  `int(tc.Expected["x"].(float64))`. Missing keys: `v, ok := tc.Inputs["x"]`.
+- Create extra projects/columns through the model API at runtime (see
+  below), never by editing fixtures.
+
+### Integration helpers you have (all from `package integration`)
+
+- `defer tests.PrepareTestEnv(t)()` — reload fixtures + git repos. Call
+  this FIRST in every test function. It resets the DB, so each story
+  starts from the shipped fixtures.
+- `loginUser(t, "user2")` → `*TestSession` (all fixture users have the
+  password `password`). `user2` owns `user2/repo1`.
+- `NewRequest(t, "GET", url)` and
+  `NewRequestWithValues(t, "POST", url, map[string]string{...})` build
+  requests. Sidebar POST routes do NOT need an explicit `_csrf` value in
+  this harness (see the existing assignee/milestone sidebar POST tests).
+- `session.MakeRequest(t, req, expectedStatus)` drives an authenticated
+  request; bare `MakeRequest(t, req, expectedStatus)` drives an anonymous
+  one. Pass the exported constant `NoExpectedStatus` to inspect the
+  status code yourself: `resp := MakeRequest(t, req, NoExpectedStatus);
+  require.Equal(t, want, resp.Code)`.
+- `NewHTMLParser(t, resp.Body)` → an HTML doc; `htmlDoc.Find(cssSel)`
+  returns a goquery selection with `.Length()`, `.Text()`,
+  `.Attr("name")`, and `.Each(...)`.
+
+### Seeding extra projects / columns at runtime
+
+Use the pre-existing model API (mirrors `tests/integration/project_test.go`):
+
+```go
+import (
+    project_model "code.gitea.io/gitea/models/project"
+    repo_model "code.gitea.io/gitea/models/repo"
+    "code.gitea.io/gitea/models/unittest"
+)
+
+repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+p := project_model.Project{Title: "Second project", RepoID: repo1.ID,
+    Type: project_model.TypeRepository, TemplateType: project_model.TemplateTypeNone}
+require.NoError(t, project_model.NewProject(t.Context(), &p))
+col := project_model.Column{Title: "Foreign column", ProjectID: p.ID}
+require.NoError(t, project_model.NewColumn(t.Context(), &col))
+// col.ID is now the id of a column that does NOT belong to project 1.
+```
+
+To read an issue's current column membership (for the "unchanged" checks)
+use the pre-existing bean — this is stable across implementations:
+
+```go
+pi := unittest.AssertExistsAndLoadBean(t, &project_model.ProjectIssue{IssueID: 5})
+require.EqualValues(t, 3, pi.ProjectColumnID)
+```
+
+### Discovering and driving the move request (REQUIRED — read the implementation, do not hardcode the wire shape)
+
+The move endpoint's path, HTTP method, and how it names the issue and the
+target column are implementation details. **Discover them from the
+implementation under test** — equally valid designs name and shape the
+request differently and the test MUST accept any of them. Two axes vary:
+
+- **How the issue is addressed.** Some designs carry the issue in a
+  query/form parameter (e.g. `?issue_id=<id>` or `?issue_ids=<id>`); others
+  bake the issue's repo index into the URL **path** (e.g.
+  `/issues/<index>/.../column`). Your discovery MUST handle BOTH — otherwise
+  a perfectly valid path-param design cannot be driven and is wrongly failed.
+- **How the target column is submitted.** The gitea sidebar-combo
+  convention — shared with the existing label / milestone / project
+  controls — is the form field `id`. If an implementation diverges, read its
+  move handler in the post-fix source for the field it consumes for the
+  target column id.
+
+**Trust guardrail (read this).** Discovery determines ONLY how to *construct*
+a faithful move request and how to *read persisted state*. It NEVER
+determines whether the test passes. The pass conditions in every story below
+are fixed behavioral facts (a column's persisted membership changed, or did
+not). Do NOT infer the contract from the implementation's HTTP responses —
+e.g. do not read "this build returns 200 here" and then assert 200. Read the
+design only to drive it correctly; judge it against the fixed behavioral
+outcome.
+
+How to discover (as a writer, `loginUser(t, "user2")`, on the issue page
+whose repo index is `pageIndex` and DB id is `pageID`):
+
+1. GET the issue page and parse it. In the sidebar's project section, locate
+   the **interactive column control** — identify it STRUCTURALLY: an element
+   carrying a `data-update-url` whose selectable items are the project's
+   column titles (`To Do` / `In Progress` / `Done`). Do NOT match a CSS
+   class. (The sidebar may carry other `data-update-url` controls — e.g. the
+   pre-existing "assign to project" combo — so select by the column titles.)
+2. Classify how that `data-update-url` carries the issue: a query value equal
+   to `pageID` or `pageIndex` → the issue is a query/form param (record its
+   key); else a path segment equal to `pageIndex` or `pageID` → the issue is
+   in the path (record the segment position).
+3. To drive a move of an arbitrary target issue, reconstruct the request
+   under the discovered mechanism: forward the target's value under the query
+   key, or rewrite the issue path segment to the target's index/id. Submit
+   the target column under field `id`.
+
+**Where this helper goes (REQUIRED — stories run in isolation).** Each story's
+`{story_id}_test.go` is compiled and run on its own; story files are NOT
+compiled together, so a helper defined inside one story file is invisible to
+the others. Put the shared helper below in ITS OWN file named
+`move_helpers_test.go` that declares **no `func Test...`** — the go driver
+injects every sibling `.go` file that has no test function into each story's
+compile, so all move stories (2, 3, 5) can call `discoverMoveControl` /
+`buildMove` from it. Do NOT paste this helper into any story file, and do NOT
+define it inside a file that contains a `func Test...` (that file is treated
+as a story and excluded from the others). The helper file uses `package
+integration` and imports `net/http`, `net/url`, `strconv`, `strings`,
+`testing`, `github.com/PuerkitoBio/goquery`, and
+`github.com/stretchr/testify/require`.
+
+`move_helpers_test.go` (a non-test shared helper — discover once, then build a
+request for any target issue/column under whatever shape this implementation
+uses):
+
+```go
+type moveControl struct {
+    rawURL    string // the control's data-update-url
+    inQuery   bool   // issue carried as a query/form param (vs the URL path)
+    issueKey  string // query mechanism: the form field name (e.g. "issue_id" / "issue_ids")
+    issueIsID bool   // the carried issue value is the DB id (true) or the repo index (false)
+    segIdx    int    // path mechanism: index of the path segment holding the issue
+}
+
+// discoverMoveControl GETs the writer issue page (repo index pageIndex, DB id
+// pageID) and classifies how its column-move control addresses the issue.
+func discoverMoveControl(t *testing.T, sess *TestSession, issueURL string, pageIndex, pageID int64) moveControl {
+    req := NewRequest(t, "GET", issueURL)
+    resp := sess.MakeRequest(t, req, http.StatusOK)
+    htmlDoc := NewHTMLParser(t, resp.Body)
+    raw := ""
+    htmlDoc.Find("[data-update-url]").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+        if txt := s.Text(); strings.Contains(txt, "In Progress") && strings.Contains(txt, "Done") {
+            raw, _ = s.Attr("data-update-url")
+            return false
+        }
+        return true
+    })
+    if raw == "" && htmlDoc.Find("[data-update-url]").Length() == 1 {
+        raw, _ = htmlDoc.Find("[data-update-url]").Attr("data-update-url") // sole control
+    }
+    require.NotEmpty(t, raw, "no interactive column control (listing the project's columns) found")
+
+    u, err := url.Parse(raw)
+    require.NoError(t, err)
+    mc := moveControl{rawURL: raw, segIdx: -1}
+    idStr, idxStr := strconv.FormatInt(pageID, 10), strconv.FormatInt(pageIndex, 10)
+
+    for k, vs := range u.Query() { // (a) issue carried in the query string?
+        for _, v := range vs {
+            if v == idStr {
+                mc.inQuery, mc.issueKey, mc.issueIsID = true, k, true
+            } else if v == idxStr {
+                mc.inQuery, mc.issueKey, mc.issueIsID = true, k, false
+            }
+        }
+    }
+    if mc.inQuery {
+        return mc
+    }
+    segs := strings.Split(strings.Trim(u.Path, "/"), "/") // (b) else the issue is in the path
+    for i, seg := range segs {
+        if seg == idxStr {
+            mc.segIdx, mc.issueIsID = i, false
+            break
+        } else if seg == idStr {
+            mc.segIdx, mc.issueIsID = i, true
+            break
+        }
+    }
+    require.GreaterOrEqual(t, mc.segIdx, 0,
+        "could not locate the issue identifier in data-update-url %q (neither a query param nor a path segment)", raw)
+    return mc
+}
+
+// buildMove returns a POST request driving a move of the issue with repo
+// index targetIndex / DB id targetID to column targetColumnID, under the
+// discovered addressing mechanism.
+func (mc moveControl) buildMove(t *testing.T, targetIndex, targetID, targetColumnID int64) *http.Request {
+    form := map[string]string{"id": strconv.FormatInt(targetColumnID, 10)}
+    u, err := url.Parse(mc.rawURL)
+    require.NoError(t, err)
+    if mc.inQuery {
+        v := targetID
+        if !mc.issueIsID {
+            v = targetIndex
+        }
+        form[mc.issueKey] = strconv.FormatInt(v, 10)
+        return NewRequestWithValues(t, "POST", u.Path, form)
+    }
+    segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+    seg := targetIndex
+    if mc.issueIsID {
+        seg = targetID
+    }
+    segs[mc.segIdx] = strconv.FormatInt(seg, 10)
+    return NewRequestWithValues(t, "POST", "/"+strings.Join(segs, "/"), form)
+}
+```
+
+**Reference example (ONE valid shape — do NOT assume it):** the reference
+exposes `data-update-url=".../issues/projects/column?issue_id=<id>"` and
+reads `issue_id` (the issue) and `id` (the target column). A design that
+names the issue `issue_ids`, bakes the issue index into the path, or reads a
+differently-named column field is equally correct —
+`discoverMoveControl`/`buildMove` derive the real shape and work for any of
+them.
+
+### Required imports (suggested)
+
+```go
+import (
+    "net/http"
+    "net/url"
+    "strconv"
+    "strings"
+    "testing"
+
+    project_model "code.gitea.io/gitea/models/project"
+    repo_model "code.gitea.io/gitea/models/repo"
+    "code.gitea.io/gitea/models/unittest"
+    "code.gitea.io/gitea/tests"
+
+    "github.com/PuerkitoBio/goquery"
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/require"
+)
+```
+"""
+
+# ---------------------------------------------------------------------------
+# Story 1: writer sees an interactive column picker listing all columns,
+#          with the issue's current column selected.
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "sidebar_writer_picker"
+driver = "go-test"
+go_module_dir = ""
+go_package = "tests/integration"
+
+description = """
+On an issue or PR that is on a project board, an editor sees a column picker
+in the sidebar showing that project's columns, with the issue's current
+column marked.
+"""
+
+procedure = """
+- Setup: `defer tests.PrepareTestEnv(t)()`. Log in as a writer:
+  `sess := loginUser(t, "user2")` (owner of user2/repo1).
+- For each test case from `GetValidationTestCases(t)`, run a subtest named
+  `tc.Name`:
+  - GET the issue page: `req := NewRequest(t, "GET",
+    tc.Inputs["issue_url"].(string))`; `resp := sess.MakeRequest(t, req,
+    http.StatusOK)`; `htmlDoc := NewHTMLParser(t, resp.Body)`.
+  - EXPECTED: project card: the sidebar's project section names the
+    project `tc.Expected["project_title"].(string)` (the title text
+    appears in the rendered sidebar).
+  - EXPECTED: interactive picker lists all columns: locate the
+    interactive column control (an element with a `data-update-url`
+    attribute whose selectable items are the project's columns). For each
+    title in `tc.Expected["column_titles"].([]interface{})` (cast each to
+    string), assert that title appears as one of the control's selectable
+    column items. Do NOT depend on a specific CSS class name.
+  - EXPECTED: current column selected: assert the control records the
+    issue's current column `tc.Expected["selected_column_title"].(string)`
+    (id `int(tc.Expected["selected_column_id"].(float64))`) as the
+    selected/current value (e.g. a hidden value input on the control equals
+    the selected column id, or that column item is marked current).
+  - EXPECTED: it is genuinely interactive: assert the control carries a
+    non-empty `data-update-url` (this is what distinguishes the editable
+    picker from the read-only static text a viewer sees).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+issue_url = "/user2/repo1/issues/4"
+[story.test_case.expected]
+project_title = "First project"
+column_titles = ["To Do", "In Progress", "Done"]
+selected_column_title = "Done"
+selected_column_id = 3
+
+[[story.test_case]]
+[story.test_case.inputs]
+issue_url = "/user2/repo1/issues/1"
+[story.test_case.expected]
+project_title = "First project"
+column_titles = ["To Do", "In Progress", "Done"]
+selected_column_title = "To Do"
+selected_column_id = 1
+
+# ---------------------------------------------------------------------------
+# Story 2: a writer moves the issue to another column of the same project;
+#          the change persists and is reflected on re-render.
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "move_changes_column"
+driver = "go-test"
+go_module_dir = ""
+go_package = "tests/integration"
+
+description = """
+When an editor moves an issue to another column of the same project from the
+sidebar, the change persists.
+"""
+
+procedure = """
+- Setup: `defer tests.PrepareTestEnv(t)()`. `sess := loginUser(t, "user2")`.
+- Discover the move control once (see the spec's "Discovering and driving the
+  move request" section): `mc := discoverMoveControl(t, sess,
+  tc.Inputs["issue_url"].(string), int64(tc.Inputs["issue_index"].(float64)),
+  int64(tc.Inputs["issue_id"].(float64)))`.
+- For each test case from `GetValidationTestCases(t)`, run a subtest named
+  `tc.Name`:
+  - Build and send the move (the issue here IS the page issue, so its target
+    index/id are the page's): `req := mc.buildMove(t,
+    int64(tc.Inputs["issue_index"].(float64)),
+    int64(tc.Inputs["issue_id"].(float64)),
+    int64(tc.Inputs["target_column_id"].(float64)))`.
+    `resp := sess.MakeRequest(t, req, NoExpectedStatus)`.
+  - EXPECTED: a successful move — assert the status is within the accepted
+    range carried in the expected params: `resp.Code >=
+    int(tc.Expected["min_status"].(float64)) && resp.Code <=
+    int(tc.Expected["max_status"].(float64))` (a 2xx).
+  - EXPECTED: persisted (assert via the DB bean — REQUIRED, do NOT re-parse
+    HTML here): load the pre-existing bean
+    `project_model.ProjectIssue{IssueID: int64(tc.Inputs["issue_id"].(float64))}`
+    and assert its `ProjectColumnID` equals
+    `int64(tc.Expected["new_selected_column_id"].(float64))`. This observes the
+    persisted move directly and is implementation-independent. (Do NOT verify
+    persistence by re-rendering the sidebar and looking for a hidden input or a
+    specific element — that couples to one template's wire shape and is brittle;
+    the rendered selected-state is already covered by the
+    `sidebar_writer_picker` story.)
+  - EXPECTED: the move did not corrupt the target column's ordering — the
+    moved issue was given its own sort position, not dropped on top of the
+    issue already in that column. The target column already contains the
+    issue `int(tc.Expected["existing_issue_id"].(float64))`; load it and the
+    moved issue as `project_model.ProjectIssue{IssueID: ...}` beans and
+    assert (a) both report `ProjectColumnID` equal to the target column
+    `int(tc.Expected["new_selected_column_id"].(float64))`, and (b) their
+    `Sorting` values DIFFER — the moved issue must not share the existing
+    issue's sort position (a `sorting` collision, e.g. both left at 0, is a
+    failure). Do NOT assert a particular ordering (after vs before the
+    existing issue is an implementation choice); assert only that the
+    positions are distinct.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+issue_url = "/user2/repo1/issues/4"
+issue_index = 4
+issue_id = 5
+target_column_id = 1
+[story.test_case.expected]
+min_status = 200
+max_status = 299
+new_selected_column_id = 1
+existing_issue_id = 1
+
+[[story.test_case]]
+[story.test_case.inputs]
+issue_url = "/user2/repo1/issues/4"
+issue_index = 4
+issue_id = 5
+target_column_id = 2
+[story.test_case.expected]
+min_status = 200
+max_status = 299
+new_selected_column_id = 2
+existing_issue_id = 3
+
+# ---------------------------------------------------------------------------
+# Story 3: an out-of-bounds move never takes effect — the target column
+#          belongs to a different project, or the issue is not in this repo.
+#          The contract is BEHAVIORAL (the issue does not end up in the
+#          out-of-bounds column, and the server does not 5xx); the exact
+#          refusal signal (4xx vs idempotent 2xx no-op) is NOT asserted.
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "move_rejects_foreign_or_out_of_repo"
+driver = "go-test"
+go_module_dir = ""
+go_package = "tests/integration"
+
+description = """
+A move that crosses a boundary (e.g. a column from a different project, or an
+issue not in this repository) is refused.
+"""
+
+procedure = """
+- Setup: `defer tests.PrepareTestEnv(t)()`. `sess := loginUser(t, "user2")`.
+- For each test case from `GetValidationTestCases(t)`, run a subtest named
+  `tc.Name`. First discover the move control from this case's writer page
+  (see the spec's "Discovering and driving the move request" section):
+  `mc := discoverMoveControl(t, sess, tc.Inputs["issue_url"].(string),
+  int64(tc.Inputs["page_issue_index"].(float64)),
+  int64(tc.Inputs["page_issue_id"].(float64)))`.
+- Branch on `tc.Inputs["scenario"].(string)` to choose the target issue +
+  column:
+  - scenario "foreign_project": seed a NEW repository project on repo1 via
+    `project_model.NewProject` and a column on it via `project_model.NewColumn`
+    (see the spec's seeding snippet). `targetColumnID` is the new column's id
+    (foreign to the page issue's project). The target issue IS the page issue:
+    `targetIndex, targetID := page_issue_index, page_issue_id`.
+  - scenario "out_of_repo": `targetColumnID := int64(tc.Inputs["target_column_id"].(float64))`
+    (a real column in repo1's project). The target issue does NOT belong to
+    user2/repo1: `targetIndex := int64(tc.Inputs["target_issue_index"].(float64))`,
+    `targetID := int64(tc.Inputs["target_issue_id"].(float64))`. (The
+    discovery is still done from the page issue, whose control renders; the
+    move is then RETARGETED to the out-of-repo issue via `buildMove`.)
+  - Build and send the move: `req := mc.buildMove(t, targetIndex, targetID,
+    targetColumnID)`; `resp := sess.MakeRequest(t, req, NoExpectedStatus)`.
+  - EXPECTED — not a server error (hygiene bound only, NOT the contract):
+    assert `resp.Code >= int(tc.Expected["min_status"].(float64)) &&
+    resp.Code <= int(tc.Expected["max_status"].(float64))` (200–499: any
+    non-5xx). A clean 4xx refusal AND an idempotent 2xx no-op both satisfy
+    this; only a 5xx crash fails it.
+  - EXPECTED — the out-of-bounds move did not take effect (THE contract):
+    - foreign_project: load `project_model.ProjectIssue{IssueID:
+      int64(tc.Expected["unchanged_issue_id"].(float64))}` and assert its
+      `ProjectColumnID` still equals
+      `int64(tc.Expected["unchanged_column_id"].(float64))` — the issue was
+      NOT relocated into the foreign column.
+    - out_of_repo: assert the out-of-repo issue gained no membership on this
+      repo's board: `unittest.AssertNotExistsBean(t,
+      &project_model.ProjectIssue{IssueID:
+      int64(tc.Expected["absent_membership_issue_id"].(float64))})` — a
+      correct implementation never creates a project_issue row for an issue
+      that is not in this repository. (This assertion is sound under any wire
+      shape: it can only fail if such a row is actually created, which only a
+      design that resolves issues globally instead of within the repo does.)
+"""
+
+# foreign column, page issue 5 (repo1 index 4, on "First project" column "Done"=3)
+[[story.test_case]]
+[story.test_case.inputs]
+scenario = "foreign_project"
+issue_url = "/user2/repo1/issues/4"
+page_issue_index = 4
+page_issue_id = 5
+[story.test_case.expected]
+min_status = 200
+max_status = 499
+unchanged_issue_id = 5
+unchanged_column_id = 3
+absent_membership_issue_id = 99999
+
+# foreign column, page issue 1 (repo1 index 1, on "First project" column "To Do"=1)
+[[story.test_case]]
+[story.test_case.inputs]
+scenario = "foreign_project"
+issue_url = "/user2/repo1/issues/1"
+page_issue_index = 1
+page_issue_id = 1
+[story.test_case.expected]
+min_status = 200
+max_status = 499
+unchanged_issue_id = 1
+unchanged_column_id = 1
+absent_membership_issue_id = 99999
+
+# out-of-repo: target issue 6 lives in a different repository (repo3, index 1);
+# a real repo1 column (id 1) is the target. The issue must gain no membership here.
+[[story.test_case]]
+[story.test_case.inputs]
+scenario = "out_of_repo"
+issue_url = "/user2/repo1/issues/4"
+page_issue_index = 4
+page_issue_id = 5
+target_issue_index = 1
+target_issue_id = 6
+target_column_id = 1
+[story.test_case.expected]
+min_status = 200
+max_status = 499
+absent_membership_issue_id = 6
+unchanged_issue_id = 5
+unchanged_column_id = 3
+
+# ---------------------------------------------------------------------------
+# Story 4: a read-only viewer sees the current column as static text, with
+#          no interactive picker.
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "sidebar_reader_readonly"
+driver = "go-test"
+go_module_dir = ""
+go_package = "tests/integration"
+
+description = """
+A viewer who cannot edit the issue sees the current column as static text (no
+interactive picker and the other columns are not offered).
+"""
+
+procedure = """
+- Setup: `defer tests.PrepareTestEnv(t)()`. Do NOT log in — an anonymous
+  visitor to the public repo user2/repo1 cannot edit issues, so they
+  exercise the read-only branch.
+- For each test case from `GetValidationTestCases(t)`, run a subtest named
+  `tc.Name`:
+  - GET the issue page anonymously: `req := NewRequest(t, "GET",
+    tc.Inputs["issue_url"].(string))`; `resp := MakeRequest(t, req,
+    http.StatusOK)`; `htmlDoc := NewHTMLParser(t, resp.Body)`.
+  - EXPECTED: current column shown as text: the project section of the
+    sidebar contains the text `tc.Expected["current_column"].(string)`
+    (the issue's current column name, shown to the viewer).
+  - EXPECTED: not a picker: assert there is NO interactive column-move
+    control in the project section — i.e. no element there carries a
+    `data-update-url` pointing at a column-move endpoint. The other column
+    titles in `tc.Expected["absent_column_titles"].([]interface{})` (cast
+    each to string) must NOT appear as selectable options in the project
+    section (a read-only viewer is not offered other columns).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+issue_url = "/user2/repo1/issues/4"
+[story.test_case.expected]
+current_column = "Done"
+absent_column_titles = ["To Do", "In Progress"]
+
+[[story.test_case]]
+[story.test_case.inputs]
+issue_url = "/user2/repo1/issues/1"
+[story.test_case.expected]
+current_column = "To Do"
+absent_column_titles = ["In Progress", "Done"]
+
+# ---------------------------------------------------------------------------
+# Story 5: the move endpoint is gated — a user without write permission is
+#          forbidden and the issue's column is unchanged.
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "move_requires_write_permission"
+driver = "go-test"
+go_module_dir = ""
+go_package = "tests/integration"
+
+description = """
+Only users who can edit the repository's issues can move an issue between
+columns.
+"""
+
+procedure = """
+- Setup: `defer tests.PrepareTestEnv(t)()`.
+- Discover the move control as the writer:
+  `writer := loginUser(t, "user2")`; `mc := discoverMoveControl(t, writer,
+  tc.Inputs["issue_url"].(string), int64(tc.Inputs["issue_index"].(float64)),
+  int64(tc.Inputs["issue_id"].(float64)))` (see the spec's "Discovering and
+  driving the move request" section).
+- For each test case from `GetValidationTestCases(t)`, run a subtest named
+  `tc.Name`:
+  - Log in as the non-writer: `other := loginUser(t,
+    tc.Inputs["actor"].(string))` (a user who is not a collaborator on
+    user2/repo1, so has no write access to the public repo).
+  - Build the move (targeting the page issue) and send it AS the non-writer:
+    `req := mc.buildMove(t, int64(tc.Inputs["issue_index"].(float64)),
+    int64(tc.Inputs["issue_id"].(float64)),
+    int64(tc.Inputs["target_column_id"].(float64)))`;
+    `resp := other.MakeRequest(t, req, NoExpectedStatus)`.
+  - EXPECTED: the non-writer is REFUSED with a client error — assert the
+    status is within the accepted range carried in the expected params:
+    `resp.Code >= int(tc.Expected["min_status"].(float64)) && resp.Code <=
+    int(tc.Expected["max_status"].(float64))` (a 4xx, and thus NOT 200).
+    The contract requires only that a non-writer be refused at the
+    endpoint; it does NOT mandate a specific status code, so the accepted
+    range is supplied as params (any client-error code, e.g. 403 or 404).
+  - EXPECTED: unchanged: load `project_model.ProjectIssue{IssueID:
+    int(tc.Expected["unchanged_issue_id"].(float64))}` and assert its
+    `ProjectColumnID` still equals
+    `int(tc.Expected["unchanged_column_id"].(float64))`.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+issue_url = "/user2/repo1/issues/4"
+issue_index = 4
+actor = "user4"
+issue_id = 5
+target_column_id = 1
+[story.test_case.expected]
+min_status = 400
+max_status = 499
+unchanged_issue_id = 5
+unchanged_column_id = 3
+
+[[story.test_case]]
+[story.test_case.inputs]
+issue_url = "/user2/repo1/issues/4"
+issue_index = 4
+actor = "user5"
+issue_id = 5
+target_column_id = 2
+[story.test_case.expected]
+min_status = 400
+max_status = 499
+unchanged_issue_id = 5
+unchanged_column_id = 3

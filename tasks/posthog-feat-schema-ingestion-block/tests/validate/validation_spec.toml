@@ -1,0 +1,1051 @@
+instructions = """
+This task uses THREE validation drivers — pytest for the Django backend,
+jest with `jest_config_key = "jest_nodejs"` for the Node.js ingestion
+pipeline, and jest with `jest_config_key = "jest_frontend"` for the
+React/Kea frontend.
+
+# 1. pytest stories (Django backend)
+
+Import the harness first — it bootstraps Django and exposes the
+pre-existing PostHog factories:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        create_event_definition,
+        create_property_group,
+        add_property,
+        link_schema,
+    )
+
+Available helpers (all consume only pre-existing PostHog ORM /
+factory functions):
+  - get_team_and_user() -> (team, user)
+    Fresh Org → Project → Team + User chain per call.
+  - get_authenticated_client(user) -> DRF APIClient with force_login.
+  - create_event_definition(team, name=None, enforcement_mode='allow')
+    -> EventDefinition. Default enforcement_mode is the pre-existing
+    column default. Pass 'reject' to start in reject mode.
+  - create_property_group(team, name=None) -> SchemaPropertyGroup.
+  - add_property(group, name, property_type='String', required=True)
+    -> SchemaPropertyGroupProperty. property_type is one of
+    'String', 'Numeric', 'Boolean', 'DateTime', 'Object'.
+  - link_schema(event_def, property_group) -> EventSchema.
+
+# 2. jest_nodejs stories (Node.js ingestion pipeline)
+
+CRITICAL — jest_nodejs test files MUST use the `.test.ts` extension
+(NOT `.test.tsx`). The nodejs jest.config.js only transforms and
+discovers `*.test.ts` files (testMatch: `src/**/*.test.ts`). A file
+named `.test.tsx` will produce "No tests found, exiting with code 1".
+Name your file exactly: `{story_id}.test.ts`.
+
+CRITICAL — Jest test files must NOT use the // @ts-nocheck and
+hogvm mock that frontend tests need. The nodejs workspace is a
+plain TypeScript project with its own jest config; just write
+ordinary TypeScript imports.
+
+A small test harness is available at ./jest_test_harness — it
+contains pure utilities ONLY (no discovery, no factory-shape
+fallback chains, no method-name aliases). It exports:
+
+  - buildPipelineInput({eventName, properties?, teamId?, ...})
+    -> {event, team}. Pre-existing PipelineEvent shape.
+  - isDropResult(result), isOkResult(result) — thin wrappers around
+    the pre-existing PipelineResultType enum from
+    ~/ingestion/pipelines/results.
+
+Per-trial adapter work happens INSIDE the test file. Each procedure
+below tells you to:
+
+  1. Locate the agent's new step factory. Read
+     `nodejs/src/ingestion/event-preprocessing/index.ts` — the agent
+     registers the new step there, importing a `create*Step` export
+     from a sibling module (e.g.
+     `import { create<Name>Step } from './<module>'`).
+     That import line gives you BOTH the export name AND the module
+     basename. If it isn't in index.ts, scan the wider
+     `nodejs/src/ingestion/` tree for the new file.
+
+  2. IMPORT IT BY ABSOLUTE PATH. Do NOT use a relative `require(...)`:
+     your test file is copied into a validation subdirectory whose
+     depth you cannot predict, so a relative path will not resolve.
+     Require the module by its absolute path inside the container,
+     which is placement-independent:
+
+         const { <factoryExport> } = require(
+             '/repo/posthog/nodejs/src/ingestion/event-preprocessing/<basename>'
+         )
+
+     where `<basename>` is the module name you found in step 1 (no
+     `.ts` extension needed — the jest transform resolves it). Use the
+     agent's actual export name, not necessarily the one shown here.
+
+  3. Open that module's source and read what the step's factory takes
+     as its argument and which methods it calls on it (the "schema
+     source" / manager). Build a per-trial stub providing ONLY those
+     methods, returning fixture schemas in whatever shape the step
+     iterates. Do NOT guess the method name — read it from the source.
+
+  4. In the same source, read the step's drop-construction site to see
+     where the warning details live in the result, and read those
+     fields when asserting.
+
+Each procedure includes a "Reference example" sketch showing one
+common shape — treat the names in it (factory name, manager method,
+warning path) as ILLUSTRATIVE; confirm the real ones from the agent's
+source per steps 1–4.
+
+Skeleton for jest_nodejs stories:
+
+```ts
+import { getTestCases } from './validationParams'
+import {
+    buildPipelineInput,
+    isDropResult,
+    isOkResult,
+} from './jest_test_harness'
+
+// Import the agent's step factory by ABSOLUTE path (see step 2 above).
+// Replace <basename> and the export name with what you found in index.ts.
+const { <factoryExport> } = require(
+    '/repo/posthog/nodejs/src/ingestion/event-preprocessing/<basename>'
+)
+
+describe('<story-id>', () => {
+    const cases = getTestCases()
+    test.each(cases)('case $#', async ({ inputs, expected }) => {
+        // Build a per-trial stub matching the factory's signature.
+        // Run the step on a buildPipelineInput(...) event.
+        // Assert observable values using isDropResult / isOkResult.
+    })
+})
+```
+
+Schema fixture shape: build whatever the agent's step iterates. The
+PostHog property-type vocabulary is 'String', 'Numeric', 'Boolean',
+'DateTime', 'Object' (pre-existing SchemaPropertyType.choices).
+
+# 3. jest_frontend stories (React/Kea)
+
+CRITICAL — EVERY .test.tsx file MUST have these as its FIRST TWO
+LINES (before any imports):
+
+    // @ts-nocheck
+    jest.mock('@posthog/hogvm', () => ({}), { virtual: true })
+
+A small frontend harness is available at ./jest_test_harness (same
+name, .tsx extension this time). It contains pure render-setup ONLY
+(no toggle-discovery, no label-keyword guessing). It exports:
+
+  - renderEventDefinitionSchemaPanel(definition) ->
+    {container, body}. Mounts teamLogic, registers canned API
+    mocks (event_schemas list, schema_property_groups list, plus
+    no-op handlers for PATCH/POST), renders
+    <EventDefinitionSchema definition={definition}/>, and waits
+    for the kea-loaders to populate.
+
+The harness registers the EventDefinition GET as the supplied
+definition object — you can pre-populate enforcement_mode='allow'
+or 'reject' on the object to drive the toggle's initial state.
+
+Discovering the toggle in the rendered DOM is per-trial work. The
+agent's <EventDefinitionSchema> component decides the label, the
+input type (LemonCheckbox/LemonSwitch/etc.), the test-id, the
+aria-label, and the surrounding text. Inspect the agent's source
+(typically frontend/src/scenes/data-management/events/
+EventDefinitionSchema.tsx and its companion logic file) before
+writing the test, then query the rendered DOM for whatever the
+agent actually rendered.
+Multi-database marker (PostHog framework mechanics): mark EVERY pytest test with
+``@pytest.mark.django_db(transaction=True, databases="__all__")``. A plain
+``@pytest.mark.django_db`` or a non-transactional ``databases="__all__"`` can
+ERROR at setup with ``OperationalError: Temporary failure in name resolution`` —
+PostHog configures auxiliary databases (persons, visual_review) on a host that is
+not reachable in this backend-only environment, and a non-transactional
+all-databases marker eagerly connects to them. The transactional form connects
+lazily (only the default database is touched) and the conftest tolerates the
+cross-database teardown.
+
+"""
+
+[settings]
+va_max_turns = 80
+va_timeout_sec = 2400
+script_timeout_sec = 900
+
+[settings.pytest]
+python = "uv run python"
+django_settings = "posthog.settings"
+
+[settings.jest_nodejs]
+config_dir = "nodejs"
+test_parent = "nodejs/src/ingestion/event-preprocessing"
+command = "pnpm exec jest"
+test_path_flag = "--testPathPatterns"
+
+[settings.jest_frontend]
+config_dir = "frontend"
+test_parent = "frontend/src"
+command = "pnpm exec jest"
+test_path_flag = "--testPathPattern"
+
+
+# =============================================================================
+# Backend stories (pytest)
+# =============================================================================
+
+[[story]]
+id = "enforcement_mode_round_trips_via_api"
+driver = "pytest"
+description = """
+A user can flip an event definition into "reject" mode through the
+existing event-definitions API, and a subsequent read returns the new
+value. The toggle round-trips through the API surface.
+"""
+procedure = """
+IMPORTANT: Write a pytest function with ``inputs`` and ``expected``
+fixtures injected by the driver. Do NOT use sys.argv, do NOT print
+results — use ``assert`` statements. Skeleton:
+
+    def test_round_trip(inputs, expected):
+        # ... use inputs dict, assert against expected dict ...
+
+Imports (at module level, before the test function):
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        create_event_definition,
+    )
+
+Steps inside ``def test_round_trip(inputs, expected)``:
+
+1. team, user = get_team_and_user()
+2. event_def = create_event_definition(team, name="purchase",
+                                        enforcement_mode=inputs["initial_mode"])
+3. client = get_authenticated_client(user)
+4. PATCH the event definition to the new mode:
+
+       url = f"/api/projects/{team.id}/event_definitions/{event_def.id}/"
+       response = client.patch(url, {"enforcement_mode": inputs["new_mode"]},
+                               format="json")
+       patch_status = response.status_code
+       patch_ok = 200 <= patch_status < 300
+
+5. GET it back:
+
+       get_response = client.get(url)
+       get_status = get_response.status_code
+       get_body = get_response.json() if get_status == 200 else {}
+       echoed_mode = get_body.get("enforcement_mode")
+
+6. Assert:
+
+       assert patch_ok == expected["patch_ok"]
+       assert echoed_mode == expected["echoed_mode"]
+"""
+
+[[story.test_case]]
+# Flip from allow → reject and read it back.
+[story.test_case.inputs]
+initial_mode = "allow"
+new_mode = "reject"
+[story.test_case.expected]
+patch_ok = true
+echoed_mode = "reject"
+
+[[story.test_case]]
+# Flip back: reject → allow round-trips too.
+[story.test_case.inputs]
+initial_mode = "reject"
+new_mode = "allow"
+[story.test_case.expected]
+patch_ok = true
+echoed_mode = "allow"
+
+
+[[story]]
+id = "event_schema_partial_update_is_allowed"
+driver = "pytest"
+description = """
+Partial updates are supported by the event-schemas resource so the
+data-management UI can swap a schema's property group in place without
+recreating the row.
+"""
+procedure = """
+IMPORTANT: Write a pytest function with ``inputs`` and ``expected``
+fixtures injected by the driver. Do NOT use sys.argv, do NOT print
+results — use ``assert`` statements. Skeleton:
+
+    def test_partial_update(inputs, expected):
+        # ... use inputs dict, assert against expected dict ...
+
+Imports (at module level, before the test function):
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        create_event_definition,
+        create_property_group,
+        link_schema,
+    )
+
+Steps inside ``def test_partial_update(inputs, expected)``:
+
+1. team, user = get_team_and_user()
+2. event_def = create_event_definition(team, name="purchase")
+3. group_a = create_property_group(team, name="Group A")
+4. group_b = create_property_group(team, name=inputs["target_group"])
+5. event_schema = link_schema(event_def, group_a)
+6. client = get_authenticated_client(user)
+7. PATCH the event_schemas detail URL:
+
+       url = f"/api/projects/{team.id}/event_schemas/{event_schema.id}/"
+       response = client.patch(url, {"property_group_id": str(group_b.id)},
+                               format="json")
+       patch_status = response.status_code
+
+8. Assert on the actual status code:
+
+       # The contract: PATCH must NOT come back as 405 Method Not Allowed.
+       # 200/204 (success) is the happy path; 4xx-but-not-405 is also
+       # acceptable (a senior implementation may legitimately reject the
+       # specific payload shape in this fixture, e.g. validation error,
+       # but the method itself must be supported).
+       assert expected["patch_status_min"] <= patch_status <= expected["patch_status_max"]
+       assert patch_status != 405
+"""
+
+[[story.test_case]]
+# PATCH should not return 405 — typically 2xx (success) or possibly 4xx
+# (e.g. payload-validation error), but the HTTP method itself must be
+# supported. We accept the full 200..499 range and exclude 405 explicitly.
+[story.test_case.inputs]
+target_group = "Group B"
+[story.test_case.expected]
+patch_status_min = 200
+patch_status_max = 499
+
+[[story.test_case]]
+# Same shape, distinct group name — guards against the agent
+# special-casing a particular group name string.
+[story.test_case.inputs]
+target_group = "Other Group"
+[story.test_case.expected]
+patch_status_min = 200
+patch_status_max = 499
+
+
+# =============================================================================
+# Node.js ingestion stories (jest, jest_config_key = "jest_nodejs", script_extension = ".test.ts")
+# =============================================================================
+
+[[story]]
+id = "event_missing_required_property_is_dropped"
+driver = "jest"
+jest_config_key = "jest_nodejs"
+script_extension = ".test.ts"
+description = """
+When the team has an event definition in reject mode with a
+required property, an event missing that property is dropped at
+ingestion with a schema-validation warning (should name the missing
+property).
+"""
+procedure = """
+Per-trial discovery work (do this BEFORE writing the test code):
+
+1. Locate the agent's new schema-validation step factory. Read
+   nodejs/src/ingestion/event-preprocessing/index.ts to see what new
+   create-step export the agent registered. If the export isn't there,
+   scan the wider nodejs/src/ingestion/ tree for the new file. Open
+   the factory's source.
+
+2. Read the factory's parameter signature and what it calls on its
+   argument. The agent likely accepts either a "schema source"
+   manager object, a config object containing such a manager, or a
+   curried lookup function. Read the factory body (and the step
+   function it returns) to confirm.
+
+3. Read the step's drop-construction site (the place where it builds a
+   DROP result on a missing-required-property failure). From that code,
+   learn the EXACT structure the step emits, and write it down for your
+   assertion:
+     - the field path within the drop result where the offending
+       property name is recorded (e.g. the step writes
+       `details.errors[].property`, or `details.propertyName`, or
+       `details.field` — whatever THIS agent wrote);
+     - the field path where the rejection reason is recorded, and the
+       reason value the step uses on the missing-required branch.
+   Your assertion will read those SPECIFIC fields — do NOT whole-blob
+   search the serialized result (the injected schema fixture and any
+   echoed metadata contain words like "required" and the property name,
+   so a blob search gives false positives).
+
+Reference example SHAPE (illustrative only — every name below is an
+agent choice you must read from the source, NOT a fixed contract):
+
+    // The factory (the create*Step export you found in index.ts) takes
+    // a "schema manager". The step calls ONE method on it to fetch the
+    // enforced schemas for a team, keyed by event name. On a validation
+    // failure it returns a DROP result whose warning details carry the
+    // offending property name and a reason. READ THE STEP SOURCE for:
+    //   - the factory's exact export name
+    //   - the exact method the step calls on its manager argument
+    //   - the schema-container shape it iterates (Map / Array / object)
+    //   - the field paths in the drop result holding the property name
+    //     and the reason (your assertion reads THESE specific fields)
+
+Imports:
+
+    import { getTestCases } from './validationParams'
+    import { buildPipelineInput, isDropResult } from './jest_test_harness'
+    // Import the agent's step factory by ABSOLUTE path. Replace
+    // <basename> with the module you found in index.ts (step 1) and
+    // <factoryExport> with the agent's actual create*Step export name.
+    const { <factoryExport> } =
+        require('/repo/posthog/nodejs/src/ingestion/event-preprocessing/<basename>')
+
+Steps (per case from getTestCases()):
+
+4. Build a fixture schema for ``inputs.event_name`` with one required
+   property of type ``inputs.required_type`` named
+   ``inputs.required_prop``. Match the SHAPE the agent's step iterates
+   (Map / Array / object with a ``properties`` field — read the step
+   body to see). Reference example fixture:
+
+       const fixtureSchemas = new Map([
+           [inputs.event_name, {
+               required_properties: new Map([
+                   [inputs.required_prop, [inputs.required_type]],
+               ]),
+           }],
+       ])
+
+5. Build a per-trial stub providing ONLY the method(s) the step
+   actually calls on its manager argument (the name you read from the
+   step source in the discovery steps). Return the fixture from it:
+
+       const stub = {
+           [<methodTheStepCalls>]: async (_teamId) => fixtureSchemas,
+       }
+
+   (Replace <methodTheStepCalls> with the literal method name from the
+   step source — do NOT guess; if the step calls more than one method
+   on the manager, stub each.)
+
+6. Construct the step, passing the stub in whatever form the factory
+   takes (the bare manager, or a config object wrapping it — read the
+   factory signature):
+
+       const step = <factoryExport>(stub)
+       // or <factoryExport>({ <managerArgName>: stub }), etc.
+
+7. Build a test event missing the required property:
+
+       const input = buildPipelineInput({
+           eventName: inputs.event_name,
+           properties: {},
+       })
+
+8. Run the step:
+
+       const result = await step(input)
+
+9. Read the OFFENDING-PROPERTY field and the REASON field at the
+   specific paths you learned from the step source in discovery step 3
+   (NOT a whole-result search). Navigate the agent's actual drop shape
+   — e.g. if the step wrote `details.errors[].property`, collect the
+   `property` values across the errors array; if it wrote
+   `details.propertyName`, read that. Likewise for the reason field.
+
+       const dropped = isDropResult(result)
+       // <-- replace the two extractions below with the field paths you
+       //     read from the step source for THIS agent:
+       const offendingProps = /* e.g. result.warnings.flatMap(w =>
+            (w.details?.errors ?? []).map(e => e.property)) */
+       const reasons = /* e.g. result.warnings.flatMap(w =>
+            (w.details?.errors ?? []).map(e => e.reason)) */
+       // Value checks use the KNOWN-CORRECT test input, so a validator
+       // that names the wrong property still fails:
+       const propertyNamed = offendingProps.includes(inputs.required_prop)
+       const reasonIndicatesMissing =
+           reasons.some((r) => /missing|required|absent/i.test(String(r)))
+
+- EXPECTED: ``dropped`` equals ``expected["dropped"]``.
+- EXPECTED: ``propertyNamed`` is ``true`` (the validator's
+  offending-property field equals ``inputs.required_prop``).
+- EXPECTED: ``reasonIndicatesMissing`` is ``true`` (the validator's
+  reason field conveys a missing-required semantic).
+
+Return ``{dropped, propertyNamed, reasonIndicatesMissing}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "user_id"
+required_type = "String"
+[story.test_case.expected]
+dropped = true
+
+[[story.test_case]]
+# Distinct event name + property name + type confirm the validator
+# isn't keyed to a hard-coded property string.
+[story.test_case.inputs]
+event_name = "checkout_started"
+required_prop = "cart_total"
+required_type = "Numeric"
+[story.test_case.expected]
+dropped = true
+
+
+[[story]]
+id = "event_wrong_type_required_property_is_dropped"
+driver = "jest"
+jest_config_key = "jest_nodejs"
+script_extension = ".test.ts"
+description = """
+When a required property's value can't be coerced to the configured
+type, the event is dropped with a type-mismatch reason (likewise should
+name the offending property). Includes ClickHouse-unsafe Numeric values
+(Inf, -Inf, NaN, booleans, the corresponding string sentinels, empty
+and whitespace-only strings), i.e. values that JS can hold but
+ClickHouse cannot store.
+"""
+procedure = """
+Per-trial discovery work (do this BEFORE writing the test code):
+
+1. Locate the agent's new schema-validation step factory the same way
+   as in event_missing_required_property_is_dropped (read
+   nodejs/src/ingestion/event-preprocessing/index.ts; if absent, scan
+   the wider tree).
+
+2. Read the factory's parameter signature and what it calls on its
+   argument; build the per-trial stub the same way.
+
+3. Read the step's drop-construction site to learn the EXACT field
+   paths where the offending property name and the rejection reason
+   are recorded on a TYPE-MISMATCH failure (usually the same shape as
+   the missing-required branch). Your assertion reads those specific
+   fields — do NOT whole-blob search.
+
+Reference example shape (one common shape; OTHER SHAPES ARE VALID):
+see event_missing_required_property_is_dropped — same factory, same
+manager interface, same drop-result shape; the per-property type
+check is just a different code branch.
+
+Imports:
+
+    import { getTestCases } from './validationParams'
+    import { buildPipelineInput, isDropResult } from './jest_test_harness'
+    const { <factoryExport> } =
+        require('/repo/posthog/nodejs/src/ingestion/event-preprocessing/<basename>')   // same path as discovered above
+
+Steps (per case from getTestCases()):
+
+4. ``inputs.bad_value_json`` is a JSON-encoded literal because TOML
+   cannot express NaN / Infinity / true / false uniformly. Decode it:
+
+       const value = JSON.parse(inputs.bad_value_json)
+
+5. Build a fixture schema for ``inputs.event_name`` with one required
+   property of type ``inputs.required_type`` named
+   ``inputs.required_prop`` (same shape decision as in the
+   missing-required story).
+
+6. Build the per-trial stub returning the fixture; construct the step.
+
+7. Build the test event carrying the bad value at the required prop:
+
+       const input = buildPipelineInput({
+           eventName: inputs.event_name,
+           properties: { [inputs.required_prop]: value },
+       })
+
+8. Run the step:
+
+       const result = await step(input)
+
+9. Read the OFFENDING-PROPERTY field and the REASON field at the
+   specific paths you learned from the step source in discovery step 3
+   (NOT a whole-result search — searching the echoed event would be
+   meaningless here since the bad value lives on the property). Read
+   the validator's own warning fields:
+
+       const dropped = isDropResult(result)
+       // <-- replace with the field paths you read from the step source:
+       const offendingProps = /* e.g. result.warnings.flatMap(w =>
+            (w.details?.errors ?? []).map(e => e.property)) */
+       const reasons = /* e.g. result.warnings.flatMap(w =>
+            (w.details?.errors ?? []).map(e => e.reason)) */
+       const propertyNamed = offendingProps.includes(inputs.required_prop)
+       const reasonIndicatesTypeMismatch =
+           reasons.some((r) =>
+               /mismatch|invalid|cannot|coerce|wrong.?type|not.*valid/i.test(String(r)))
+
+- EXPECTED: ``dropped`` equals ``expected["dropped"]``.
+- EXPECTED: ``propertyNamed`` is ``true`` (the validator's
+  offending-property field equals ``inputs.required_prop`` — read from
+  the warning, not the echoed event).
+- EXPECTED: ``reasonIndicatesTypeMismatch`` is ``true`` (the
+  validator's reason field conveys a type/coercion-failure semantic).
+
+Return ``{dropped, propertyNamed, reasonIndicatesTypeMismatch}``.
+"""
+
+# ── Wrong-type cases (non-Numeric)
+[[story.test_case]]
+# Numeric schema, non-numeric string value.
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+bad_value_json = "\"not-a-number\""
+[story.test_case.expected]
+dropped = true
+
+[[story.test_case]]
+# Boolean schema with a value that's neither true/false nor the
+# accepted lowercase string forms.
+[story.test_case.inputs]
+event_name = "subscribed"
+required_prop = "is_premium"
+required_type = "Boolean"
+bad_value_json = "\"yes\""
+[story.test_case.expected]
+dropped = true
+
+# ── ClickHouse-unsafe Numeric values that must be rejected
+# (folded in from the standalone "numeric_validator_rejects_*" story).
+# These are values JavaScript can hold but ClickHouse cannot store.
+
+[[story.test_case]]
+# String sentinel "NaN".
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+bad_value_json = "\"NaN\""
+[story.test_case.expected]
+dropped = true
+
+[[story.test_case]]
+# String sentinel "Infinity".
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+bad_value_json = "\"Infinity\""
+[story.test_case.expected]
+dropped = true
+
+[[story.test_case]]
+# String sentinel "-Infinity".
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+bad_value_json = "\"-Infinity\""
+[story.test_case.expected]
+dropped = true
+
+[[story.test_case]]
+# Empty string is not a valid Numeric.
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+bad_value_json = "\"\""
+[story.test_case.expected]
+dropped = true
+
+[[story.test_case]]
+# Whitespace-only string is not a valid Numeric.
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+bad_value_json = "\"   \""
+[story.test_case.expected]
+dropped = true
+
+[[story.test_case]]
+# Boolean true is not a valid Numeric.
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+bad_value_json = "true"
+[story.test_case.expected]
+dropped = true
+
+[[story.test_case]]
+# Boolean false is not a valid Numeric.
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+bad_value_json = "false"
+[story.test_case.expected]
+dropped = true
+
+
+[[story]]
+id = "event_satisfying_schema_is_accepted"
+driver = "jest"
+jest_config_key = "jest_nodejs"
+script_extension = ".test.ts"
+description = """
+An event whose properties satisfy the schema flows through the
+validation step unchanged. Includes Numeric values that are valid
+for ClickHouse (finite numbers, negatives, zero, trimmed numeric
+strings), i.e. the validator doesn't over-reject valid traffic.
+"""
+procedure = """
+Per-trial discovery work (do this BEFORE writing the test code):
+same as event_missing_required_property_is_dropped — locate the
+agent's step factory, read its parameter signature, plan the
+per-trial stub, and read the result shape (you'll be checking for
+isOkResult here rather than the warning details).
+
+Imports:
+
+    import { getTestCases } from './validationParams'
+    import { buildPipelineInput, isOkResult } from './jest_test_harness'
+    const { <factoryExport> } =
+        require('/repo/posthog/nodejs/src/ingestion/event-preprocessing/<basename>')
+
+Steps (per case from getTestCases()):
+
+1. ``inputs.value_json`` is a JSON-encoded literal so the same shape
+   covers strings, numbers, etc. uniformly. Decode it:
+
+       const value = JSON.parse(inputs.value_json)
+
+2. Build a fixture schema for ``inputs.event_name`` with one required
+   property of type ``inputs.required_type`` named
+   ``inputs.required_prop`` (same shape decision as in the
+   missing-required story).
+
+3. Build the per-trial stub returning the fixture; construct the step.
+
+4. Build the satisfying event with ``value`` at the required prop:
+
+       const input = buildPipelineInput({
+           eventName: inputs.event_name,
+           properties: { [inputs.required_prop]: value },
+       })
+
+5. Run the step:
+
+       const result = await step(input)
+       const passed = isOkResult(result)
+
+- EXPECTED: ``passed`` equals ``expected["passed"]``.
+
+Return ``{passed}``.
+"""
+
+# ── String happy path
+[[story.test_case]]
+[story.test_case.inputs]
+event_name = "login"
+required_prop = "user_id"
+required_type = "String"
+value_json = "\"alice\""
+[story.test_case.expected]
+passed = true
+
+# ── Boolean values coercible to the configured type must NOT be over-rejected
+# (base.md drops only values that "can't be coerced"). Native booleans and the
+# lowercase "true"/"false" strings are ClickHouse-storable; a typeof-only
+# validator silently drops valid string-boolean traffic. (Case variants like
+# "TRUE"/"yes"/1 stay rejectable — covered by the wrong-type story / rubric.)
+[[story.test_case]]
+# Native JSON boolean satisfies a Boolean property.
+[story.test_case.inputs]
+event_name = "subscribed"
+required_prop = "is_premium"
+required_type = "Boolean"
+value_json = "true"
+[story.test_case.expected]
+passed = true
+
+[[story.test_case]]
+# Lowercase string "true" is coercible to Boolean (ClickHouse-storable).
+[story.test_case.inputs]
+event_name = "subscribed"
+required_prop = "is_premium"
+required_type = "Boolean"
+value_json = "\"true\""
+[story.test_case.expected]
+passed = true
+
+[[story.test_case]]
+# Lowercase string "false" is coercible to Boolean (ClickHouse-storable).
+[story.test_case.inputs]
+event_name = "notified"
+required_prop = "opted_in"
+required_type = "Boolean"
+value_json = "\"false\""
+[story.test_case.expected]
+passed = true
+
+# ── ClickHouse-safe Numeric values that must NOT be over-rejected
+# (folded in from the standalone "numeric_validator_rejects_*" story).
+
+[[story.test_case]]
+# Positive integer.
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+value_json = "42"
+[story.test_case.expected]
+passed = true
+
+[[story.test_case]]
+# Float.
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+value_json = "3.14"
+[story.test_case.expected]
+passed = true
+
+[[story.test_case]]
+# Negative integer.
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+value_json = "-10"
+[story.test_case.expected]
+passed = true
+
+[[story.test_case]]
+# Zero.
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+value_json = "0"
+[story.test_case.expected]
+passed = true
+
+[[story.test_case]]
+# Numeric string '42'.
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+value_json = "\"42\""
+[story.test_case.expected]
+passed = true
+
+[[story.test_case]]
+# Negative numeric string.
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+value_json = "\"-10\""
+[story.test_case.expected]
+passed = true
+
+[[story.test_case]]
+# Float string '3.14'.
+[story.test_case.inputs]
+event_name = "purchase"
+required_prop = "amount"
+required_type = "Numeric"
+value_json = "\"3.14\""
+[story.test_case.expected]
+passed = true
+
+
+[[story]]
+id = "team_without_reject_mode_short_circuits"
+driver = "jest"
+jest_config_key = "jest_nodejs"
+script_extension = ".test.ts"
+description = """
+Teams with no event definitions in reject mode short-circuit the
+validation step (events flow through regardless of whether their
+properties match any registered schemas). The validator shouldn't
+accidentally over-enforce on teams that haven't opted in.
+"""
+procedure = """
+Per-trial discovery work (do this BEFORE writing the test code):
+same as event_missing_required_property_is_dropped — locate the
+agent's step factory, read its parameter signature, plan the
+per-trial stub. The stub here returns an EMPTY schema source
+(empty Map / empty Array / no schemas for this team), exercising
+the short-circuit path.
+
+Imports:
+
+    import { getTestCases } from './validationParams'
+    import { buildPipelineInput, isOkResult } from './jest_test_harness'
+    const { <factoryExport> } =
+        require('/repo/posthog/nodejs/src/ingestion/event-preprocessing/<basename>')
+
+Steps (per case from getTestCases()):
+
+1. Build the per-trial stub that returns an empty schema source in the
+   shape the agent's step expects (e.g. ``new Map()`` if the step calls
+   ``schemas.get(eventName)``, or ``[]`` if it iterates as an array).
+
+2. Construct the step:
+
+       const step = <factoryExport>(stub)
+
+3. Build an event with arbitrary properties:
+
+       const input = buildPipelineInput({
+           eventName: 'arbitrary_event',
+           properties: { foo: 'bar', count: 42 },
+       })
+
+4. Run the step:
+
+       const result = await step(input)
+       const passed = isOkResult(result)
+
+- EXPECTED: ``passed`` equals ``expected["passed"]``.
+
+Return ``{passed}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+sentinel = "no-schemas"
+[story.test_case.expected]
+passed = true
+
+[[story.test_case]]
+# Same empty schema set, distinct sentinel — confirms re-running is
+# stable (no caching artifacts that flip behavior between calls).
+[story.test_case.inputs]
+sentinel = "still-no-schemas"
+[story.test_case.expected]
+passed = true
+
+
+# =============================================================================
+# Frontend stories (jest, jest_config_key = "jest_frontend")
+# =============================================================================
+
+[[story]]
+id = "enforcement_toggle_renders_in_event_definition_schema_view"
+driver = "jest"
+jest_config_key = "jest_frontend"
+description = """
+The event-definition schema management page shows an interactive
+toggle for enforcing the schema on incoming events (a checkbox or
+switch with a label related to enforcement / rejection / strictness).
+"""
+procedure = """
+The Jest test file MUST start with these exact two lines (before any
+imports):
+
+    // @ts-nocheck
+    jest.mock('@posthog/hogvm', () => ({}), { virtual: true })
+
+Without these the test will fail to compile or crash on import.
+Do not add any other ``jest.mock(...)`` calls — PostHog's test
+infrastructure already handles ``posthog-js`` and the other
+expected mocks.
+
+Per-trial discovery work (do this BEFORE writing the test code):
+
+1. Open the agent's <EventDefinitionSchema> source — typically
+   frontend/src/scenes/data-management/events/EventDefinitionSchema.tsx
+   and its companion logic file (eventDefinitionSchemaLogic.ts or
+   similar). Read how the agent rendered the schema-enforcement
+   toggle: what component (LemonSwitch / LemonCheckbox / native
+   <input type="checkbox">), what label string, what data-testid /
+   aria-label / id, and whether it sits in the panel header, the
+   schema row, or the property table.
+
+2. Plan a per-trial DOM query that selects the toggle the agent
+   actually rendered. Reference example: a senior implementation
+   adds a <LemonSwitch label="Reject events that violate the
+   schema"> in the panel header, which renders as an interactive
+   element with role="switch" inside a container whose text contains
+   the label string. If the agent's actual choice is different (e.g.
+   a checkbox with data-testid="enforcement-toggle"), adapt your
+   query to match.
+
+   OTHER SHAPES ARE VALID — read the agent's source first, then
+   write the query. Do NOT pin the test to a specific keyword
+   regex; query for what the agent actually rendered.
+
+Imports (after the two header lines):
+
+    import { getTestCases } from './validationParams'
+    import { renderEventDefinitionSchemaPanel } from './jest_test_harness.tsx'
+
+Steps (per case from getTestCases()):
+
+3. Build a definition object — at minimum ``{id, name}``. The harness
+   wires up the API mocks so the component sees one schema attached
+   and can enable the toggle:
+
+       const definition = {
+           id: inputs.event_definition_id,
+           name: inputs.event_name,
+           enforcement_mode: inputs.initial_mode,
+       }
+
+4. Render the schema panel:
+
+       const { container, body } = await renderEventDefinitionSchemaPanel(definition)
+
+5. Run the per-trial query you planned in (2) against ``body`` (or
+   ``container`` if the toggle isn't on document.body) to locate the
+   toggle the agent rendered.
+
+       const toggle = /* your per-trial query, e.g.
+           body.querySelector('[role="switch"][aria-label*="enforce" i]')
+           or container.querySelector('[data-testid="enforcement-toggle"]')
+           — match what the agent's source actually emits */
+       const toggle_present = toggle !== null
+
+- EXPECTED: ``toggle_present`` equals ``expected["toggle_present"]``.
+
+(Don't assert on the toggle's enabled state — its interactivity may
+depend on data the harness's API mocks don't fully populate, e.g. the
+toggle may be conditionally disabled until a separate kea-loader
+fetches an unmocked endpoint. The story's claim is that the toggle
+exists in the rendered DOM with the right semantic role.)
+
+Return ``{toggle_present}``.
+"""
+
+[[story.test_case]]
+# Initial state = allow → toggle is rendered (and unchecked).
+[story.test_case.inputs]
+event_definition_id = "event-def-validation-1"
+event_name = "purchase"
+initial_mode = "allow"
+[story.test_case.expected]
+toggle_present = true
+
+[[story.test_case]]
+# Initial state = reject → toggle is rendered (and checked) — confirms
+# the control surfaces in BOTH starting states, not just the default.
+[story.test_case.inputs]
+event_definition_id = "event-def-validation-2"
+event_name = "signup"
+initial_mode = "reject"
+[story.test_case.expected]
+toggle_present = true

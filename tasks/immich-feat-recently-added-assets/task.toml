@@ -1,0 +1,146 @@
+version = "1.0"
+
+[environment]
+base_image = "immich-feat-recently-added-assets:latest"
+build_timeout_sec = 2400.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1800.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "immich"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "immich"
+
+[metadata]
+family = "immich-feat-recently-added-assets"
+variant = "hard"
+segment = "design"
+repo = "immich"
+tags = ["immich", "typescript-service", "sql-database"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Immich's main timeline groups and sorts a user's photos and videos by the
+date each item was *taken* (its capture date). Users have asked for a way
+to browse their library by when assets were *added to Immich* instead — a
+"recently added" view that surfaces newly-uploaded photos at the top
+regardless of when they were originally captured (e.g. a scan of a
+decades-old print uploaded today should appear at the top of "recently
+added", but near the bottom of the normal capture-date timeline).
+
+The timeline is served by two endpoints that the web and mobile clients
+poll as the user scrolls: `GET /timeline/buckets` returns the list of
+month "buckets" with per-bucket asset counts, and `GET /timeline/bucket`
+returns the assets within one month bucket. Today both always group and
+order by capture date. The task is to add an optional `orderBy` dimension
+so the same endpoints can group and order by upload date, while leaving
+the existing capture-date behaviour as the default.
+"""
+context = """Setting:
+- The timeline-bucket endpoints are backed by a service that delegates to
+  a repository which builds the month-bucket SQL with the Kysely query
+  builder against Postgres. A bucket is a calendar month; the bucket key
+  is the truncated month of a date column.
+- Each asset row carries two distinct dates that matter here: the date the
+  photo/video was taken (a timezone-localised capture timestamp used today
+  for all timeline grouping and ordering) and the date the asset row was
+  created in Immich (its upload timestamp). These are different columns and
+  for many assets fall in different months (e.g. importing an old library).
+- The bucket-contents endpoint returns column-parallel arrays (one entry
+  per asset): ids, capture timestamps, durations, etc. Clients read these
+  arrays positionally.
+
+What the feature must do:
+- `GET /timeline/buckets` and `GET /timeline/bucket` accept an optional
+  `orderBy` query parameter with two values: `takenAt` (group & order by
+  capture date — the existing behaviour, and the default when the
+  parameter is omitted) and `createdAt` (group & order by upload date).
+- When `orderBy=createdAt`, the month buckets, the bucket-membership
+  filter, and the ordering of assets within a bucket are all driven by the
+  upload date instead of the capture date.
+- `GET /timeline/bucket` additionally returns a new `createdAt` array: the
+  per-asset upload timestamps, parallel to the existing arrays.
+- The default (`takenAt` / omitted) path must remain exactly as before so
+  the normal photo timeline is unaffected.
+
+Why it is non-trivial:
+- The grouping, the per-bucket filter, and the within-bucket ordering are
+  three separate places in two different query methods; all must switch in
+  lockstep or buckets won't line up with their contents.
+- Grouping must switch to a physically different date column, not reuse the
+  localised capture value.
+- A naive implementation that always groups by upload date silently
+  regresses the default capture-date timeline.
+"""
+solution = """Canonical fix (reference example, server-only scope):
+- Introduce an ordering-dimension value with two options (capture date vs.
+  upload date) and thread it from the query DTO into the repository's
+  timeline-bucket options. The service needs no change — it forwards the
+  DTO into those options unmodified, so the new field passes straight
+  through (the oracle touches no service file).
+- The shared month-truncation helper used to build the bucket key takes the
+  ordering dimension and truncates the upload-date column instead of the
+  capture-date column when upload ordering is requested. Both the
+  `getTimeBuckets` grouping select and the `getTimeBucket` membership
+  `where` use this helper, so they switch together.
+- The within-bucket `orderBy` switches to the upload column when upload
+  ordering is requested.
+- The bucket-contents query selects the upload timestamp as a new column
+  and aggregates it into a `createdAt` array alongside the existing arrays;
+  the response DTO gains the matching `createdAt` array field.
+
+Alternative valid implementations (all accepted — see
+alternative_implementations).
+
+Non-optimal implementations the reward rejects:
+- Switching only the grouping but not the within-bucket filter/order (or
+  vice-versa): buckets and their contents disagree.
+- Always grouping by upload date: regresses the default capture-date
+  timeline.
+- Omitting the per-asset upload-timestamp response array entirely (a
+  differently named array is fine — the field name is the agent's choice).
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["typescript-service", "sql-database"]
+runtime_dependence = "runtime-essential"
+skills = ["codebase-exploration", "framework-fluency", "api-contract-design", "query-optimization", "data-population", "test-execution"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 36
+files = 5
+hunks = 14
+scope = "spread"
+
+[metadata.origin]
+repo = "immich-app/immich"
+pr_numbers = [28272]
+base_commit = "38438c8d9a4b19e8563327b26d098bec6d862711"
+base_commit_date = "2026-05-11"
+merged_at = "2026-05-11"
+
+
+
+

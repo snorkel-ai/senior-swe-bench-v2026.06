@@ -1,0 +1,187 @@
+version = "1.0"
+
+[environment]
+base_image = "electric-fix-resolve-pending-shapes:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "electric"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "electric"
+
+[metadata]
+family = "electric-fix-resolve-pending-shapes"
+variant = "hard"
+segment = "investigate"
+repo = "electric"
+tags = ["electric", "elixir"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """On a production stack we periodically see Postgres replication-slot lag
+grow without bound — the `confirmed_flush_lsn` we report back to
+Postgres just stops advancing. Every shape on the stack is healthy:
+clients keep streaming new changes, storage keeps writing to disk,
+nothing crashes. But the global flush boundary the sync engine reports
+upstream just freezes. Restarting the stack clears it; the lag begins
+to grow again hours or days later. A telltale: the freeze always
+begins shortly after a transaction whose changes spanned multiple WAL
+fragments.
+"""
+context = """The Electric sync engine streams Postgres logical replication changes
+to clients as Shapes (filtered table subsets). Per-committed-transaction
+fan-out is centralised in
+`packages/sync-service/lib/electric/replication/shape_log_collector.ex`
+(the SLC). The SLC dispatches `%TransactionFragment{}` messages to
+per-shape `Electric.Shapes.Consumer` GenServers and owns a
+`Electric.Replication.ShapeLogCollector.FlushTracker` struct that
+tracks per-shape flush progress. When the global flushed offset
+advances, FlushTracker emits a `{:flush_boundary_updated, lsn}`
+message to the replication client.
+
+A Postgres transaction can be fanned out as one *or several*
+fragments — `has_begin?: true` on the first, `has_commit?: true` on
+the last, arbitrary number of intermediate non-commit fragments in
+between. Multi-fragment transactions are common when a single Postgres
+transaction touches many records or large records.
+
+Per-shape consumers write fragment data to their storage backend
+asynchronously. When storage finishes flushing, it sends
+`{ShapeCache.Storage, :flushed, offset}` back to the consumer
+process, which then notifies the SLC's FlushTracker via
+`ShapeLogCollector.notify_flushed/3`. The `PureFileStorage` backend
+flushes either on a periodic timer (`flush_period`) or once a 64 KiB
+buffer threshold has been written — whichever comes first.
+
+Reproduction artefacts and triage notes from the production incident:
+
+  - Issue: https://github.com/electric-sql/electric/issues/4063
+  - Earlier related fix that did NOT solve the freeze:
+    https://github.com/electric-sql/electric/issues/3985 — that PR
+    pre-registered shapes in the FlushTracker on every non-commit
+    fragment so flush notifications at the non-commit's offset
+    weren't dropped on the floor. It addresses one race window but
+    leaves the larger one open.
+  - Production telemetry: FlushTracker.last_flushed showed a pending
+    entry where `last_sent` was at the commit fragment's offset and
+    `last_flushed` was at the matching non-commit fragment's offset
+    — i.e. the flush at the commit's offset never arrived.
+  - The freeze does not correlate with shape size, traffic volume, or
+    consumer process restarts. It correlates with multi-fragment
+    transactions whose commit fragment has fewer changes for a given
+    shape than the earlier non-commit fragments did, especially when
+    storage flushes mid-fragment (large records hitting the 64 KiB
+    threshold or the flush timer firing during fragment processing).
+
+Red herrings that show up during triage but are not the cause:
+
+  - The FlushTracker.handle_flush_notification "shape not in mapping"
+    branch: it is correctly defensive after the prior 3985 PR.
+  - The replication client itself: it is purely a sink for
+    `{:flush_boundary_updated, lsn}` messages.
+  - The SLC's broadcast/2 fan-out: O(N) but unrelated to flush
+    bookkeeping.
+  - Consumer.terminate/2 paths and shape lifecycle hooks: the freeze
+    happens with no consumer churn; the affected shape is alive
+    throughout.
+"""
+solution = """Canonical fix (reference example): defer the flush notification at
+the Consumer level. When `{ShapeCache.Storage, :flushed, offset}`
+arrives at a Consumer while `state.pending_txn` is non-nil (i.e. a
+multi-fragment txn is in flight), store the latest such offset on the
+consumer state (e.g. as a new `pending_flush_offset` field) and emit
+`ShapeLogCollector.notify_flushed/3` only once the pending txn
+completes — at the commit fragment's offset, aligned via the
+existing `align_offset_to_txn_boundary/2`. All three terminal paths of
+a pending transaction (commit with relevant changes, skip, commit with
+no relevant changes) must clear the deferred offset, otherwise the
+freeze recurs in less obvious code paths. With this in place,
+FlushTracker only ever sees flush acknowledgements at commit-fragment
+boundaries and never gets stuck.
+
+A consequence of moving the offset alignment into the Consumer: the
+FlushTracker no longer needs the non-commit-fragment branch the prior
+3985 PR introduced. Calling `FlushTracker.handle_txn_fragment` only on
+commit fragments — and dropping the `shapes_with_changes` parameter
+entirely — keeps the tracker simpler and matches the new invariant.
+The verifier does not require this simplification, but most agents
+will reach it naturally.
+
+Other valid implementations:
+
+  - Cache the deferred offset somewhere other than a struct field
+    (process dictionary, ETS, persistent_term). Same observable
+    behaviour through `notify_flushed/3`.
+  - Track a list of deferred offsets and replay them in order. The
+    canonical fix collapses concurrent deferrals into the maximum
+    offset because storage flush notifications are monotonic in
+    offset under PureFileStorage; a per-flush replay is correct but
+    more complex.
+  - Have the Consumer compute the commit fragment's
+    `last_log_offset` retroactively from the storage-level offset on
+    every storage flush. Implementable but requires the Consumer to
+    look up an in-flight commit-fragment offset that doesn't exist
+    yet at the moment the storage flush fires. The deferral pattern
+    sidesteps this.
+
+Non-optimal "fixes" that the verifier will reject:
+
+  - Pre-registering shapes earlier in the FlushTracker (the prior
+    3985 fix). Closes only a subset of the race window — the
+    buffer-size flush case still drops the boundary update because
+    the offset the Consumer notifies with predates the commit
+    fragment's offset.
+  - Suppressing the `:flushed` message during a pending txn without
+    replaying it. FlushTracker keeps the shape pending forever, so
+    the boundary still freezes.
+  - Forcing `flush_period` to a value larger than the longest
+    transaction. Makes the timer-based race unlikely but does not
+    address the buffer-size flush path; also delays Postgres
+    acknowledgements and risks WAL-segment retention.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["elixir"]
+runtime_dependence = "runtime-essential"
+skills = ["codebase-exploration", "fault-localization", "concurrency-reasoning", "framework-fluency", "logic-fix", "distributed-systems", "event-driven-design"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 104
+files = 4
+hunks = 11
+scope = "broad"
+
+[metadata.origin]
+repo = "electric-sql/electric"
+pr_numbers = [4064]
+base_commit = "64a89a05f58e80b4f9c72fc64467ae3893bb0e78"
+base_commit_date = "2026-03-26"
+merged_at = "2026-03-30"
+
+
+
+

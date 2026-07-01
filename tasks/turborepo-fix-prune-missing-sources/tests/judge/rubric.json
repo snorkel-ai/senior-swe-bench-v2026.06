@@ -1,0 +1,7 @@
+{
+  "files": [
+    "crates/turborepo-fs/src/lib.rs"
+  ],
+  "fail_to_pass": [],
+  "pass_to_pass": []
+}

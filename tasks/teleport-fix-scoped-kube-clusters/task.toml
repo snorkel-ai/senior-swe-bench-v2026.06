@@ -1,0 +1,114 @@
+version = "1.0"
+
+[environment]
+base_image = "teleport-fix-scoped-kube-clusters:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 2700.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "teleport"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 14400.0
+
+[solution.env]
+REPO_NAME = "teleport"
+
+[metadata]
+family = "teleport-fix-scoped-kube-clusters"
+variant = "hard"
+segment = "investigate"
+repo = "teleport"
+tags = ["teleport", "go", "cli"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Now that Teleport kube clusters can be scoped, unscoped users are silently losing
+visibility: when the same cluster name exists in two different scopes, resource
+listings collapse them to a single entry, so the user only ever sees one of the
+duplicate-named clusters, and `tsh kube ls` gives them no way to tell which one.
+The fix must make listing return every cluster across scope boundaries (while still
+collapsing genuine duplicates), keep pagination correct when names repeat, and make
+`tsh kube ls` distinguish same-named clusters.
+"""
+context = """Multi-layer change in the Go monorepo. Kube clusters can now carry a scope.
+ListResources (server side) deduplicates kube clusters via the seenMap threaded
+through services.MatchResourceByFilters and paginates in-memory via
+services/local.FakePaginate; the tsh client lists via lib/kube/utils
+extractAndSortKubeClusters and displays via tool/tsh/common/kube.go.
+
+Before this change deduplication keyed on resource name only, so an unscoped
+identity saw a single cluster per name even when the same name existed in multiple
+scopes; and the in-memory pagination cursor keyed on name, so once duplicate names
+became visible the cursor could skip or loop resources.
+
+Design notes for verifier/rubric authors: deduplication must NOT cross scope
+boundaries but must still collapse true within-scope duplicates (same name AND same
+scope). Scope equality is by normalized scope (scopes.NormalizeForEquality), so
+equivalent scope spellings dedup together. The FakePaginate cursor must encode scope
+for kube clusters. tsh kube ls must surface the scope (text + JSON/YAML) and must not
+mark a single arbitrary row as selected when a name is ambiguous. The web UI is
+knowingly left unable to disambiguate until the unified resource cache supports
+scopes — that is explicitly out of scope for this task.
+"""
+solution = """Canonical fix (reference example): add scope to the dedup key used in
+services.MatchResourceByFilters (normalized via scopes.NormalizeForEquality), make
+FakePaginate's start/next cursor scope-aware for kube clusters, key
+extractAndSortKubeClusters uniqueness on (name, scope) instead of name alone, and
+surface scope in tsh kube ls (text column + JSON/YAML field) while suppressing the
+selected '*' marker when a name is ambiguous.
+
+WHY: an unscoped identity must see every (name, scope) combination; pagination must
+remain exactly-once with duplicate names; within-scope duplicates must still collapse.
+
+Likely-wrong shortcuts the reward stack must reject: (a) disabling kube-cluster dedup
+entirely — breaks within-scope dedup; (b) making dedup scope-aware but leaving the
+pagination cursor name-keyed — pagination skips/loops on duplicate names; (c) raw
+scope-string compare instead of the normalized helper.
+
+Alternative valid fixes vary the dedup-key representation (struct field vs composite
+string), the cursor encoding (scope-cache encoder vs any injective name+scope
+encoding), the location of the dedup logic, and the CLI scope-display shape — all
+must be accepted.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["go", "cli"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "cross-service-reasoning", "framework-fluency", "logic-fix", "data-model-design"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 85
+files = 4
+hunks = 14
+scope = "broad"
+
+[metadata.origin]
+repo = "gravitational/teleport"
+pr_numbers = [66339]
+base_commit = "10c52b9137b3afe3e0c21ad4e94912c296dad676"
+base_commit_date = "2026-04-30"
+merged_at = "2026-05-06"
+
+
+
+

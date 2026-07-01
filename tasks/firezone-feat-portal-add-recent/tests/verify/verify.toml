@@ -1,0 +1,6 @@
+# Elixir verifier config. test-setup.sh has already started Postgres and the
+# firezone_test DB by the time verifiers run, so `mix test` works here.
+[mix]
+app = "elixir"
+command = "mix test"
+timeout = 600

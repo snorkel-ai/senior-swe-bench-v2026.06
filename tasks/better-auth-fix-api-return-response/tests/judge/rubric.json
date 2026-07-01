@@ -1,0 +1,7 @@
+{
+  "files": [
+    "packages/better-auth/src/api/to-auth-endpoints.ts"
+  ],
+  "fail_to_pass": [],
+  "pass_to_pass": []
+}

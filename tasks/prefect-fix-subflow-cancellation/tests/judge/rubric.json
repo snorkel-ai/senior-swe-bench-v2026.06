@@ -1,0 +1,32 @@
+{
+  "files": [
+    "src/prefect/runner/",
+    "src/prefect/engine.py",
+    "src/prefect/flow_engine.py",
+    "src/prefect/cli/flow_run.py",
+    "src/prefect/_internal/",
+    "src/prefect/_experimental/bundles/",
+    "src/prefect/utilities/processutils.py",
+    "src/prefect/utilities/engine.py",
+    "src/prefect/workers/process.py"
+  ],
+  "pass_to_pass": [],
+  "fail_to_pass": [
+    {
+      "name": "runner_to_child_intent_mechanism_present",
+      "description": "The implementation introduces an explicit intent-delivery mechanism between the runner process and the child flow run process — a loopback channel, named pipe, signal-with-shared-memory, file-semaphore, second-signal handler, or equivalent — that lets the runner communicate cancel intent to the child before sending the platform termination signal. A blanket 'always treat SIGTERM as cancel' replacement of the existing crash-handling logic does NOT satisfy this criterion: the implementation must distinguish user-driven cancel from unsolicited termination by carrying explicit intent across the process boundary."
+    },
+    {
+      "name": "runner_falls_back_when_child_not_ready",
+      "description": "The new intent mechanism is best-effort: when the child has not yet connected, registered, or acknowledged through it (e.g. cancellation arrives before the child's bridge is up, or the child is already wedged), the runner falls through to the existing crash-style termination path without hanging or raising. A wedged or unresponsive child cannot wedge the runner — the runner's external termination remains the liveness guarantee. The implementation must include this explicit fallback path and bounded ack waiting."
+    },
+    {
+      "name": "cancel_path_distinguished_from_crash_in_engine",
+      "description": "The engine's termination-signal handling distinguishes user-driven cancel intent from unsolicited termination (crash). When intent has been committed, the engine dispatches to the cancellation code path (Cancelled state, on_cancellation hooks); otherwise it falls through to the existing crash code path. Reschedule-mode raw-SIGTERM behaviour (PREFECT_FLOW_RUN_EXECUTE_SIGTERM_BEHAVIOR=reschedule) is preserved. The implementation must NOT remove the existing crash detection or unconditionally rewrite SIGTERM as cancel."
+    },
+    {
+      "name": "bootstrap_env_sanitized_for_nested_subprocesses",
+      "description": "Whatever startup-time state the implementation injects into the child environment (port + token env vars, file path, file descriptor, shared state path, etc.) is consumed by the immediate child runtime and is NOT leaked into deeper nested subprocesses the child itself spawns. Subprocess-spawning paths (the bundle execute launch, the direct subprocess starter, the engine command starter, the process worker exec path) explicitly sanitise the new cross-process state out of the env passed to grandchildren. Without this, a nested subprocess would attempt to participate in its grandparent's intent channel and corrupt the protocol."
+    }
+  ]
+}

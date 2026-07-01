@@ -1,0 +1,2903 @@
+diff --git a/posthog/api/llm_prompt.py b/posthog/api/llm_prompt.py
+index 6321c5c5b95..3a69b80bf06 100644
+--- a/posthog/api/llm_prompt.py
++++ b/posthog/api/llm_prompt.py
+@@ -1,36 +1,72 @@
+-import re
+ from typing import Any, cast
+ 
+ from django.conf import settings
++from django.db import IntegrityError
++from django.db.models import Q, QuerySet, TextField
++from django.db.models.functions import Cast
+ 
+ import posthoganalytics
+-from rest_framework import serializers, status, viewsets
++from drf_spectacular.utils import extend_schema
++from rest_framework import mixins, serializers, status, viewsets
+ from rest_framework.decorators import action
+ from rest_framework.permissions import BasePermission
+ from rest_framework.request import Request
+ from rest_framework.response import Response
++from rest_framework.serializers import BaseSerializer
+ 
+ from posthog.api.capture import capture_internal
+-from posthog.api.forbid_destroy_model import ForbidDestroyModel
++from posthog.api.llm_prompt_serializers import (
++    LLMPromptFetchQuerySerializer,
++    LLMPromptPublicSerializer,
++    LLMPromptPublishSerializer,
++    LLMPromptResolveQuerySerializer,
++    LLMPromptResolveResponseSerializer,
++    LLMPromptSerializer,
++    LLMPromptVersionSummarySerializer,
++)
+ from posthog.api.monitoring import monitor
+ from posthog.api.routing import TeamAndOrgViewSetMixin
+-from posthog.api.shared import UserBasicSerializer
++from posthog.api.services.llm_prompt import (
++    LLMPromptNotFoundError,
++    LLMPromptVersionConflictError,
++    LLMPromptVersionLimitError,
++    archive_prompt,
++    get_active_prompt_queryset,
++    get_latest_prompts_queryset,
++    get_prompt_by_name_from_db,
++    publish_prompt_version,
++    resolve_versions_page,
++)
+ from posthog.auth import JwtAuthentication, SessionAuthentication
+ from posthog.event_usage import report_team_action, report_user_action
+ from posthog.exceptions_capture import capture_exception
+-from posthog.models import User
+-from posthog.models.llm_prompt import LLMPrompt
++from posthog.models import LLMPrompt, User
+ from posthog.permissions import AccessControlPermission, get_organization_from_view
+-from posthog.rate_limit import BurstRateThrottle, SustainedRateThrottle
++from posthog.rate_limit import BurstRateThrottle, LLMPromptPublishBurstRateThrottle, SustainedRateThrottle
+ from posthog.rbac.access_control_api_mixin import AccessControlViewSetMixin
+ from posthog.storage.llm_prompt_cache import get_prompt_by_name_from_cache
+ 
+ from products.llm_analytics.backend.api.metrics import llma_track_latency
+ 
+-RESERVED_PROMPT_NAMES = {"new"}
+ PROMPT_FETCHED_EVENT = "$llm_prompt_fetched"
+ PROMPT_FETCHED_EVENT_SOURCE = "llm_prompt_management"
+ LLM_PROMPT_FEATURE_FLAGS = ("prompt-management", "llm-analytics-early-adopters")
++ALLOWED_LIST_ORDERINGS = {
++    "name": "name",
++    "-name": "-name",
++    "created_at": "created_at",
++    "-created_at": "-created_at",
++    "updated_at": "updated_at",
++    "-updated_at": "-updated_at",
++    "version": "version",
++    "-version": "-version",
++    "latest_version": "latest_version",
++    "-latest_version": "-latest_version",
++    "version_count": "version_count",
++    "-version_count": "-version_count",
++    "first_version_created_at": "first_version_created_at",
++    "-first_version_created_at": "-first_version_created_at",
++}
+ 
+ 
+ class LLMPromptFeatureFlagPermission(BasePermission):
+@@ -53,177 +89,71 @@ class LLMPromptFeatureFlagPermission(BasePermission):
+         )
+ 
+ 
+-class LLMPromptSerializer(serializers.ModelSerializer):
+-    created_by = UserBasicSerializer(read_only=True)
+-
+-    class Meta:
+-        model = LLMPrompt
+-        fields = [
+-            "id",
+-            "name",
+-            "prompt",
+-            "version",
+-            "created_by",
+-            "created_at",
+-            "updated_at",
+-            "deleted",
+-        ]
+-        read_only_fields = [
+-            "id",
+-            "version",
+-            "created_by",
+-            "created_at",
+-            "updated_at",
+-        ]
+-
+-    def validate_name(self, value: str) -> str:
+-        if value.lower() in RESERVED_PROMPT_NAMES:
+-            raise serializers.ValidationError(
+-                "'new' is a reserved name and cannot be used.",
+-                code="reserved_name",
+-            )
+-
+-        if not re.match(r"^[a-zA-Z0-9_-]+$", value):
+-            raise serializers.ValidationError(
+-                "Only letters, numbers, hyphens (-) and underscores (_) are allowed.",
+-                code="invalid_name",
+-            )
+-
+-        return value
+-
+-    def validate(self, data):
+-        team = self.context["get_team"]()
+-        name = data.get("name")
+-
+-        # On CREATE: check if name already exists
+-        if self.instance is None:
+-            if LLMPrompt.objects.filter(name=name, team=team, deleted=False).exists():
+-                raise serializers.ValidationError({"name": "A prompt with this name already exists."}, code="unique")
+-
+-        # On UPDATE: reject name changes (name is immutable after creation)
+-        else:
+-            if name is not None and self.instance.name != name:
+-                raise serializers.ValidationError(
+-                    {"name": "Prompt name cannot be changed after creation."},
+-                    code="immutable",
+-                )
+-
+-            # Check for name conflicts when restoring a deleted prompt
+-            is_being_restored = self.instance.deleted and data.get("deleted") is False
+-
+-            if is_being_restored:
+-                if (
+-                    LLMPrompt.objects.filter(name=self.instance.name, team=team, deleted=False)
+-                    .exclude(id=self.instance.id)
+-                    .exists()
+-                ):
+-                    raise serializers.ValidationError(
+-                        {"name": "A prompt with this name already exists."}, code="unique"
+-                    )
+-
+-        return data
+-
+-    def create(self, validated_data):
+-        request = self.context["request"]
+-        team = self.context["get_team"]()
+-
+-        return LLMPrompt.objects.create(
+-            team=team,
+-            created_by=request.user,
+-            **validated_data,
+-        )
+-
+-
+-class LLMPromptViewSet(TeamAndOrgViewSetMixin, AccessControlViewSetMixin, ForbidDestroyModel, viewsets.ModelViewSet):
++class LLMPromptViewSet(
++    TeamAndOrgViewSetMixin,
++    AccessControlViewSetMixin,
++    mixins.CreateModelMixin,
++    mixins.ListModelMixin,
++    viewsets.GenericViewSet,
++):
+     scope_object = "llm_prompt"
+     queryset = LLMPrompt.objects.all()
+     serializer_class = LLMPromptSerializer
+     permission_classes = [LLMPromptFeatureFlagPermission, AccessControlPermission]
+ 
+-    def safely_get_queryset(self, queryset):
+-        return queryset.filter(deleted=False)
++    def safely_get_queryset(self, queryset: QuerySet[LLMPrompt]) -> QuerySet[LLMPrompt]:
++        return get_active_prompt_queryset(self.team)
+ 
+     def get_throttles(self):
++        if self.action == "update_by_name":
++            return [LLMPromptPublishBurstRateThrottle(), BurstRateThrottle(), SustainedRateThrottle()]
+         if self.action in ["get_by_name", "resolve_by_name"]:
+             return [BurstRateThrottle(), SustainedRateThrottle()]
+ 
+         return super().get_throttles()
+ 
+-    def _get_prompt_by_name_from_cache(self, prompt_name: str) -> dict[str, Any] | None:
+-        return get_prompt_by_name_from_cache(self.team, prompt_name)
++    def dangerously_get_required_scopes(self, request: Request, view) -> list[str] | None:
++        super_method = getattr(super(), "dangerously_get_required_scopes", None)
++        if callable(super_method):
++            mixin_result = super_method(request, view)
++            if mixin_result is not None:
++                return mixin_result
+ 
+-    def _get_prompt_by_name_from_db(self, prompt_name: str) -> LLMPrompt | None:
+-        try:
+-            return LLMPrompt.objects.get(
+-                team=self.team,
+-                name=prompt_name,
+-                deleted=False,
+-            )
+-        except LLMPrompt.DoesNotExist:
+-            return None
++        if view.action in ["get_by_name", "update_by_name"]:
++            return ["llm_prompt:write"] if request.method == "PATCH" else ["llm_prompt:read"]
++        return None
+ 
+-    def perform_create(self, serializer):
+-        instance = serializer.save()
++    def _ensure_web_authenticated(self, request: Request) -> Response | None:
++        if not isinstance(request.successful_authenticator, SessionAuthentication | JwtAuthentication):
++            return Response(
++                {"detail": "This endpoint is only available to web-authenticated users."},
++                status=status.HTTP_403_FORBIDDEN,
++            )
++        return None
+ 
+-        report_user_action(
+-            cast(User, self.request.user),
+-            "llma prompt created",
+-            {
+-                "prompt_id": str(instance.id),
+-                "prompt_name": instance.name,
+-            },
+-            team=self.team,
+-            request=self.request,
++    def _prompt_not_found_response(self, prompt_name: str) -> Response:
++        return Response(
++            {"detail": f"Prompt with name '{prompt_name}' not found."},
++            status=status.HTTP_404_NOT_FOUND,
+         )
+ 
+-    def perform_update(self, serializer):
+-        is_being_deleted = serializer.validated_data.get("deleted") is True and not self.get_object().deleted
++    def _serialize_prompt(self, prompt: LLMPrompt) -> dict[str, Any]:
++        return cast(dict[str, Any], self.get_serializer(prompt).data)
+ 
+-        instance = serializer.save()
++    def _serialize_version_summaries(self, prompts: list[LLMPrompt]) -> list[dict[str, Any]]:
++        return cast(list[dict[str, Any]], LLMPromptVersionSummarySerializer(prompts, many=True).data)
+ 
+-        if is_being_deleted:
+-            report_user_action(
+-                cast(User, self.request.user),
+-                "llma prompt deleted",
+-                {
+-                    "prompt_id": str(instance.id),
+-                    "prompt_name": instance.name,
+-                },
+-                team=self.team,
+-                request=self.request,
+-            )
+-        else:
+-            changed_fields = [field for field in serializer.validated_data.keys() if field != "deleted"]
+-
+-            if changed_fields:
+-                report_user_action(
+-                    cast(User, self.request.user),
+-                    "llma prompt updated",
+-                    {
+-                        "prompt_id": str(instance.id),
+-                        "prompt_name": instance.name,
+-                        "changed_fields": changed_fields,
+-                    },
+-                    team=self.team,
+-                    request=self.request,
+-                )
++    def _get_requested_version_params(self, request: Request) -> dict[str, Any]:
++        serializer = LLMPromptFetchQuerySerializer(data=request.query_params)
++        serializer.is_valid(raise_exception=True)
++        return serializer.validated_data
+ 
+-    @action(
+-        methods=["GET"],
+-        detail=False,
+-        url_path=r"name/(?P<prompt_name>[^/]+)",
+-        required_scopes=["llm_prompt:read"],
+-    )
+-    @llma_track_latency("llma_prompts_get_by_name")
+-    @monitor(feature=None, endpoint="llma_prompts_get_by_name", method="GET")
+-    def get_by_name(self, request: Request, prompt_name: str = "", **kwargs) -> Response:
+-        prompt = self._get_prompt_by_name_from_cache(prompt_name)
+-        if prompt is None:
+-            return Response(
+-                {"detail": f"Prompt with name '{prompt_name}' not found."},
+-                status=status.HTTP_404_NOT_FOUND,
+-            )
++    def _get_resolve_query_params(self, request: Request) -> dict[str, Any]:
++        serializer = LLMPromptResolveQuerySerializer(data=request.query_params)
++        serializer.is_valid(raise_exception=True)
++        return serializer.validated_data
+ 
++    def _track_prompt_fetch(self, prompt: dict[str, Any]) -> None:
+         if not settings.TEST:
+             try:
+                 capture_internal(
+@@ -235,6 +165,9 @@ class LLMPromptViewSet(TeamAndOrgViewSetMixin, AccessControlViewSetMixin, Forbid
+                     properties={
+                         "prompt_id": prompt["id"],
+                         "prompt_name": prompt["name"],
++                        "prompt_version": prompt["version"],
++                        "prompt_is_latest": prompt["is_latest"],
++                        "prompt_first_version_created_at": prompt["first_version_created_at"],
+                     },
+                 )
+             except Exception as err:
+@@ -246,11 +179,113 @@ class LLMPromptViewSet(TeamAndOrgViewSetMixin, AccessControlViewSetMixin, Forbid
+             {
+                 "prompt_id": prompt["id"],
+                 "prompt_name": prompt["name"],
++                "prompt_version": prompt["version"],
++                "prompt_is_latest": prompt["is_latest"],
++                "prompt_first_version_created_at": prompt["first_version_created_at"],
++            },
++        )
++
++    def _get_list_queryset(self, request: Request) -> QuerySet[LLMPrompt]:
++        queryset = get_latest_prompts_queryset(self.team)
++
++        search = request.query_params.get("search", "").strip()
++        if search:
++            queryset = queryset.annotate(prompt_text=Cast("prompt", output_field=TextField())).filter(
++                Q(name__icontains=search) | Q(prompt_text__icontains=search)
++            )
++
++        order_by = request.query_params.get("order_by", "-created_at")
++        queryset = queryset.order_by(ALLOWED_LIST_ORDERINGS.get(order_by, "-created_at"), "-id")
++        return queryset
++
++    def perform_create(self, serializer: BaseSerializer[Any]) -> None:
++        instance = cast(LLMPrompt, serializer.save())
++
++        report_user_action(
++            cast(User, self.request.user),
++            "llma prompt created",
++            {
++                "prompt_id": str(instance.id),
++                "prompt_name": instance.name,
++                "prompt_version": instance.version,
+             },
++            team=self.team,
++            request=self.request,
+         )
+ 
++    @extend_schema(
++        parameters=[LLMPromptFetchQuerySerializer],
++        responses={200: LLMPromptPublicSerializer},
++    )
++    @action(methods=["GET"], detail=False, url_path=r"name/(?P<prompt_name>[^/]+)")
++    @llma_track_latency("llma_prompts_get_by_name")
++    @monitor(feature=None, endpoint="llma_prompts_get_by_name", method="GET")
++    def get_by_name(self, request: Request, prompt_name: str = "", **kwargs) -> Response:
++        version_params = self._get_requested_version_params(request)
++        version = cast(int | None, version_params.get("version"))
++        prompt = get_prompt_by_name_from_cache(self.team, prompt_name, version)
++        if prompt is None:
++            return self._prompt_not_found_response(prompt_name)
++
++        self._track_prompt_fetch(prompt)
+         return Response(prompt)
+ 
++    @extend_schema(request=LLMPromptPublishSerializer, responses={200: LLMPromptSerializer})
++    @get_by_name.mapping.patch
++    @llma_track_latency("llma_prompts_publish_by_name")
++    @monitor(feature=None, endpoint="llma_prompts_publish_by_name", method="PATCH")
++    def update_by_name(self, request: Request, prompt_name: str = "", **kwargs) -> Response:
++        auth_error = self._ensure_web_authenticated(request)
++        if auth_error is not None:
++            return auth_error
++
++        payload = LLMPromptPublishSerializer(data=request.data)
++        payload.is_valid(raise_exception=True)
++
++        try:
++            published_prompt = publish_prompt_version(
++                self.team,
++                user=cast(User, request.user),
++                prompt_name=prompt_name,
++                prompt_payload=payload.validated_data["prompt"],
++                base_version=payload.validated_data["base_version"],
++            )
++        except LLMPromptNotFoundError:
++            return self._prompt_not_found_response(prompt_name)
++        except LLMPromptVersionConflictError as err:
++            return Response(
++                {
++                    "detail": "The prompt changed since you opened it. Reload the latest version and try again.",
++                    "current_version": err.current_version,
++                },
++                status=status.HTTP_409_CONFLICT,
++            )
++        except LLMPromptVersionLimitError as err:
++            return Response(
++                {
++                    "detail": (
++                        f"Prompt has reached the maximum of {err.max_version} versions. "
++                        "Archive and recreate the prompt to continue publishing."
++                    ),
++                },
++                status=status.HTTP_400_BAD_REQUEST,
++            )
++
++        report_user_action(
++            cast(User, request.user),
++            "llma prompt version published",
++            {
++                "prompt_id": str(published_prompt.id),
++                "prompt_name": published_prompt.name,
++                "prompt_version": published_prompt.version,
++                "base_version": payload.validated_data["base_version"],
++            },
++            team=self.team,
++            request=request,
++        )
++        return Response(self._serialize_prompt(published_prompt))
++
++    @extend_schema(parameters=[LLMPromptResolveQuerySerializer], responses={200: LLMPromptResolveResponseSerializer})
+     @action(
+         methods=["GET"],
+         detail=False,
+@@ -260,43 +295,92 @@ class LLMPromptViewSet(TeamAndOrgViewSetMixin, AccessControlViewSetMixin, Forbid
+     @llma_track_latency("llma_prompts_resolve_by_name")
+     @monitor(feature=None, endpoint="llma_prompts_resolve_by_name", method="GET")
+     def resolve_by_name(self, request: Request, prompt_name: str = "", **kwargs) -> Response:
+-        if not isinstance(request.successful_authenticator, SessionAuthentication | JwtAuthentication):
+-            return Response(
+-                {"detail": "This endpoint is only available to web-authenticated users."},
+-                status=status.HTTP_403_FORBIDDEN,
+-            )
+-
+-        prompt = self._get_prompt_by_name_from_db(prompt_name)
++        auth_error = self._ensure_web_authenticated(request)
++        if auth_error is not None:
++            return auth_error
++
++        query_params = self._get_resolve_query_params(request)
++        version = cast(int | None, query_params.get("version"))
++        version_id = query_params.get("version_id")
++        prompt = get_prompt_by_name_from_db(
++            self.team,
++            prompt_name=prompt_name,
++            version=version,
++            version_id=str(version_id) if version_id else None,
++        )
+         if prompt is None:
+-            return Response(
+-                {"detail": f"Prompt with name '{prompt_name}' not found."},
+-                status=status.HTTP_404_NOT_FOUND,
+-            )
++            return self._prompt_not_found_response(prompt_name)
+ 
+-        serializer = self.get_serializer(prompt)
+-        return Response(serializer.data)
++        limit = cast(int, query_params["limit"])
++        offset = cast(int | None, query_params.get("offset"))
++        before_version = cast(int | None, query_params.get("before_version"))
++        versions, has_more = resolve_versions_page(
++            self.team,
++            prompt_name=prompt_name,
++            limit=limit,
++            offset=offset,
++            before_version=before_version,
++        )
++        return Response(
++            {
++                "prompt": self._serialize_prompt(prompt),
++                "versions": self._serialize_version_summaries(versions),
++                "has_more": has_more,
++            }
++        )
++
++    @action(
++        methods=["POST"],
++        detail=False,
++        url_path=r"name/(?P<prompt_name>[^/]+)/archive",
++        required_scopes=["llm_prompt:write"],
++    )
++    @llma_track_latency("llma_prompts_archive")
++    @monitor(feature=None, endpoint="llma_prompts_archive", method="POST")
++    def archive(self, request: Request, prompt_name: str = "", **kwargs) -> Response:
++        auth_error = self._ensure_web_authenticated(request)
++        if auth_error is not None:
++            return auth_error
++
++        try:
++            prompt_versions = archive_prompt(self.team, prompt_name)
++        except LLMPromptNotFoundError:
++            return self._prompt_not_found_response(prompt_name)
++
++        report_user_action(
++            cast(User, request.user),
++            "llma prompt archived",
++            {
++                "prompt_name": prompt_name,
++                "prompt_versions": prompt_versions,
++            },
++            team=self.team,
++            request=request,
++        )
++        return Response(status=status.HTTP_204_NO_CONTENT)
+ 
+     @llma_track_latency("llma_prompts_list")
+     @monitor(feature=None, endpoint="llma_prompts_list", method="GET")
+-    def list(self, request, *args, **kwargs):
+-        return super().list(request, *args, **kwargs)
++    def list(self, request: Request, *args, **kwargs) -> Response:
++        queryset = self.filter_queryset(self._get_list_queryset(request))
++        page = self.paginate_queryset(queryset)
++        if page is not None:
++            serializer = self.get_serializer(page, many=True)
++            return self.get_paginated_response(serializer.data)
+ 
+-    @llma_track_latency("llma_prompts_retrieve")
+-    @monitor(feature=None, endpoint="llma_prompts_retrieve", method="GET")
+-    def retrieve(self, request, *args, **kwargs):
+-        return super().retrieve(request, *args, **kwargs)
++        serializer = self.get_serializer(queryset, many=True)
++        data = serializer.data
++        return Response({"count": len(data), "results": data})
+ 
+     @llma_track_latency("llma_prompts_create")
+     @monitor(feature=None, endpoint="llma_prompts_create", method="POST")
+     def create(self, request, *args, **kwargs):
+-        return super().create(request, *args, **kwargs)
+-
+-    @llma_track_latency("llma_prompts_update")
+-    @monitor(feature=None, endpoint="llma_prompts_update", method="PUT")
+-    def update(self, request, *args, **kwargs):
+-        return super().update(request, *args, **kwargs)
+-
+-    @llma_track_latency("llma_prompts_partial_update")
+-    @monitor(feature=None, endpoint="llma_prompts_partial_update", method="PATCH")
+-    def partial_update(self, request, *args, **kwargs):
+-        return super().partial_update(request, *args, **kwargs)
++        try:
++            return super().create(request, *args, **kwargs)
++        except IntegrityError as err:
++            if any(
++                constraint_name in str(err)
++                for constraint_name in ["unique_llm_prompt_latest_per_team", "unique_llm_prompt_version_per_team"]
++            ):
++                raise serializers.ValidationError({"name": "A prompt with this name already exists."}, code="unique")
++            raise
+diff --git a/posthog/api/llm_prompt_serializers.py b/posthog/api/llm_prompt_serializers.py
+new file mode 100644
+index 00000000000..1aaa45a0658
+--- /dev/null
++++ b/posthog/api/llm_prompt_serializers.py
+@@ -0,0 +1,187 @@
++import re
++import json
++from typing import Any
++
++from rest_framework import serializers
++
++from posthog.api.shared import UserBasicSerializer
++from posthog.models.llm_prompt import LLMPrompt
++
++RESERVED_PROMPT_NAMES = {"new"}
++DEFAULT_VERSION_PAGE_SIZE = 50
++MAX_PROMPT_PAYLOAD_BYTES = 1_000_000
++
++
++def validate_prompt_payload_size(prompt_payload: Any) -> Any:
++    prompt_payload_bytes = len(json.dumps(prompt_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
++    if prompt_payload_bytes > MAX_PROMPT_PAYLOAD_BYTES:
++        raise serializers.ValidationError(
++            f"Prompt payload must be {MAX_PROMPT_PAYLOAD_BYTES} bytes or fewer.",
++            code="max_size",
++        )
++    return prompt_payload
++
++
++class LLMPromptFetchQuerySerializer(serializers.Serializer):
++    version = serializers.IntegerField(min_value=1, required=False)
++
++
++class LLMPromptResolveQuerySerializer(LLMPromptFetchQuerySerializer):
++    version_id = serializers.UUIDField(required=False)
++    offset = serializers.IntegerField(min_value=0, required=False)
++    before_version = serializers.IntegerField(min_value=1, required=False)
++    limit = serializers.IntegerField(min_value=1, required=False, default=DEFAULT_VERSION_PAGE_SIZE, max_value=100)
++
++    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
++        if attrs.get("offset") is not None and attrs.get("before_version") is not None:
++            raise serializers.ValidationError("Use either offset or before_version, not both.")
++        return attrs
++
++
++class LLMPromptPublishSerializer(serializers.Serializer):
++    prompt = serializers.JSONField()
++    base_version = serializers.IntegerField(min_value=1)
++
++    def validate_prompt(self, value: Any) -> Any:
++        return validate_prompt_payload_size(value)
++
++
++class LLMPromptSerializer(serializers.ModelSerializer):
++    created_by = UserBasicSerializer(read_only=True)
++    is_latest = serializers.SerializerMethodField()
++    latest_version = serializers.SerializerMethodField()
++    version_count = serializers.SerializerMethodField()
++    first_version_created_at = serializers.SerializerMethodField()
++
++    class Meta:
++        model = LLMPrompt
++        fields = [
++            "id",
++            "name",
++            "prompt",
++            "version",
++            "created_by",
++            "created_at",
++            "updated_at",
++            "deleted",
++            "is_latest",
++            "latest_version",
++            "version_count",
++            "first_version_created_at",
++        ]
++        read_only_fields = [
++            "id",
++            "version",
++            "created_by",
++            "created_at",
++            "updated_at",
++            "deleted",
++            "is_latest",
++            "latest_version",
++            "version_count",
++            "first_version_created_at",
++        ]
++
++    def get_is_latest(self, instance: LLMPrompt) -> bool:
++        return bool(getattr(instance, "is_latest", False))
++
++    def get_latest_version(self, instance: LLMPrompt) -> int:
++        return int(getattr(instance, "latest_version", instance.version))
++
++    def get_version_count(self, instance: LLMPrompt) -> int:
++        return int(getattr(instance, "version_count", 1))
++
++    def get_first_version_created_at(self, instance: LLMPrompt) -> str:
++        value = getattr(instance, "first_version_created_at", instance.created_at)
++        if value is None:
++            value = instance.created_at
++        if isinstance(value, str):
++            return value
++        return value.isoformat().replace("+00:00", "Z")
++
++    def validate_name(self, value: str) -> str:
++        if value.lower() in RESERVED_PROMPT_NAMES:
++            raise serializers.ValidationError(
++                "'new' is a reserved name and cannot be used.",
++                code="reserved_name",
++            )
++
++        if not re.match(r"^[a-zA-Z0-9_-]+$", value):
++            raise serializers.ValidationError(
++                "Only letters, numbers, hyphens (-) and underscores (_) are allowed.",
++                code="invalid_name",
++            )
++
++        return value
++
++    def validate_prompt(self, value: Any) -> Any:
++        return validate_prompt_payload_size(value)
++
++    def validate(self, data: dict[str, Any]) -> dict[str, Any]:
++        team = self.context["get_team"]()
++        name = data.get("name")
++
++        if self.instance is None:
++            if name and LLMPrompt.objects.filter(name=name, team=team, deleted=False).exists():
++                raise serializers.ValidationError({"name": "A prompt with this name already exists."}, code="unique")
++            return data
++
++        if name is not None and self.instance.name != name:
++            raise serializers.ValidationError(
++                {"name": "Prompt name cannot be changed after creation."},
++                code="immutable",
++            )
++
++        if "prompt" in data:
++            raise serializers.ValidationError(
++                {"prompt": "Prompt content is versioned and cannot be updated in place. Create a new version instead."},
++                code="immutable",
++            )
++
++        return data
++
++    def create(self, validated_data: dict[str, Any]) -> LLMPrompt:
++        request = self.context["request"]
++        team = self.context["get_team"]()
++
++        return LLMPrompt.objects.create(
++            team=team,
++            created_by=request.user,
++            is_latest=True,
++            **validated_data,
++        )
++
++
++class LLMPromptVersionSummarySerializer(serializers.ModelSerializer):
++    created_by = UserBasicSerializer(read_only=True)
++
++    class Meta:
++        model = LLMPrompt
++        fields = [
++            "id",
++            "version",
++            "created_by",
++            "created_at",
++            "is_latest",
++        ]
++        read_only_fields = fields
++
++
++class LLMPromptPublicSerializer(serializers.Serializer):
++    id = serializers.UUIDField()
++    name = serializers.CharField()
++    prompt = serializers.JSONField()
++    version = serializers.IntegerField()
++    created_at = serializers.DateTimeField()
++    updated_at = serializers.DateTimeField()
++    deleted = serializers.BooleanField()
++    is_latest = serializers.BooleanField()
++    latest_version = serializers.IntegerField()
++    version_count = serializers.IntegerField()
++    first_version_created_at = serializers.DateTimeField()
++
++
++class LLMPromptResolveResponseSerializer(serializers.Serializer):
++    prompt = LLMPromptSerializer()
++    versions = LLMPromptVersionSummarySerializer(many=True)
++    has_more = serializers.BooleanField()
+diff --git a/posthog/api/services/llm_prompt.py b/posthog/api/services/llm_prompt.py
+new file mode 100644
+index 00000000000..f78954afd8c
+--- /dev/null
++++ b/posthog/api/services/llm_prompt.py
+@@ -0,0 +1,179 @@
++from dataclasses import dataclass
++from typing import Any
++
++from django.conf import settings
++from django.db import transaction
++from django.db.models import QuerySet
++
++from posthog.exceptions_capture import capture_exception
++from posthog.models import Team, User
++from posthog.models.llm_prompt import LLMPrompt, annotate_llm_prompt_version_history_metadata
++from posthog.storage.llm_prompt_cache import invalidate_prompt_latest_cache, invalidate_prompt_version_caches
++
++SYNC_ARCHIVE_VERSION_INVALIDATION_LIMIT = 100
++MAX_PROMPT_VERSION = 2000
++
++
++class LLMPromptNotFoundError(Exception):
++    pass
++
++
++@dataclass
++class LLMPromptVersionConflictError(Exception):
++    current_version: int
++
++
++@dataclass
++class LLMPromptVersionLimitError(Exception):
++    max_version: int
++
++
++def get_active_prompt_queryset(team: Team) -> QuerySet[LLMPrompt]:
++    return annotate_llm_prompt_version_history_metadata(
++        LLMPrompt.objects.filter(team=team, deleted=False).select_related("created_by")
++    )
++
++
++def get_latest_prompts_queryset(team: Team) -> QuerySet[LLMPrompt]:
++    return get_active_prompt_queryset(team).filter(is_latest=True)
++
++
++def get_prompt_by_name_from_db(
++    team: Team,
++    prompt_name: str,
++    version: int | None = None,
++    version_id: str | None = None,
++) -> LLMPrompt | None:
++    queryset = get_active_prompt_queryset(team).filter(name=prompt_name)
++
++    if version_id is not None:
++        queryset = queryset.filter(id=version_id)
++        if version is not None:
++            queryset = queryset.filter(version=version)
++        return queryset.order_by("created_at", "id").first()
++
++    if version is None:
++        return queryset.filter(is_latest=True).order_by("-version", "-created_at", "-id").first()
++
++    return queryset.filter(version=version).order_by("created_at", "id").first()
++
++
++def resolve_versions_page(
++    team: Team,
++    prompt_name: str,
++    *,
++    limit: int,
++    offset: int | None = None,
++    before_version: int | None = None,
++) -> tuple[list[LLMPrompt], bool]:
++    queryset = (
++        LLMPrompt.objects.filter(team=team, name=prompt_name, deleted=False)
++        .select_related("created_by")
++        .order_by("-version", "-created_at", "-id")
++    )
++
++    if before_version is not None:
++        queryset = queryset.filter(version__lt=before_version)
++    elif offset is not None:
++        versions = list(queryset[offset : offset + limit + 1])
++        has_more = len(versions) > limit
++        return versions[:limit], has_more
++
++    versions = list(queryset[: limit + 1])
++    has_more = len(versions) > limit
++    return versions[:limit], has_more
++
++
++def publish_prompt_version(
++    team: Team,
++    *,
++    user: User,
++    prompt_name: str,
++    prompt_payload: Any,
++    base_version: int,
++) -> LLMPrompt:
++    with transaction.atomic():
++        current_latest = (
++            LLMPrompt.objects.select_for_update()
++            .filter(team=team, name=prompt_name, deleted=False, is_latest=True)
++            .order_by("-version", "-created_at", "-id")
++            .first()
++        )
++        if current_latest is None:
++            raise LLMPromptNotFoundError()
++
++        if base_version != current_latest.version:
++            raise LLMPromptVersionConflictError(current_version=current_latest.version)
++        if current_latest.version >= MAX_PROMPT_VERSION:
++            raise LLMPromptVersionLimitError(max_version=MAX_PROMPT_VERSION)
++
++        LLMPrompt.objects.filter(pk=current_latest.pk).update(is_latest=False)
++        published_prompt = LLMPrompt.objects.create(
++            team=team,
++            name=current_latest.name,
++            prompt=prompt_payload,
++            version=current_latest.version + 1,
++            is_latest=True,
++            created_by=user,
++        )
++
++        refreshed_prompt = (
++            get_active_prompt_queryset(team).filter(pk=published_prompt.pk).order_by("-created_at", "-id").first()
++        )
++        if refreshed_prompt is not None:
++            return refreshed_prompt
++
++        fallback_prompt = (
++            annotate_llm_prompt_version_history_metadata(
++                LLMPrompt.objects.filter(team=team, deleted=False).select_related("created_by")
++            )
++            .filter(pk=published_prompt.pk)
++            .order_by("-created_at", "-id")
++            .first()
++        )
++        return fallback_prompt if fallback_prompt is not None else published_prompt
++
++
++def archive_prompt(team: Team, prompt_name: str) -> list[int]:
++    with transaction.atomic():
++        prompt_versions = list(
++            LLMPrompt.objects.select_for_update()
++            .filter(team=team, name=prompt_name, deleted=False)
++            .order_by("version", "created_at", "id")
++            .values_list("version", flat=True)
++        )
++        if not prompt_versions:
++            raise LLMPromptNotFoundError()
++        LLMPrompt.objects.filter(team=team, name=prompt_name, deleted=False).update(
++            deleted=True,
++            is_latest=False,
++        )
++
++        def invalidate_caches_on_commit() -> None:
++            invalidate_prompt_latest_cache(team.id, prompt_name)
++
++            sync_versions = (
++                prompt_versions if settings.TEST else prompt_versions[:SYNC_ARCHIVE_VERSION_INVALIDATION_LIMIT]
++            )
++            invalidate_prompt_version_caches(team.id, prompt_name, sync_versions)
++
++            remaining_versions = prompt_versions[len(sync_versions) :]
++            if not remaining_versions:
++                return
++
++            try:
++                from posthog.tasks.llm_prompt_cache import invalidate_archived_prompt_versions_cache_task
++
++                invalidate_archived_prompt_versions_cache_task.delay(
++                    team.id,
++                    prompt_name,
++                    remaining_versions[0],
++                    remaining_versions[-1],
++                )
++            except Exception as err:
++                capture_exception(err)
++                invalidate_prompt_version_caches(team.id, prompt_name, remaining_versions)
++
++        transaction.on_commit(invalidate_caches_on_commit)
++
++    return prompt_versions
+diff --git a/posthog/api/test/test_llm_prompt.py b/posthog/api/test/test_llm_prompt.py
+index e5fcef55ec7..087c6087918 100644
+--- a/posthog/api/test/test_llm_prompt.py
++++ b/posthog/api/test/test_llm_prompt.py
+@@ -5,8 +5,13 @@ from django.test import override_settings
+ 
+ from parameterized import parameterized
+ from rest_framework import status
++from rest_framework.test import APIRequestFactory
+ 
++from posthog.api.llm_prompt import LLMPromptViewSet
++from posthog.api.llm_prompt_serializers import MAX_PROMPT_PAYLOAD_BYTES
++from posthog.api.services.llm_prompt import MAX_PROMPT_VERSION
+ from posthog.models.llm_prompt import LLMPrompt
++from posthog.rate_limit import BurstRateThrottle, LLMPromptPublishBurstRateThrottle, SustainedRateThrottle
+ 
+ 
+ @patch("posthog.api.llm_prompt.posthoganalytics.feature_enabled", return_value=True)
+@@ -39,6 +44,25 @@ class TestLLMPromptAPI(APIBaseTest):
+ 
+         assert response.status_code == expected_status
+ 
++    def create_prompt_version(
++        self,
++        *,
++        name: str = "my-prompt",
++        prompt: str = "Prompt content",
++        version: int = 1,
++        is_latest: bool = True,
++        deleted: bool = False,
++    ) -> LLMPrompt:
++        return LLMPrompt.objects.create(
++            team=self.team,
++            name=name,
++            prompt=prompt,
++            version=version,
++            is_latest=is_latest,
++            deleted=deleted,
++            created_by=self.user,
++        )
++
+     def test_create_prompt_with_unique_name_succeeds(self, mock_feature_enabled):
+         response = self.client.post(
+             f"/api/environments/{self.team.id}/llm_prompts/",
+@@ -50,22 +74,17 @@ class TestLLMPromptAPI(APIBaseTest):
+         )
+ 
+         assert response.status_code == status.HTTP_201_CREATED
+-        assert LLMPrompt.objects.filter(team=self.team, name="my-prompt").exists()
++        assert response.json()["version"] == 1
++        assert response.json()["is_latest"] is True
++        assert response.json()["latest_version"] == 1
++        assert response.json()["version_count"] == 1
+ 
+-    def test_create_prompt_with_duplicate_name_fails(self, mock_feature_enabled):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="my-prompt",
+-            prompt="Original prompt",
+-            created_by=self.user,
+-        )
++    def test_create_prompt_with_duplicate_active_name_fails(self, mock_feature_enabled):
++        self.create_prompt_version(name="my-prompt")
+ 
+         response = self.client.post(
+             f"/api/environments/{self.team.id}/llm_prompts/",
+-            data={
+-                "name": "my-prompt",
+-                "prompt": "Duplicate prompt",
+-            },
++            data={"name": "my-prompt", "prompt": "Duplicate prompt"},
+             format="json",
+         )
+ 
+@@ -73,316 +92,435 @@ class TestLLMPromptAPI(APIBaseTest):
+         assert response.json()["attr"] == "name"
+         assert response.json()["detail"] == "A prompt with this name already exists."
+ 
+-    def test_update_prompt_name_rejected(self, mock_feature_enabled):
+-        prompt = LLMPrompt.objects.create(
+-            team=self.team,
+-            name="original-name",
+-            prompt="Content",
+-            created_by=self.user,
+-        )
++    def test_create_prompt_with_same_name_as_archived_versions_restarts_at_version_one(self, mock_feature_enabled):
++        self.create_prompt_version(name="archived-prompt", version=1, is_latest=False, deleted=True)
++        self.create_prompt_version(name="archived-prompt", version=2, is_latest=False, deleted=True)
+ 
+-        response = self.client.patch(
+-            f"/api/environments/{self.team.id}/llm_prompts/{prompt.id}/",
+-            data={"name": "new-name"},
++        response = self.client.post(
++            f"/api/environments/{self.team.id}/llm_prompts/",
++            data={"name": "archived-prompt", "prompt": "New active prompt"},
+             format="json",
+         )
+ 
+-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+-        assert response.json()["attr"] == "name"
+-        assert response.json()["detail"] == "Prompt name cannot be changed after creation."
+-
+-        prompt.refresh_from_db()
+-        assert prompt.name == "original-name"
++        assert response.status_code == status.HTTP_201_CREATED
++        assert response.json()["version"] == 1
++        assert response.json()["latest_version"] == 1
+ 
+-    def test_create_prompt_with_reserved_name_new_fails(self, mock_feature_enabled):
++    def test_create_prompt_ignores_deleted_field(self, mock_feature_enabled):
+         response = self.client.post(
+             f"/api/environments/{self.team.id}/llm_prompts/",
+-            data={
+-                "name": "new",
+-                "prompt": "Content",
+-            },
++            data={"name": "my-prompt", "prompt": "Prompt content", "deleted": True},
+             format="json",
+         )
+ 
+-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+-        assert response.json()["attr"] == "name"
+-        assert "'new' is a reserved name" in response.json()["detail"]
++        assert response.status_code == status.HTTP_201_CREATED
++        assert response.json()["deleted"] is False
++        created_prompt = LLMPrompt.objects.get(team=self.team, name="my-prompt", version=1, deleted=False)
++        assert created_prompt.deleted is False
++
++    def test_create_prompt_rejects_payload_above_max_size(self, mock_feature_enabled):
++        oversized_prompt = "x" * (MAX_PROMPT_PAYLOAD_BYTES + 1)
+ 
+-    def test_create_prompt_with_reserved_name_NEW_uppercase_fails(self, mock_feature_enabled):
+         response = self.client.post(
+             f"/api/environments/{self.team.id}/llm_prompts/",
+-            data={
+-                "name": "NEW",
+-                "prompt": "Content",
+-            },
++            data={"name": "oversized-prompt", "prompt": oversized_prompt},
+             format="json",
+         )
+ 
+         assert response.status_code == status.HTTP_400_BAD_REQUEST
+-        assert response.json()["attr"] == "name"
+-        assert "'new' is a reserved name" in response.json()["detail"]
++        assert response.json()["attr"] == "prompt"
++        assert "bytes or fewer" in response.json()["detail"]
+ 
+-    def test_create_prompt_with_same_name_as_deleted_prompt_succeeds(self, mock_feature_enabled):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="deleted-prompt",
+-            prompt="Original content",
+-            created_by=self.user,
+-            deleted=True,
++    def test_retrieve_prompt_by_id_is_not_routed(self, mock_feature_enabled):
++        prompt = self.create_prompt_version(name="original-name")
++
++        response = self.client.get(
++            f"/api/environments/{self.team.id}/llm_prompts/{prompt.id}/",
+         )
+ 
+-        response = self.client.post(
+-            f"/api/environments/{self.team.id}/llm_prompts/",
+-            data={
+-                "name": "deleted-prompt",
+-                "prompt": "New content",
+-            },
++        assert response.status_code == status.HTTP_404_NOT_FOUND
++
++    def test_update_prompt_by_id_is_not_routed(self, mock_feature_enabled):
++        prompt = self.create_prompt_version(name="my-prompt", prompt="Original content")
++
++        response = self.client.patch(
++            f"/api/environments/{self.team.id}/llm_prompts/{prompt.id}/",
++            data={"prompt": "Updated content", "base_version": 1},
+             format="json",
+         )
+ 
+-        assert response.status_code == status.HTTP_201_CREATED
+-        assert LLMPrompt.objects.filter(team=self.team, name="deleted-prompt", deleted=False).exists()
++        assert response.status_code == status.HTTP_404_NOT_FOUND
+ 
+-    def test_prompt_name_unique_per_team(self, mock_feature_enabled):
+-        from posthog.models import Team
++    def test_list_returns_only_latest_rows_for_active_version_histories(self, mock_feature_enabled):
++        self.create_prompt_version(name="prompt-a", version=1, is_latest=False, prompt="v1")
++        self.create_prompt_version(name="prompt-a", version=2, is_latest=True, prompt="v2")
++        self.create_prompt_version(name="prompt-b", version=1, is_latest=True, prompt="only")
+ 
+-        other_team = Team.objects.create(organization=self.organization, name="Other team")
++        response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/")
+ 
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="shared-name",
+-            prompt="Content for team 1",
+-            created_by=self.user,
+-        )
++        assert response.status_code == status.HTTP_200_OK
++        results = response.json()["results"]
++        assert {prompt["name"] for prompt in results} == {"prompt-a", "prompt-b"}
++        prompt_a = next(prompt for prompt in results if prompt["name"] == "prompt-a")
++        assert prompt_a["version"] == 2
++        assert prompt_a["latest_version"] == 2
++        assert prompt_a["version_count"] == 2
+ 
+-        response = self.client.post(
+-            f"/api/environments/{other_team.id}/llm_prompts/",
+-            data={
+-                "name": "shared-name",
+-                "prompt": "Content for team 2",
+-            },
+-            format="json",
+-        )
++    def test_fetch_prompt_by_name_returns_latest_by_default(self, mock_feature_enabled):
++        first_version = self.create_prompt_version(name="test-prompt", version=1, is_latest=False, prompt="v1")
++        latest_version = self.create_prompt_version(name="test-prompt", version=2, is_latest=True, prompt="v2")
+ 
+-        assert response.status_code == status.HTTP_201_CREATED
++        response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/test-prompt/")
+ 
+-    def test_update_prompt_content_without_name_change_succeeds(self, mock_feature_enabled):
+-        prompt = LLMPrompt.objects.create(
+-            team=self.team,
+-            name="my-prompt",
+-            prompt="Original content",
+-            created_by=self.user,
++        assert response.status_code == status.HTTP_200_OK
++        assert response.json()["id"] == str(latest_version.id)
++        assert response.json()["prompt"] == "v2"
++        assert response.json()["version"] == 2
++        assert response.json()["latest_version"] == 2
++        assert response.json()["version_count"] == 2
++        assert response.json()["first_version_created_at"] == first_version.created_at.isoformat().replace(
++            "+00:00", "Z"
+         )
++        assert "created_by" not in response.json()
++
++    def test_fetch_prompt_by_name_with_explicit_version_returns_historical_version(self, mock_feature_enabled):
++        first_version = self.create_prompt_version(name="test-prompt", version=1, is_latest=False, prompt="v1")
++        self.create_prompt_version(name="test-prompt", version=2, is_latest=True, prompt="v2")
++
++        response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/test-prompt/?version=1")
++
++        assert response.status_code == status.HTTP_200_OK
++        assert response.json()["id"] == str(first_version.id)
++        assert response.json()["prompt"] == "v1"
++        assert response.json()["version"] == 1
++        assert response.json()["is_latest"] is False
++        assert response.json()["latest_version"] == 2
++        assert response.json()["version_count"] == 2
++
++    def test_fetch_prompt_by_name_uses_latest_cache_after_first_load(self, mock_feature_enabled):
++        self.create_prompt_version(name="cached-prompt", version=1, is_latest=True)
++        from posthog.storage.llm_prompt_cache import llm_prompts_hypercache
++
++        with patch.object(llm_prompts_hypercache, "load_fn", wraps=llm_prompts_hypercache.load_fn) as mock_load_fn:
++            first_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/cached-prompt/")
++            second_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/cached-prompt/")
++
++        assert first_response.status_code == status.HTTP_200_OK
++        assert second_response.status_code == status.HTTP_200_OK
++        assert mock_load_fn.call_count == 1
++
++    def test_fetch_prompt_by_name_uses_version_cache_for_historical_fetches(self, mock_feature_enabled):
++        self.create_prompt_version(name="cached-prompt", version=1, is_latest=False, prompt="v1")
++        self.create_prompt_version(name="cached-prompt", version=2, is_latest=True, prompt="v2")
++        from posthog.storage.llm_prompt_cache import llm_prompts_hypercache
++
++        latest_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/cached-prompt/")
++        assert latest_response.status_code == status.HTTP_200_OK
++
++        with patch.object(llm_prompts_hypercache, "load_fn", wraps=llm_prompts_hypercache.load_fn) as mock_load_fn:
++            first_response = self.client.get(
++                f"/api/environments/{self.team.id}/llm_prompts/name/cached-prompt/?version=1"
++            )
++            second_response = self.client.get(
++                f"/api/environments/{self.team.id}/llm_prompts/name/cached-prompt/?version=1"
++            )
++
++        assert first_response.status_code == status.HTTP_200_OK
++        assert second_response.status_code == status.HTTP_200_OK
++        assert mock_load_fn.call_count == 1
++
++    def test_update_prompt_by_name_creates_new_immutable_row(self, mock_feature_enabled):
++        original = self.create_prompt_version(name="publish-prompt", version=1, is_latest=True, prompt="v1")
+ 
+         response = self.client.patch(
+-            f"/api/environments/{self.team.id}/llm_prompts/{prompt.id}/",
+-            data={"prompt": "Updated content"},
++            f"/api/environments/{self.team.id}/llm_prompts/name/publish-prompt/",
++            data={"prompt": "v2", "base_version": 1},
+             format="json",
+         )
+ 
+         assert response.status_code == status.HTTP_200_OK
+-        prompt.refresh_from_db()
+-        assert prompt.prompt == "Updated content"
++        original.refresh_from_db()
++        assert original.prompt == "v1"
++        assert original.is_latest is False
++
++        latest = LLMPrompt.objects.get(team=self.team, name="publish-prompt", version=2, deleted=False)
++        assert latest.is_latest is True
++        assert latest.prompt == "v2"
++        assert response.json()["id"] == str(latest.id)
++        assert response.json()["latest_version"] == 2
++        assert response.json()["version_count"] == 2
++
++    def test_update_prompt_by_name_falls_back_when_post_publish_refresh_misses_row(self, mock_feature_enabled):
++        first_version = self.create_prompt_version(name="publish-prompt", version=1, is_latest=True, prompt="v1")
++
++        with patch("posthog.api.services.llm_prompt.get_active_prompt_queryset", return_value=LLMPrompt.objects.none()):
++            response = self.client.patch(
++                f"/api/environments/{self.team.id}/llm_prompts/name/publish-prompt/",
++                data={"prompt": "v2", "base_version": 1},
++                format="json",
++            )
+ 
+-    def test_soft_delete_prompt(self, mock_feature_enabled):
+-        prompt = LLMPrompt.objects.create(
+-            team=self.team,
+-            name="to-be-deleted",
+-            prompt="Content",
+-            created_by=self.user,
++        assert response.status_code == status.HTTP_200_OK
++        assert response.json()["version"] == 2
++        assert response.json()["version_count"] == 2
++        assert response.json()["first_version_created_at"] == first_version.created_at.isoformat().replace(
++            "+00:00", "Z"
+         )
++        assert LLMPrompt.objects.filter(team=self.team, name="publish-prompt", version=2, deleted=False).exists()
++
++    def test_update_prompt_by_name_returns_conflict_for_stale_base_version(self, mock_feature_enabled):
++        self.create_prompt_version(name="publish-prompt", version=1, is_latest=False, prompt="v1")
++        self.create_prompt_version(name="publish-prompt", version=2, is_latest=True, prompt="v2")
+ 
+         response = self.client.patch(
+-            f"/api/environments/{self.team.id}/llm_prompts/{prompt.id}/",
+-            data={"deleted": True},
++            f"/api/environments/{self.team.id}/llm_prompts/name/publish-prompt/",
++            data={"prompt": "stale", "base_version": 1},
+             format="json",
+         )
+ 
+-        assert response.status_code == status.HTTP_200_OK
+-        prompt.refresh_from_db()
+-        assert prompt.deleted is True
++        assert response.status_code == status.HTTP_409_CONFLICT
++        assert response.json()["current_version"] == 2
+ 
+-    def test_hard_delete_forbidden(self, mock_feature_enabled):
+-        prompt = LLMPrompt.objects.create(
+-            team=self.team,
+-            name="cannot-hard-delete",
+-            prompt="Content",
+-            created_by=self.user,
++    def test_update_prompt_by_name_rejects_payload_above_max_size(self, mock_feature_enabled):
++        self.create_prompt_version(name="publish-prompt", version=1, is_latest=True, prompt="v1")
++        oversized_prompt = "x" * (MAX_PROMPT_PAYLOAD_BYTES + 1)
++
++        response = self.client.patch(
++            f"/api/environments/{self.team.id}/llm_prompts/name/publish-prompt/",
++            data={"prompt": oversized_prompt, "base_version": 1},
++            format="json",
+         )
+ 
+-        response = self.client.delete(f"/api/environments/{self.team.id}/llm_prompts/{prompt.id}/")
++        assert response.status_code == status.HTTP_400_BAD_REQUEST
++        assert response.json()["attr"] == "prompt"
++        assert "bytes or fewer" in response.json()["detail"]
+ 
+-        assert response.status_code == status.HTTP_405_METHOD_NOT_ALLOWED
++    def test_update_prompt_by_name_rejects_publish_when_version_limit_reached(self, mock_feature_enabled):
++        self.create_prompt_version(name="publish-prompt", version=MAX_PROMPT_VERSION, is_latest=True, prompt="v-limit")
+ 
+-    def test_list_excludes_deleted_prompts(self, mock_feature_enabled):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="active-prompt",
+-            prompt="Content",
+-            created_by=self.user,
+-            deleted=False,
+-        )
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="deleted-prompt",
+-            prompt="Content",
+-            created_by=self.user,
+-            deleted=True,
++        response = self.client.patch(
++            f"/api/environments/{self.team.id}/llm_prompts/name/publish-prompt/",
++            data={"prompt": "v-over-limit", "base_version": MAX_PROMPT_VERSION},
++            format="json",
+         )
+ 
+-        response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/")
++        assert response.status_code == status.HTTP_400_BAD_REQUEST
++        assert str(MAX_PROMPT_VERSION) in response.json()["detail"]
++        assert LLMPrompt.objects.filter(team=self.team, name="publish-prompt", deleted=False).count() == 1
+ 
+-        assert response.status_code == status.HTTP_200_OK
+-        results = response.json()["results"]
+-        assert len(results) == 1
+-        assert results[0]["name"] == "active-prompt"
++    def test_update_prompt_by_name_forbidden_for_personal_api_key_auth(self, mock_feature_enabled):
++        self.create_prompt_version(name="publish-prompt", version=1, is_latest=True, prompt="v1")
++        api_key = self.create_personal_api_key_with_scopes(["llm_prompt:read"])
++        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {api_key}")
+ 
+-    def test_fetch_prompt_by_name_succeeds(self, mock_feature_enabled):
+-        prompt = LLMPrompt.objects.create(
+-            team=self.team,
+-            name="test-prompt",
+-            prompt="You are a helpful assistant.",
+-            created_by=self.user,
++        read_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/publish-prompt/")
++        write_response = self.client.patch(
++            f"/api/environments/{self.team.id}/llm_prompts/name/publish-prompt/",
++            data={"prompt": "v2", "base_version": 1},
++            format="json",
+         )
+ 
+-        response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/test-prompt/")
++        assert read_response.status_code == status.HTTP_200_OK
++        assert write_response.status_code == status.HTTP_403_FORBIDDEN
+ 
+-        assert response.status_code == status.HTTP_200_OK
+-        assert response.json()["id"] == str(prompt.id)
+-        assert response.json()["name"] == "test-prompt"
+-        assert response.json()["prompt"] == "You are a helpful assistant."
+-        assert "created_by" not in response.json()
++    def test_resolve_prompt_by_name_returns_selected_prompt_and_versions(self, mock_feature_enabled):
++        historical = self.create_prompt_version(name="versions-prompt", version=1, is_latest=False, prompt="v1")
++        latest = self.create_prompt_version(name="versions-prompt", version=2, is_latest=True, prompt="v2")
+ 
+-    def test_fetch_prompt_by_name_uses_cached_result_after_first_load(self, mock_feature_enabled):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="cached-prompt",
+-            prompt="You are a helpful assistant.",
+-            created_by=self.user,
++        response = self.client.get(
++            f"/api/environments/{self.team.id}/llm_prompts/resolve/name/versions-prompt/?version=1"
+         )
+-        from posthog.storage.llm_prompt_cache import llm_prompts_hypercache
+ 
+-        with patch.object(llm_prompts_hypercache, "load_fn", wraps=llm_prompts_hypercache.load_fn) as mock_load_fn:
+-            first_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/cached-prompt/")
+-            second_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/cached-prompt/")
++        assert response.status_code == status.HTTP_200_OK
++        data = response.json()
++        assert data["prompt"]["id"] == str(historical.id)
++        assert data["prompt"]["version"] == 1
++        assert data["prompt"]["latest_version"] == 2
++        assert [prompt["version"] for prompt in data["versions"]] == [2, 1]
++        assert data["versions"][0]["id"] == str(latest.id)
++        assert data["versions"][0]["is_latest"] is True
++        assert data["has_more"] is False
++
++    def test_resolve_prompt_by_name_supports_paged_versions_with_has_more(self, mock_feature_enabled):
++        for version in range(1, 4):
++            self.create_prompt_version(
++                name="paged-prompt",
++                version=version,
++                prompt=f"v{version}",
++                is_latest=version == 3,
++            )
++
++        response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/resolve/name/paged-prompt/?limit=2")
+ 
+-        assert first_response.status_code == status.HTTP_200_OK
+-        assert second_response.status_code == status.HTTP_200_OK
+-        assert mock_load_fn.call_count == 1
++        assert response.status_code == status.HTTP_200_OK
++        data = response.json()
++        assert [prompt["version"] for prompt in data["versions"]] == [3, 2]
++        assert data["has_more"] is True
+ 
+-    def test_create_prompt_invalidates_cached_not_found_result(self, mock_feature_enabled):
+-        first_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/new-cached-prompt/")
+-        assert first_response.status_code == status.HTTP_404_NOT_FOUND
++    def test_resolve_prompt_by_name_keeps_versions_page_order_and_limit_for_old_selected_version(
++        self, mock_feature_enabled
++    ):
++        selected = None
++        for version in range(1, 5):
++            prompt = self.create_prompt_version(
++                name="paged-prompt",
++                version=version,
++                prompt=f"v{version}",
++                is_latest=version == 4,
++            )
++            if version == 1:
++                selected = prompt
+ 
+-        create_response = self.client.post(
+-            f"/api/environments/{self.team.id}/llm_prompts/",
+-            data={"name": "new-cached-prompt", "prompt": "Created after cache miss"},
+-            format="json",
++        response = self.client.get(
++            f"/api/environments/{self.team.id}/llm_prompts/resolve/name/paged-prompt/?version=1&limit=2"
+         )
+-        assert create_response.status_code == status.HTTP_201_CREATED
+ 
+-        second_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/new-cached-prompt/")
+-        assert second_response.status_code == status.HTTP_200_OK
+-        assert second_response.json()["prompt"] == "Created after cache miss"
++        assert response.status_code == status.HTTP_200_OK
++        data = response.json()
++        assert data["prompt"]["version"] == 1
++        assert selected is not None
++        assert data["prompt"]["id"] == str(selected.id)
++        assert [prompt["version"] for prompt in data["versions"]] == [4, 3]
++        assert len(data["versions"]) == 2
++        assert data["has_more"] is True
++
++    def test_resolve_prompt_by_name_supports_before_version_cursor(self, mock_feature_enabled):
++        for version in range(1, 4):
++            self.create_prompt_version(
++                name="paged-prompt",
++                version=version,
++                prompt=f"v{version}",
++                is_latest=version == 3,
++            )
++
++        response = self.client.get(
++            f"/api/environments/{self.team.id}/llm_prompts/resolve/name/paged-prompt/?before_version=2&limit=2"
++        )
+ 
+-    def test_model_save_invalidates_cached_not_found_result(self, mock_feature_enabled):
+-        first_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/model-saved-prompt/")
+-        assert first_response.status_code == status.HTTP_404_NOT_FOUND
++        assert response.status_code == status.HTTP_200_OK
++        data = response.json()
++        assert [prompt["version"] for prompt in data["versions"]] == [1]
++        assert data["has_more"] is False
+ 
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="model-saved-prompt",
+-            prompt="Created via model save",
+-            created_by=self.user,
++    def test_resolve_prompt_by_name_rejects_offset_with_before_version(self, mock_feature_enabled):
++        self.create_prompt_version(name="paged-prompt", version=1, prompt="v1", is_latest=True)
++
++        response = self.client.get(
++            f"/api/environments/{self.team.id}/llm_prompts/resolve/name/paged-prompt/?offset=0&before_version=1"
+         )
+ 
+-        second_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/model-saved-prompt/")
+-        assert second_response.status_code == status.HTTP_200_OK
+-        assert second_response.json()["prompt"] == "Created via model save"
++        assert response.status_code == status.HTTP_400_BAD_REQUEST
++        assert "offset or before_version" in response.json()["detail"]
+ 
+-    @patch("posthog.models.llm_prompt.transaction.on_commit", side_effect=lambda callback: callback())
+-    def test_update_prompt_invalidates_cached_prompt_by_name_result(self, mock_on_commit, mock_feature_enabled):
+-        prompt = LLMPrompt.objects.create(
+-            team=self.team,
+-            name="update-cached-prompt",
+-            prompt="Original content",
+-            created_by=self.user,
+-        )
++    def test_archive_endpoint_archives_all_active_versions_for_name(self, mock_feature_enabled):
++        self.create_prompt_version(name="archive-prompt", version=1, is_latest=False, prompt="v1")
++        self.create_prompt_version(name="archive-prompt", version=2, is_latest=True, prompt="v2")
+ 
+-        first_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/update-cached-prompt/")
+-        assert first_response.status_code == status.HTTP_200_OK
+-        assert first_response.json()["prompt"] == "Original content"
++        response = self.client.post(f"/api/environments/{self.team.id}/llm_prompts/name/archive-prompt/archive/")
+ 
+-        update_response = self.client.patch(
+-            f"/api/environments/{self.team.id}/llm_prompts/{prompt.id}/",
+-            data={"prompt": "Updated content"},
++        assert response.status_code == status.HTTP_204_NO_CONTENT
++        assert LLMPrompt.objects.filter(team=self.team, name="archive-prompt", deleted=False).count() == 0
++
++        recreate_response = self.client.post(
++            f"/api/environments/{self.team.id}/llm_prompts/",
++            data={"name": "archive-prompt", "prompt": "fresh"},
+             format="json",
+         )
+-        assert update_response.status_code == status.HTTP_200_OK
+ 
+-        second_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/update-cached-prompt/")
+-        assert second_response.status_code == status.HTTP_200_OK
+-        assert second_response.json()["prompt"] == "Updated content"
++        assert recreate_response.status_code == status.HTTP_201_CREATED
++        assert recreate_response.json()["version"] == 1
+ 
+-    @patch("posthog.models.llm_prompt.transaction.on_commit", side_effect=lambda callback: callback())
+-    def test_soft_delete_invalidates_cached_prompt_by_name_result(self, mock_on_commit, mock_feature_enabled):
+-        prompt = LLMPrompt.objects.create(
+-            team=self.team,
+-            name="delete-cached-prompt",
+-            prompt="To be deleted",
+-            created_by=self.user,
+-        )
++    def test_archive_endpoint_invalidates_latest_and_version_fetches(self, mock_feature_enabled):
++        self.create_prompt_version(name="archive-prompt", version=1, is_latest=False, prompt="v1")
++        self.create_prompt_version(name="archive-prompt", version=2, is_latest=True, prompt="v2")
+ 
+-        first_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/delete-cached-prompt/")
+-        assert first_response.status_code == status.HTTP_200_OK
++        with patch("posthog.api.services.llm_prompt.transaction.on_commit", side_effect=lambda callback: callback()):
++            first_latest = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/archive-prompt/")
++            first_version = self.client.get(
++                f"/api/environments/{self.team.id}/llm_prompts/name/archive-prompt/?version=1"
++            )
++            archive_response = self.client.post(
++                f"/api/environments/{self.team.id}/llm_prompts/name/archive-prompt/archive/"
++            )
+ 
+-        delete_response = self.client.patch(
+-            f"/api/environments/{self.team.id}/llm_prompts/{prompt.id}/",
+-            data={"deleted": True},
+-            format="json",
+-        )
+-        assert delete_response.status_code == status.HTTP_200_OK
++        assert first_latest.status_code == status.HTTP_200_OK
++        assert first_version.status_code == status.HTTP_200_OK
++        assert archive_response.status_code == status.HTTP_204_NO_CONTENT
+ 
+-        second_response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/delete-cached-prompt/")
+-        assert second_response.status_code == status.HTTP_404_NOT_FOUND
++        second_latest = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/archive-prompt/")
++        second_version = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/archive-prompt/?version=1")
+ 
+-    def test_resolve_prompt_by_name_succeeds_for_session_auth(self, mock_feature_enabled):
+-        prompt = LLMPrompt.objects.create(
+-            team=self.team,
+-            name="test-prompt",
+-            prompt="You are a helpful assistant.",
+-            created_by=self.user,
++        assert second_latest.status_code == status.HTTP_404_NOT_FOUND
++        assert second_version.status_code == status.HTTP_404_NOT_FOUND
++
++    @override_settings(TEST=False)
++    def test_archive_endpoint_batches_version_cache_invalidation_when_many_versions_exist(self, mock_feature_enabled):
++        for version in range(1, 106):
++            self.create_prompt_version(
++                name="archive-prompt",
++                version=version,
++                is_latest=version == 105,
++                prompt=f"v{version}",
++            )
++
++        with (
++            patch("posthog.api.services.llm_prompt.transaction.on_commit", side_effect=lambda callback: callback()),
++            patch("posthog.api.services.llm_prompt.invalidate_prompt_latest_cache") as mock_invalidate_latest,
++            patch("posthog.api.services.llm_prompt.invalidate_prompt_version_caches") as mock_invalidate_versions,
++            patch("posthog.tasks.llm_prompt_cache.invalidate_archived_prompt_versions_cache_task.delay") as mock_delay,
++        ):
++            response = self.client.post(f"/api/environments/{self.team.id}/llm_prompts/name/archive-prompt/archive/")
++
++        assert response.status_code == status.HTTP_204_NO_CONTENT
++        mock_invalidate_latest.assert_called_once_with(self.team.id, "archive-prompt")
++        assert mock_invalidate_versions.call_count == 1
++        invalidated_versions = mock_invalidate_versions.call_args.args[2]
++        assert invalidated_versions == list(range(1, 101))
++        mock_delay.assert_called_once_with(self.team.id, "archive-prompt", 101, 105)
++
++    def test_resolve_prompt_by_name_supports_explicit_version_for_session_auth(self, mock_feature_enabled):
++        historical = self.create_prompt_version(name="resolve-prompt", version=1, is_latest=False, prompt="v1")
++        self.create_prompt_version(name="resolve-prompt", version=2, is_latest=True, prompt="v2")
++
++        response = self.client.get(
++            f"/api/environments/{self.team.id}/llm_prompts/resolve/name/resolve-prompt/?version=1"
+         )
+ 
+-        response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/resolve/name/test-prompt/")
++        assert response.status_code == status.HTTP_200_OK
++        assert response.json()["prompt"]["id"] == str(historical.id)
++        assert response.json()["prompt"]["version"] == 1
++        assert "created_by" in response.json()["prompt"]
++
++    def test_resolve_prompt_by_name_supports_exact_version_id_for_session_auth(self, mock_feature_enabled):
++        historical = self.create_prompt_version(name="resolve-prompt", version=1, is_latest=False, prompt="v1")
++        self.create_prompt_version(name="resolve-prompt", version=2, is_latest=True, prompt="v2")
++
++        response = self.client.get(
++            f"/api/environments/{self.team.id}/llm_prompts/resolve/name/resolve-prompt/"
++            f"?version=1&version_id={historical.id}"
++        )
+ 
+         assert response.status_code == status.HTTP_200_OK
+-        assert response.json()["id"] == str(prompt.id)
+-        assert response.json()["name"] == "test-prompt"
+-        assert response.json()["prompt"] == "You are a helpful assistant."
+-        assert "created_by" in response.json()
++        assert response.json()["prompt"]["id"] == str(historical.id)
++        assert response.json()["prompt"]["version"] == 1
+ 
+-    def test_resolve_prompt_by_name_does_not_use_hypercache(self, mock_feature_enabled):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="test-prompt",
+-            prompt="You are a helpful assistant.",
+-            created_by=self.user,
++    def test_resolve_prompt_by_name_returns_404_for_archived_version_id_after_name_reuse(self, mock_feature_enabled):
++        historical = self.create_prompt_version(name="resolve-prompt", version=1, is_latest=True, prompt="old")
++        LLMPrompt.objects.filter(team=self.team, name="resolve-prompt", deleted=False).update(
++            deleted=True,
++            is_latest=False,
+         )
++        self.create_prompt_version(name="resolve-prompt", version=1, is_latest=True, prompt="new")
+ 
+-        with patch("posthog.api.llm_prompt.get_prompt_by_name_from_cache") as mock_get_from_cache:
+-            response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/resolve/name/test-prompt/")
++        response = self.client.get(
++            f"/api/environments/{self.team.id}/llm_prompts/resolve/name/resolve-prompt/"
++            f"?version=1&version_id={historical.id}"
++        )
+ 
+-        assert response.status_code == status.HTTP_200_OK
+-        mock_get_from_cache.assert_not_called()
++        assert response.status_code == status.HTTP_404_NOT_FOUND
+ 
+     def test_resolve_prompt_by_name_forbidden_for_personal_api_key_auth(self, mock_feature_enabled):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="test-prompt",
+-            prompt="You are a helpful assistant.",
+-            created_by=self.user,
+-        )
++        self.create_prompt_version(name="test-prompt")
+ 
+         api_key = self.create_personal_api_key_with_scopes(["llm_prompt:read"])
+         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {api_key}")
+@@ -394,20 +532,20 @@ class TestLLMPromptAPI(APIBaseTest):
+ 
+     @override_settings(TEST=False)
+     @patch("posthog.api.llm_prompt.capture_internal")
+-    def test_resolve_prompt_by_name_does_not_emit_prompt_fetched_event(
+-        self, mock_capture_internal, mock_feature_enabled
+-    ):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="test-prompt",
+-            prompt="You are a helpful assistant.",
+-            created_by=self.user,
+-        )
++    def test_fetch_prompt_by_name_emits_version_metadata(self, mock_capture_internal, mock_feature_enabled):
++        self.create_prompt_version(name="test-prompt", version=1, is_latest=False, prompt="v1")
++        latest = self.create_prompt_version(name="test-prompt", version=2, is_latest=True, prompt="v2")
+ 
+-        response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/resolve/name/test-prompt/")
++        response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/test-prompt/")
+ 
+         assert response.status_code == status.HTTP_200_OK
+-        mock_capture_internal.assert_not_called()
++        mock_capture_internal.assert_called_once()
++        properties = mock_capture_internal.call_args.kwargs["properties"]
++        assert properties["prompt_id"] == str(latest.id)
++        assert properties["prompt_name"] == "test-prompt"
++        assert properties["prompt_version"] == 2
++        assert properties["prompt_is_latest"] is True
++        assert properties["prompt_first_version_created_at"] == response.json()["first_version_created_at"]
+ 
+     def test_fetch_prompt_by_name_not_found(self, mock_feature_enabled):
+         response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/non-existent/")
+@@ -415,19 +553,6 @@ class TestLLMPromptAPI(APIBaseTest):
+         assert response.status_code == status.HTTP_404_NOT_FOUND
+         assert "not found" in response.json()["detail"].lower()
+ 
+-    def test_fetch_deleted_prompt_by_name_returns_not_found(self, mock_feature_enabled):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="deleted-prompt",
+-            prompt="Content",
+-            created_by=self.user,
+-            deleted=True,
+-        )
+-
+-        response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/deleted-prompt/")
+-
+-        assert response.status_code == status.HTTP_404_NOT_FOUND
+-
+     def test_fetch_prompt_by_name_other_team_not_accessible(self, mock_feature_enabled):
+         from posthog.models import Team
+ 
+@@ -443,43 +568,61 @@ class TestLLMPromptAPI(APIBaseTest):
+ 
+         assert response.status_code == status.HTTP_404_NOT_FOUND
+ 
+-    def test_create_prompt_with_invalid_name_fails(self, mock_feature_enabled):
++    def test_create_prompt_with_reserved_name_new_fails(self, mock_feature_enabled):
+         response = self.client.post(
+             f"/api/environments/{self.team.id}/llm_prompts/",
+-            data={
+-                "name": "invalid name with spaces",
+-                "prompt": "Content",
+-            },
++            data={"name": "new", "prompt": "Content"},
+             format="json",
+         )
+ 
+         assert response.status_code == status.HTTP_400_BAD_REQUEST
+         assert response.json()["attr"] == "name"
+-        assert "Only letters, numbers, hyphens (-) and underscores (_) are allowed" in response.json()["detail"]
++        assert "'new' is a reserved name" in response.json()["detail"]
+ 
+-    def test_create_prompt_with_valid_name_characters(self, mock_feature_enabled):
++    def test_create_prompt_with_invalid_name_fails(self, mock_feature_enabled):
+         response = self.client.post(
+             f"/api/environments/{self.team.id}/llm_prompts/",
+-            data={
+-                "name": "valid-name_123",
+-                "prompt": "Content",
+-            },
++            data={"name": "invalid name with spaces", "prompt": "Content"},
+             format="json",
+         )
+ 
+-        assert response.status_code == status.HTTP_201_CREATED
+-        assert response.json()["name"] == "valid-name_123"
++        assert response.status_code == status.HTTP_400_BAD_REQUEST
++        assert response.json()["attr"] == "name"
++        assert "Only letters, numbers, hyphens (-) and underscores (_) are allowed" in response.json()["detail"]
+ 
+     def test_returns_403_when_feature_flag_disabled(self, mock_class_feature_enabled):
+         mock_class_feature_enabled.return_value = False
+-
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="test-prompt",
+-            prompt="You are a helpful assistant.",
+-            created_by=self.user,
+-        )
++        self.create_prompt_version(name="test-prompt")
+ 
+         response = self.client.get(f"/api/environments/{self.team.id}/llm_prompts/name/test-prompt/")
+ 
+         assert response.status_code == status.HTTP_403_FORBIDDEN
++
++    def test_get_by_name_patch_uses_write_scope(self, mock_feature_enabled):
++        request = APIRequestFactory().patch("/api/environments/1/llm_prompts/name/example/")
++        view = LLMPromptViewSet()
++        view.action = "get_by_name"
++        assert view.dangerously_get_required_scopes(request, view) == ["llm_prompt:write"]
++
++        view.action = "update_by_name"
++        assert view.dangerously_get_required_scopes(request, view) == ["llm_prompt:write"]
++
++    def test_update_by_name_uses_publish_specific_burst_throttle(self, mock_feature_enabled):
++        view = LLMPromptViewSet()
++        view.action = "update_by_name"
++
++        throttles = view.get_throttles()
++
++        assert isinstance(throttles[0], LLMPromptPublishBurstRateThrottle)
++        assert isinstance(throttles[1], BurstRateThrottle)
++        assert isinstance(throttles[2], SustainedRateThrottle)
++
++    def test_get_by_name_uses_default_burst_and_sustained_throttles(self, mock_feature_enabled):
++        view = LLMPromptViewSet()
++        view.action = "get_by_name"
++
++        throttles = view.get_throttles()
++
++        assert len(throttles) == 2
++        assert isinstance(throttles[0], BurstRateThrottle)
++        assert isinstance(throttles[1], SustainedRateThrottle)
+diff --git a/posthog/migrations/1035_llm_prompt_versioning.py b/posthog/migrations/1035_llm_prompt_versioning.py
+new file mode 100644
+index 00000000000..e63e5b8c904
+--- /dev/null
++++ b/posthog/migrations/1035_llm_prompt_versioning.py
+@@ -0,0 +1,37 @@
++# Generated by Django 4.2.26 on 2026-03-03 13:00
++
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("posthog", "1034_taggeditem_ticket_unique_constraint"),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name="llmprompt",
++            name="is_latest",
++            field=models.BooleanField(default=True),
++        ),
++        migrations.RemoveConstraint(
++            model_name="llmprompt",
++            name="unique_llm_prompt_name_per_team",
++        ),
++        migrations.AddConstraint(
++            model_name="llmprompt",
++            constraint=models.UniqueConstraint(
++                condition=models.Q(("deleted", False)),
++                fields=("team", "name", "version"),
++                name="unique_llm_prompt_version_per_team",
++            ),
++        ),
++        migrations.AddConstraint(
++            model_name="llmprompt",
++            constraint=models.UniqueConstraint(
++                condition=models.Q(("deleted", False), ("is_latest", True)),
++                fields=("team", "name"),
++                name="unique_llm_prompt_latest_per_team",
++            ),
++        ),
++    ]
+diff --git a/posthog/migrations/max_migration.txt b/posthog/migrations/max_migration.txt
+index 2e34fb6d58a..5f927df4401 100644
+--- a/posthog/migrations/max_migration.txt
++++ b/posthog/migrations/max_migration.txt
+@@ -1 +1 @@
+-1034_taggeditem_ticket_unique_constraint
++1035_llm_prompt_versioning
+diff --git a/posthog/models/llm_prompt.py b/posthog/models/llm_prompt.py
+index 52854357be5..77e60531d57 100644
+--- a/posthog/models/llm_prompt.py
++++ b/posthog/models/llm_prompt.py
+@@ -1,4 +1,5 @@
+ from django.db import models, transaction
++from django.db.models import Count, DateTimeField, IntegerField, OuterRef, QuerySet, Subquery, UUIDField
+ from django.db.models.signals import post_delete, post_save
+ from django.dispatch import receiver
+ from django.utils import timezone
+@@ -11,10 +12,15 @@ class LLMPrompt(UUIDModel):
+     class Meta:
+         constraints = [
+             models.UniqueConstraint(
+-                fields=["team", "name"],
++                fields=["team", "name", "version"],
+                 condition=models.Q(deleted=False),
+-                name="unique_llm_prompt_name_per_team",
+-            )
++                name="unique_llm_prompt_version_per_team",
++            ),
++            models.UniqueConstraint(
++                fields=["team", "name"],
++                condition=models.Q(deleted=False, is_latest=True),
++                name="unique_llm_prompt_latest_per_team",
++            ),
+         ]
+ 
+     name = models.CharField(max_length=255)
+@@ -22,8 +28,8 @@ class LLMPrompt(UUIDModel):
+     # The prompt content as JSON (currently a string, may expand to array of objects)
+     prompt = models.JSONField()
+ 
+-    # TODO: Auto-increment version on updates when versioning feature is implemented
+     version = models.PositiveIntegerField(default=1)
++    is_latest = models.BooleanField(default=True)
+ 
+     team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE)
+     created_by = models.ForeignKey(
+@@ -39,16 +45,45 @@ class LLMPrompt(UUIDModel):
+     deleted = models.BooleanField(default=False)
+ 
+ 
++def annotate_llm_prompt_version_history_metadata(queryset: QuerySet[LLMPrompt]) -> QuerySet[LLMPrompt]:
++    active_versions = LLMPrompt.objects.filter(team_id=OuterRef("team_id"), name=OuterRef("name"), deleted=False)
++
++    version_count = Subquery(
++        active_versions.values("name").annotate(count=Count("id")).values("count")[:1],
++        output_field=IntegerField(),
++    )
++    latest_version = Subquery(
++        active_versions.order_by("-version", "-created_at", "-id").values("version")[:1],
++        output_field=IntegerField(),
++    )
++    first_version_created_at = Subquery(
++        active_versions.filter(version=1).order_by("created_at", "id").values("created_at")[:1],
++        output_field=DateTimeField(),
++    )
++    first_version_id = Subquery(
++        active_versions.filter(version=1).order_by("created_at", "id").values("id")[:1],
++        output_field=UUIDField(),
++    )
++
++    return queryset.annotate(
++        version_count=version_count,
++        latest_version=latest_version,
++        first_version_created_at=first_version_created_at,
++        first_version_id=first_version_id,
++    )
++
++
+ @receiver(post_save, sender=LLMPrompt)
+ @receiver(post_delete, sender=LLMPrompt)
+ def invalidate_llm_prompt_cache(sender: type[LLMPrompt], instance: LLMPrompt, **kwargs) -> None:
+     team_id = instance.team_id
+ 
+     def clear_cache() -> None:
+-        from posthog.storage.llm_prompt_cache import invalidate_team_prompt_cache
++        from posthog.storage.llm_prompt_cache import invalidate_prompt_latest_cache, invalidate_prompt_version_cache
+ 
+         try:
+-            invalidate_team_prompt_cache(team_id)
++            invalidate_prompt_latest_cache(team_id, instance.name)
++            invalidate_prompt_version_cache(team_id, instance.name, instance.version)
+         except Exception as err:
+             capture_exception(err)
+ 
+diff --git a/posthog/rate_limit.py b/posthog/rate_limit.py
+index 79c0ded0172..42a2ec965ce 100644
+--- a/posthog/rate_limit.py
++++ b/posthog/rate_limit.py
+@@ -159,13 +159,12 @@ class PersonalApiKeyRateThrottle(SimpleRateThrottle):
+ 
+         self.num_requests, self.duration = self.parse_rate(self.rate)
+ 
+-    def allow_request(self, request, view):
++    def _allow_request_internal(self, request, view, *, personal_api_key_only: bool) -> bool:
+         if not is_rate_limit_enabled(round(time.time() / 60)):
+             return True
+ 
+-        # Only rate limit authenticated requests made with a personal API key
+         personal_api_key = PersonalAPIKeyAuthentication.find_key_with_source(request)
+-        if request.user.is_authenticated and personal_api_key is None:
++        if personal_api_key_only and request.user.is_authenticated and personal_api_key is None:
+             return True
+ 
+         try:
+@@ -173,7 +172,7 @@ class PersonalApiKeyRateThrottle(SimpleRateThrottle):
+             if team_id is not None and self.scope == HogQLQueryThrottle.scope:
+                 self.load_team_rate_limit(team_id)
+ 
+-            request_would_be_allowed = super().allow_request(request, view)
++            request_would_be_allowed = SimpleRateThrottle.allow_request(self, request, view)
+             if request_would_be_allowed:
+                 return True
+ 
+@@ -215,6 +214,10 @@ class PersonalApiKeyRateThrottle(SimpleRateThrottle):
+             capture_exception(e)
+             return True
+ 
++    def allow_request(self, request, view):
++        # Only rate limit authenticated requests made with a personal API key
++        return self._allow_request_internal(request, view, personal_api_key_only=True)
++
+     def get_cache_key(self, request, view):
+         """
+         Tries the following options in order:
+@@ -350,6 +353,15 @@ class SustainedRateThrottle(PersonalApiKeyRateThrottle):
+     rate = "4800/hour"
+ 
+ 
++class PersonalApiKeyOrUserRateThrottle(PersonalApiKeyRateThrottle):
++    """
++    Rate limit both personal API key and web-authenticated user requests.
++    """
++
++    def allow_request(self, request, view):
++        return self._allow_request_internal(request, view, personal_api_key_only=False)
++
++
+ class ClickHouseBurstRateThrottle(PersonalApiKeyRateThrottle):
+     # Throttle class that's a bit more aggressive and is used specifically on endpoints that hit ClickHouse
+     # Intended to block quick bursts of requests, per project
+@@ -538,6 +550,13 @@ class LLMAnalyticsSummarizationDailyThrottle(PersonalApiKeyRateThrottle):
+     rate = "500/day"
+ 
+ 
++class LLMPromptPublishBurstRateThrottle(PersonalApiKeyOrUserRateThrottle):
++    # Stricter burst limit for publishing prompt versions.
++    # This protects against accidental loops or scripted abuse while allowing normal usage.
++    scope = "llm_prompt_publish_burst"
++    rate = "30/minute"
++
++
+ class EventValuesBurstThrottle(PersonalApiKeyRateThrottle):
+     scope = "event_values_burst"
+     rate = "60/minute"
+diff --git a/posthog/storage/llm_prompt_cache.py b/posthog/storage/llm_prompt_cache.py
+index 8d230354fd1..dbe60a4370d 100644
+--- a/posthog/storage/llm_prompt_cache.py
++++ b/posthog/storage/llm_prompt_cache.py
+@@ -1,70 +1,163 @@
+-from typing import Any
++from collections.abc import Iterable
++from typing import Any, cast
+ 
+ from django.conf import settings
++from django.db.models import QuerySet
+ 
+ from posthog.exceptions_capture import capture_exception
+-from posthog.models.llm_prompt import LLMPrompt
++from posthog.models.llm_prompt import LLMPrompt, annotate_llm_prompt_version_history_metadata
+ from posthog.models.team.team import Team
+ from posthog.storage.hypercache import HyperCache, HyperCacheStoreMissing, KeyType
++from posthog.storage.llm_prompt_cache_keys import (
++    parse_prompt_cache_key,
++    prompt_latest_cache_key,
++    prompt_version_cache_key,
++)
++from posthog.storage.llm_prompt_cache_payloads import (
++    INTERNAL_FIRST_VERSION_ID_KEY,
++    is_stale_exact_version_entry,
++    merge_prompt_version_history_metadata,
++    serialize_prompt,
++    serialize_prompt_version,
++    strip_internal_metadata,
++)
++
++# Used in tests; keep as module export.
++_serialize_prompt = serialize_prompt
+ 
+ 
+-def _serialize_prompt(prompt: LLMPrompt) -> dict[str, Any]:
+-    return {
+-        "id": str(prompt.id),
+-        "name": prompt.name,
+-        "prompt": prompt.prompt,
+-        "version": prompt.version,
+-        "created_at": prompt.created_at.isoformat().replace("+00:00", "Z"),
+-        "updated_at": prompt.updated_at.isoformat().replace("+00:00", "Z"),
+-        "deleted": prompt.deleted,
+-    }
++def _get_active_prompt_queryset_for_team_id(team_id: int) -> QuerySet[LLMPrompt]:
++    return annotate_llm_prompt_version_history_metadata(LLMPrompt.objects.filter(team_id=team_id, deleted=False))
+ 
+ 
+-def _load_team_prompts_by_name_cache(team_key: KeyType) -> dict[str, Any] | HyperCacheStoreMissing:
+-    try:
+-        team = HyperCache.team_from_key(team_key)
+-    except Team.DoesNotExist:
++def _attach_first_version_id(prompt: LLMPrompt, team_id: int, prompt_name: str) -> LLMPrompt:
++    prompt_with_first_version_id = cast(Any, prompt)
++    if prompt.version == 1:
++        prompt_with_first_version_id.first_version_id = prompt.id
++        return prompt
++
++    first_version_id = (
++        LLMPrompt.objects.filter(team_id=team_id, name=prompt_name, deleted=False, version=1)
++        .order_by("created_at", "id")
++        .values_list("id", flat=True)
++        .first()
++    )
++    if first_version_id is not None:
++        prompt_with_first_version_id.first_version_id = first_version_id
++    return prompt
++
++
++def _get_latest_prompt_from_db(team_id: int, prompt_name: str) -> LLMPrompt | None:
++    return (
++        _get_active_prompt_queryset_for_team_id(team_id)
++        .filter(name=prompt_name, is_latest=True)
++        .order_by("-version", "-created_at", "-id")
++        .first()
++    )
++
++
++def _get_prompt_version_from_db(team_id: int, prompt_name: str, version: int) -> LLMPrompt | None:
++    prompt = (
++        LLMPrompt.objects.filter(team_id=team_id, deleted=False)
++        .filter(name=prompt_name, version=version)
++        .order_by("created_at", "id")
++        .first()
++    )
++    if prompt is None:
++        return None
++    return _attach_first_version_id(prompt, team_id, prompt_name)
++
++
++def _load_prompt_cache(cache_key: KeyType) -> dict[str, Any] | HyperCacheStoreMissing:
++    parsed_key = parse_prompt_cache_key(cache_key)
++    if parsed_key is None:
+         return HyperCacheStoreMissing()
+ 
+-    prompts = LLMPrompt.objects.filter(team=team, deleted=False).order_by("created_at", "id")
+-    prompts_by_name = {prompt.name: _serialize_prompt(prompt) for prompt in prompts}
+-    return {"prompts_by_name": prompts_by_name}
++    team_id, prompt_name, version = parsed_key
++
++    if version is None:
++        prompt = _get_latest_prompt_from_db(team_id, prompt_name)
++        if prompt is None:
++            return HyperCacheStoreMissing()
++        return serialize_prompt(prompt, include_internal=True)
++
++    prompt = _get_prompt_version_from_db(team_id, prompt_name, version)
++    if prompt is None:
++        return HyperCacheStoreMissing()
++
++    return serialize_prompt_version(prompt, include_internal=True)
+ 
+ 
+ llm_prompts_hypercache = HyperCache(
+     namespace="llm_prompts",
+-    value="prompts_by_name.json",
+-    load_fn=_load_team_prompts_by_name_cache,
++    value="prompt.json",
++    load_fn=_load_prompt_cache,
+     cache_ttl=settings.LLM_PROMPTS_CACHE_TTL,
+     cache_miss_ttl=settings.LLM_PROMPTS_CACHE_MISS_TTL,
+ )
+ 
+ 
+-def get_prompt_by_name_from_cache(team: Team, prompt_name: str) -> dict[str, Any] | None:
+-    team_prompts = llm_prompts_hypercache.get_from_cache(team)
+-    if not team_prompts:
+-        return None
++def get_prompt_by_name_from_cache(team: Team, prompt_name: str, version: int | None = None) -> dict[str, Any] | None:
++    latest_key = prompt_latest_cache_key(team.id, prompt_name)
++    latest_prompt = llm_prompts_hypercache.get_from_cache(latest_key)
+ 
+-    prompts_by_name = team_prompts.get("prompts_by_name", {})
+-    prompt = prompts_by_name.get(prompt_name)
+-    if isinstance(prompt, dict):
+-        return prompt
++    if not isinstance(latest_prompt, dict) or not isinstance(latest_prompt.get(INTERNAL_FIRST_VERSION_ID_KEY), str):
++        db_latest = _get_latest_prompt_from_db(team.id, prompt_name)
++        if db_latest is None:
++            return None
+ 
+-    db_prompt = (
+-        LLMPrompt.objects.filter(team=team, name=prompt_name, deleted=False).order_by("created_at", "id").first()
+-    )
+-    if db_prompt is None:
++        latest_prompt = serialize_prompt(db_latest, include_internal=True)
++        try:
++            llm_prompts_hypercache.set_cache_value(latest_key, latest_prompt)
++        except Exception as err:
++            capture_exception(err)
++
++    if version is None or version == latest_prompt["latest_version"]:
++        return strip_internal_metadata(latest_prompt)
++
++    version_key = prompt_version_cache_key(team.id, prompt_name, version)
++    exact_prompt = llm_prompts_hypercache.get_from_cache(version_key)
++    if not isinstance(exact_prompt, dict):
+         return None
+ 
+-    # Stale map protection: if DB has the prompt but cache map missed it,
+-    # invalidate the team map so subsequent reads use a fresh cache state.
+-    try:
+-        invalidate_team_prompt_cache(team.id)
+-    except Exception as err:
+-        capture_exception(err)
++    if is_stale_exact_version_entry(exact_prompt, latest_prompt):
++        try:
++            invalidate_prompt_version_cache(team.id, prompt_name, version)
++        except Exception as err:
++            capture_exception(err)
++
++        db_prompt = _get_prompt_version_from_db(team.id, prompt_name, version)
++        if db_prompt is None:
++            return None
++        exact_prompt = serialize_prompt_version(db_prompt, include_internal=True)
++        try:
++            llm_prompts_hypercache.set_cache_value(version_key, exact_prompt)
++        except Exception as err:
++            capture_exception(err)
++
++    return strip_internal_metadata(merge_prompt_version_history_metadata(exact_prompt, latest_prompt))
++
++
++def invalidate_prompt_latest_cache(team: Team | str | int, prompt_name: str) -> None:
++    llm_prompts_hypercache.clear_cache(prompt_latest_cache_key(team, prompt_name))
++
++
++def invalidate_prompt_version_cache(team: Team | str | int, prompt_name: str, version: int) -> None:
++    llm_prompts_hypercache.clear_cache(prompt_version_cache_key(team, prompt_name, version))
++
++
++def invalidate_prompt_version_caches(team: Team | str | int, prompt_name: str, versions: Iterable[int]) -> None:
++    for version in versions:
++        invalidate_prompt_version_cache(team, prompt_name, int(version))
++
+ 
+-    return _serialize_prompt(db_prompt)
++def invalidate_prompt_version_cache_range(team: Team | str | int, prompt_name: str, start: int, end: int) -> None:
++    if start > end:
++        return
++    for version in range(start, end + 1):
++        invalidate_prompt_version_cache(team, prompt_name, version)
+ 
+ 
+-def invalidate_team_prompt_cache(team: Team | str | int) -> None:
+-    llm_prompts_hypercache.clear_cache(team)
++def invalidate_prompt_name_caches(team: Team | str | int, prompt_name: str, versions: list[int]) -> None:
++    invalidate_prompt_latest_cache(team, prompt_name)
++    invalidate_prompt_version_caches(team, prompt_name, versions)
+diff --git a/posthog/storage/llm_prompt_cache_keys.py b/posthog/storage/llm_prompt_cache_keys.py
+new file mode 100644
+index 00000000000..d5a0973a0fb
+--- /dev/null
++++ b/posthog/storage/llm_prompt_cache_keys.py
+@@ -0,0 +1,47 @@
++from posthog.models.team.team import Team
++from posthog.storage.hypercache import KeyType
++
++
++def _prompt_cache_key_prefix(team: Team | str | int, prompt_name: str) -> str:
++    team_identifier = team.id if isinstance(team, Team) else team
++    return f"{team_identifier}:{prompt_name}"
++
++
++def prompt_latest_cache_key(team: Team | str | int, prompt_name: str) -> str:
++    return f"{_prompt_cache_key_prefix(team, prompt_name)}:latest"
++
++
++def prompt_version_cache_key(team: Team | str | int, prompt_name: str, version: int) -> str:
++    return f"{_prompt_cache_key_prefix(team, prompt_name)}:v:{version}"
++
++
++def parse_prompt_cache_key(cache_key: KeyType) -> tuple[int, str, int | None] | None:
++    if not isinstance(cache_key, str):
++        return None
++
++    parts = cache_key.split(":")
++    if len(parts) not in (3, 4):
++        return None
++
++    team_id_str, prompt_name = parts[0], parts[1]
++    if not prompt_name:
++        return None
++
++    try:
++        team_id = int(team_id_str)
++    except ValueError:
++        return None
++
++    if len(parts) == 3 and parts[2] == "latest":
++        return team_id, prompt_name, None
++
++    if len(parts) == 4 and parts[2] == "v":
++        try:
++            version = int(parts[3])
++        except ValueError:
++            return None
++        if version < 1:
++            return None
++        return team_id, prompt_name, version
++
++    return None
+diff --git a/posthog/storage/llm_prompt_cache_payloads.py b/posthog/storage/llm_prompt_cache_payloads.py
+new file mode 100644
+index 00000000000..fbd91f2ac2b
+--- /dev/null
++++ b/posthog/storage/llm_prompt_cache_payloads.py
+@@ -0,0 +1,88 @@
++from datetime import datetime
++from typing import Any
++
++from posthog.models.llm_prompt import LLMPrompt
++
++INTERNAL_FIRST_VERSION_ID_KEY = "_first_version_id"
++
++
++def _serialize_timestamp(value: datetime) -> str:
++    return value.isoformat().replace("+00:00", "Z")
++
++
++def serialize_prompt(prompt: LLMPrompt, *, include_internal: bool = False) -> dict[str, Any]:
++    first_version_created_at = getattr(prompt, "first_version_created_at", prompt.created_at) or prompt.created_at
++    if isinstance(first_version_created_at, datetime):
++        first_version_created_at = _serialize_timestamp(first_version_created_at)
++
++    first_version_id = getattr(prompt, "first_version_id", None)
++    serialized_first_version_id = str(first_version_id) if first_version_id is not None else None
++    if serialized_first_version_id is None and prompt.version == 1:
++        serialized_first_version_id = str(prompt.id)
++
++    serialized_prompt = {
++        "id": str(prompt.id),
++        "name": prompt.name,
++        "prompt": prompt.prompt,
++        "version": prompt.version,
++        "created_at": _serialize_timestamp(prompt.created_at),
++        "updated_at": _serialize_timestamp(prompt.updated_at),
++        "deleted": prompt.deleted,
++        "is_latest": bool(getattr(prompt, "is_latest", False)),
++        "latest_version": int(getattr(prompt, "latest_version", prompt.version)),
++        "version_count": int(getattr(prompt, "version_count", 1)),
++        "first_version_created_at": first_version_created_at,
++    }
++    if include_internal and serialized_first_version_id is not None:
++        serialized_prompt[INTERNAL_FIRST_VERSION_ID_KEY] = serialized_first_version_id
++    return serialized_prompt
++
++
++def serialize_prompt_version(prompt: LLMPrompt, *, include_internal: bool = False) -> dict[str, Any]:
++    serialized_prompt = {
++        "id": str(prompt.id),
++        "name": prompt.name,
++        "prompt": prompt.prompt,
++        "version": prompt.version,
++        "created_at": _serialize_timestamp(prompt.created_at),
++        "updated_at": _serialize_timestamp(prompt.updated_at),
++        "deleted": prompt.deleted,
++    }
++    if include_internal:
++        first_version_id = getattr(prompt, "first_version_id", None)
++        if first_version_id is not None:
++            serialized_prompt[INTERNAL_FIRST_VERSION_ID_KEY] = str(first_version_id)
++        elif prompt.version == 1:
++            serialized_prompt[INTERNAL_FIRST_VERSION_ID_KEY] = str(prompt.id)
++    return serialized_prompt
++
++
++def merge_prompt_version_history_metadata(
++    prompt_version: dict[str, Any], latest_prompt: dict[str, Any]
++) -> dict[str, Any]:
++    merged_prompt = {
++        **prompt_version,
++        "deleted": False,
++        "is_latest": prompt_version["version"] == latest_prompt["latest_version"],
++        "latest_version": latest_prompt["latest_version"],
++        "version_count": latest_prompt["version_count"],
++        "first_version_created_at": latest_prompt["first_version_created_at"],
++    }
++    generation_marker = latest_prompt.get(INTERNAL_FIRST_VERSION_ID_KEY)
++    if isinstance(generation_marker, str):
++        merged_prompt[INTERNAL_FIRST_VERSION_ID_KEY] = generation_marker
++    return merged_prompt
++
++
++def strip_internal_metadata(prompt: dict[str, Any]) -> dict[str, Any]:
++    public_prompt = dict(prompt)
++    public_prompt.pop(INTERNAL_FIRST_VERSION_ID_KEY, None)
++    return public_prompt
++
++
++def is_stale_exact_version_entry(exact_prompt: dict[str, Any], latest_prompt: dict[str, Any]) -> bool:
++    exact_first_version_id = exact_prompt.get(INTERNAL_FIRST_VERSION_ID_KEY)
++    latest_first_version_id = latest_prompt.get(INTERNAL_FIRST_VERSION_ID_KEY)
++    if not isinstance(exact_first_version_id, str) or not isinstance(latest_first_version_id, str):
++        return True
++    return exact_first_version_id != latest_first_version_id
+diff --git a/posthog/storage/test/test_llm_prompt_cache.py b/posthog/storage/test/test_llm_prompt_cache.py
+index 5ee0a217cb0..584c6a55e5a 100644
+--- a/posthog/storage/test/test_llm_prompt_cache.py
++++ b/posthog/storage/test/test_llm_prompt_cache.py
+@@ -1,162 +1,282 @@
++from datetime import UTC, datetime, timedelta
++
+ from posthog.test.base import BaseTest
+ from unittest.mock import patch
+ 
+-from posthog.api.llm_prompt import LLMPromptSerializer
++from django.utils import timezone
++
+ from posthog.models.llm_prompt import LLMPrompt
+ from posthog.storage.llm_prompt_cache import (
+     _serialize_prompt,
+     get_prompt_by_name_from_cache,
+-    invalidate_team_prompt_cache,
++    invalidate_prompt_latest_cache,
++    invalidate_prompt_name_caches,
++    invalidate_prompt_version_cache,
+     llm_prompts_hypercache,
+ )
++from posthog.storage.llm_prompt_cache_keys import prompt_latest_cache_key
+ 
+ 
+ class TestLLMPromptCache(BaseTest):
++    version_cache_names = ["cached-prompt", "existing-prompt", "new-prompt", "reused-prompt", "serializer-shape"]
++
+     def setUp(self):
+         super().setUp()
+-        llm_prompts_hypercache.clear_cache(self.team)
++        self._clear_known_latest_cache_keys()
++        self._clear_known_version_cache_keys()
+ 
+     def tearDown(self):
+-        llm_prompts_hypercache.clear_cache(self.team)
++        self._clear_known_latest_cache_keys()
++        self._clear_known_version_cache_keys()
+         super().tearDown()
+ 
+-    def test_get_prompt_by_name_from_cache_returns_serialized_prompt(self):
+-        prompt = LLMPrompt.objects.create(
++    def create_prompt_version(
++        self,
++        *,
++        name: str = "cached-prompt",
++        prompt: str = "Prompt content",
++        version: int = 1,
++        is_latest: bool = True,
++        deleted: bool = False,
++    ) -> LLMPrompt:
++        return LLMPrompt.objects.create(
+             team=self.team,
+-            name="cached-prompt",
+-            prompt="You are a helpful assistant.",
++            name=name,
++            prompt=prompt,
++            version=version,
++            is_latest=is_latest,
++            deleted=deleted,
+             created_by=self.user,
+         )
+ 
++    def clear_version_cache(self, prompt_name: str, version: int) -> None:
++        invalidate_prompt_version_cache(self.team.id, prompt_name, version)
++
++    def _clear_known_version_cache_keys(self) -> None:
++        for prompt_name in self.version_cache_names:
++            for version in range(1, 4):
++                invalidate_prompt_version_cache(self.team.id, prompt_name, version)
++
++    def _clear_known_latest_cache_keys(self) -> None:
++        for prompt_name in self.version_cache_names:
++            invalidate_prompt_latest_cache(self.team.id, prompt_name)
++
++    def test_get_prompt_by_name_from_cache_returns_latest_prompt_with_version_history_metadata(self):
++        first_version = self.create_prompt_version(name="cached-prompt", version=1, is_latest=False, prompt="v1")
++        latest_version = self.create_prompt_version(name="cached-prompt", version=2, is_latest=True, prompt="v2")
++
+         cached_prompt = get_prompt_by_name_from_cache(self.team, "cached-prompt")
+ 
+-        self.assertIsNotNone(cached_prompt)
+         assert cached_prompt is not None
+-        self.assertEqual(cached_prompt["id"], str(prompt.id))
+-        self.assertEqual(cached_prompt["name"], prompt.name)
+-        self.assertEqual(cached_prompt["prompt"], prompt.prompt)
+-        self.assertEqual(cached_prompt["version"], prompt.version)
+-        self.assertEqual(cached_prompt["deleted"], prompt.deleted)
+-        self.assertNotIn("created_by", cached_prompt)
+-
+-    def test_serialize_prompt_matches_api_serializer_keys_except_created_by(self):
+-        prompt = LLMPrompt.objects.create(
+-            team=self.team,
+-            name="serializer-shape",
+-            prompt="Prompt content",
+-            created_by=self.user,
++        self.assertEqual(cached_prompt["id"], str(latest_version.id))
++        self.assertEqual(cached_prompt["version"], 2)
++        self.assertEqual(cached_prompt["latest_version"], 2)
++        self.assertEqual(cached_prompt["version_count"], 2)
++        self.assertEqual(
++            cached_prompt["first_version_created_at"], first_version.created_at.isoformat().replace("+00:00", "Z")
+         )
++        self.assertTrue(cached_prompt["is_latest"])
+ 
+-        serialized_prompt = _serialize_prompt(prompt)
+-        serializer_keys = set(LLMPromptSerializer(prompt).data.keys())
+-        expected_keys = serializer_keys - {"created_by"}
++    def test_get_prompt_by_name_from_cache_returns_historical_prompt_with_latest_metadata(self):
++        historical = self.create_prompt_version(name="cached-prompt", version=1, is_latest=False, prompt="v1")
++        self.create_prompt_version(name="cached-prompt", version=2, is_latest=True, prompt="v2")
+ 
+-        self.assertEqual(set(serialized_prompt.keys()), expected_keys)
++        cached_prompt = get_prompt_by_name_from_cache(self.team, "cached-prompt", version=1)
+ 
+-    def test_get_prompt_by_name_from_cache_returns_none_for_missing_prompt_name(self):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="existing-prompt",
+-            prompt="Prompt content",
+-            created_by=self.user,
+-        )
++        assert cached_prompt is not None
++        self.assertEqual(cached_prompt["id"], str(historical.id))
++        self.assertEqual(cached_prompt["version"], 1)
++        self.assertEqual(cached_prompt["latest_version"], 2)
++        self.assertEqual(cached_prompt["version_count"], 2)
++        self.assertFalse(cached_prompt["is_latest"])
+ 
+-        cached_prompt = get_prompt_by_name_from_cache(self.team, "missing-prompt")
++    def test_first_version_created_at_follows_version_one_not_oldest_timestamp(self):
++        version_one = self.create_prompt_version(name="cached-prompt", version=1, is_latest=False, prompt="v1")
++        version_two = self.create_prompt_version(name="cached-prompt", version=2, is_latest=True, prompt="v2")
+ 
+-        self.assertIsNone(cached_prompt)
++        LLMPrompt.objects.filter(pk=version_one.pk).update(created_at=timezone.now())
++        LLMPrompt.objects.filter(pk=version_two.pk).update(created_at=timezone.now() - timedelta(days=1))
+ 
+-    def test_get_prompt_by_name_from_cache_hits_loader_once_when_cache_is_warm(self):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="cached-prompt",
+-            prompt="Prompt content",
+-            created_by=self.user,
++        version_one.refresh_from_db()
++        cached_prompt = get_prompt_by_name_from_cache(self.team, "cached-prompt")
++
++        assert cached_prompt is not None
++        self.assertEqual(
++            cached_prompt["first_version_created_at"], version_one.created_at.isoformat().replace("+00:00", "Z")
+         )
+ 
++    def test_serialize_prompt_matches_expected_cache_shape(self):
++        prompt = self.create_prompt_version(name="serializer-shape")
++
++        serialized_prompt = _serialize_prompt(prompt)
++        self.assertEqual(
++            set(serialized_prompt.keys()),
++            {
++                "id",
++                "name",
++                "prompt",
++                "version",
++                "created_at",
++                "updated_at",
++                "deleted",
++                "is_latest",
++                "latest_version",
++                "version_count",
++                "first_version_created_at",
++            },
++        )
++
++    def test_get_prompt_by_name_from_cache_hits_latest_loader_once_when_cache_is_warm(self):
++        self.create_prompt_version(name="cached-prompt", version=1, is_latest=True)
++
+         with patch.object(llm_prompts_hypercache, "load_fn", wraps=llm_prompts_hypercache.load_fn) as mock_load_fn:
+             get_prompt_by_name_from_cache(self.team, "cached-prompt")
+             get_prompt_by_name_from_cache(self.team, "cached-prompt")
+ 
+         self.assertEqual(mock_load_fn.call_count, 1)
+ 
+-    def test_invalidate_team_prompt_cache_forces_loader_on_next_read(self):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="cached-prompt",
+-            prompt="Prompt content",
+-            created_by=self.user,
+-        )
++    def test_get_prompt_by_name_from_cache_hits_version_loader_once_when_historical_cache_is_warm(self):
++        self.create_prompt_version(name="cached-prompt", version=1, is_latest=False, prompt="v1")
++        self.create_prompt_version(name="cached-prompt", version=2, is_latest=True, prompt="v2")
++        get_prompt_by_name_from_cache(self.team, "cached-prompt")
++
++        with patch.object(
++            llm_prompts_hypercache,
++            "load_fn",
++            wraps=llm_prompts_hypercache.load_fn,
++        ) as mock_load_fn:
++            get_prompt_by_name_from_cache(self.team, "cached-prompt", version=1)
++            get_prompt_by_name_from_cache(self.team, "cached-prompt", version=1)
++
++        self.assertEqual(mock_load_fn.call_count, 1)
++
++    def test_invalidate_prompt_latest_cache_forces_latest_loader_on_next_read(self):
++        self.create_prompt_version(name="cached-prompt", version=1, is_latest=True)
+ 
+         with patch.object(llm_prompts_hypercache, "load_fn", wraps=llm_prompts_hypercache.load_fn) as mock_load_fn:
+             get_prompt_by_name_from_cache(self.team, "cached-prompt")
+-            invalidate_team_prompt_cache(self.team.id)
++            invalidate_prompt_latest_cache(self.team.id, "cached-prompt")
+             get_prompt_by_name_from_cache(self.team, "cached-prompt")
+ 
+         self.assertEqual(mock_load_fn.call_count, 2)
+ 
+-    def test_name_miss_falls_back_to_db_when_cached_map_is_stale(self):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="existing-prompt",
+-            prompt="Prompt content",
+-            created_by=self.user,
+-        )
++    def test_invalidate_prompt_version_cache_forces_version_loader_on_next_read(self):
++        self.create_prompt_version(name="cached-prompt", version=1, is_latest=False, prompt="v1")
++        self.create_prompt_version(name="cached-prompt", version=2, is_latest=True, prompt="v2")
++        get_prompt_by_name_from_cache(self.team, "cached-prompt")
++
++        with patch.object(
++            llm_prompts_hypercache,
++            "load_fn",
++            wraps=llm_prompts_hypercache.load_fn,
++        ) as mock_load_fn:
++            get_prompt_by_name_from_cache(self.team, "cached-prompt", version=1)
++            invalidate_prompt_version_cache(self.team.id, "cached-prompt", 1)
++            get_prompt_by_name_from_cache(self.team, "cached-prompt", version=1)
++
++        self.assertEqual(mock_load_fn.call_count, 2)
++
++    def test_name_miss_falls_back_to_db_when_latest_prompt_cache_entry_is_stale(self):
++        self.create_prompt_version(name="existing-prompt", version=1, is_latest=True)
+         get_prompt_by_name_from_cache(self.team, "existing-prompt")
+ 
+         with patch("posthog.models.llm_prompt.transaction.on_commit", side_effect=lambda callback: None):
+-            LLMPrompt.objects.create(
+-                team=self.team,
+-                name="new-prompt",
+-                prompt="New prompt content",
+-                created_by=self.user,
+-            )
++            self.create_prompt_version(name="new-prompt", version=1, is_latest=True)
+ 
+-        with patch("posthog.storage.llm_prompt_cache.invalidate_team_prompt_cache") as mock_invalidate:
+-            cached_prompt = get_prompt_by_name_from_cache(self.team, "new-prompt")
++        cached_prompt = get_prompt_by_name_from_cache(self.team, "new-prompt")
+ 
+-        self.assertIsNotNone(cached_prompt)
+         assert cached_prompt is not None
+         self.assertEqual(cached_prompt["name"], "new-prompt")
+-        self.assertEqual(cached_prompt["prompt"], "New prompt content")
+-        mock_invalidate.assert_called_with(self.team.id)
++        self.assertEqual(cached_prompt["version"], 1)
+ 
+-    def test_name_miss_fallback_still_returns_prompt_when_invalidation_fails(self):
+-        LLMPrompt.objects.create(
+-            team=self.team,
+-            name="existing-prompt",
+-            prompt="Prompt content",
+-            created_by=self.user,
++    def test_archive_invalidation_clears_sparse_version_cache_for_reused_name(self):
++        old_v1 = self.create_prompt_version(name="reused-prompt", version=1, is_latest=False, prompt="old-v1")
++        self.create_prompt_version(name="reused-prompt", version=2, is_latest=True, prompt="old-v2")
++        first_cached = get_prompt_by_name_from_cache(self.team, "reused-prompt", version=1)
++        assert first_cached is not None
++        self.assertEqual(first_cached["id"], str(old_v1.id))
++
++        invalidate_prompt_name_caches(self.team.id, "reused-prompt", [1, 2])
++        LLMPrompt.objects.filter(team=self.team, name="reused-prompt", deleted=False).update(
++            deleted=True,
++            is_latest=False,
+         )
+-        get_prompt_by_name_from_cache(self.team, "existing-prompt")
++
++        new_v1 = self.create_prompt_version(name="reused-prompt", version=1, is_latest=True, prompt="new-v1")
++        second_cached = get_prompt_by_name_from_cache(self.team, "reused-prompt", version=1)
++
++        assert second_cached is not None
++        self.assertEqual(second_cached["id"], str(new_v1.id))
++        self.assertNotEqual(second_cached["id"], str(old_v1.id))
++
++    def test_stale_exact_version_cache_entry_is_detected_using_first_version_id(self):
++        old_v1 = self.create_prompt_version(name="reused-prompt", version=1, is_latest=True, prompt="old-v1")
++        cached_old = get_prompt_by_name_from_cache(self.team, "reused-prompt", version=1)
++        assert cached_old is not None
++        self.assertEqual(cached_old["id"], str(old_v1.id))
+ 
+         with patch("posthog.models.llm_prompt.transaction.on_commit", side_effect=lambda callback: None):
+-            LLMPrompt.objects.create(
+-                team=self.team,
+-                name="new-prompt",
+-                prompt="New prompt content",
+-                created_by=self.user,
++            LLMPrompt.objects.filter(team=self.team, name="reused-prompt", deleted=False).update(
++                deleted=True, is_latest=False
+             )
++            new_v1 = self.create_prompt_version(name="reused-prompt", version=1, is_latest=True, prompt="new-v1")
+ 
+-        with (
+-            patch(
+-                "posthog.storage.llm_prompt_cache.invalidate_team_prompt_cache",
+-                side_effect=Exception("cache clear failed"),
+-            ),
+-            patch("posthog.storage.llm_prompt_cache.capture_exception") as mock_capture_exception,
+-        ):
+-            cached_prompt = get_prompt_by_name_from_cache(self.team, "new-prompt")
++        invalidate_prompt_latest_cache(self.team.id, "reused-prompt")
++        refreshed = get_prompt_by_name_from_cache(self.team, "reused-prompt", version=1)
+ 
+-        self.assertIsNotNone(cached_prompt)
+-        assert cached_prompt is not None
+-        self.assertEqual(cached_prompt["name"], "new-prompt")
+-        mock_capture_exception.assert_called_once()
++        assert refreshed is not None
++        self.assertEqual(refreshed["id"], str(new_v1.id))
++        self.assertNotEqual(refreshed["id"], str(old_v1.id))
++
++    def test_stale_exact_version_cache_entry_uses_first_version_id_generation_marker(self):
++        old_v1 = self.create_prompt_version(name="reused-prompt", version=1, is_latest=True, prompt="old-v1")
++        LLMPrompt.objects.filter(pk=old_v1.pk).update(created_at=datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC))
++
++        cached_old = get_prompt_by_name_from_cache(self.team, "reused-prompt", version=1)
++        assert cached_old is not None
++        self.assertEqual(cached_old["id"], str(old_v1.id))
++
++        with patch("posthog.models.llm_prompt.transaction.on_commit", side_effect=lambda callback: None):
++            LLMPrompt.objects.filter(team=self.team, name="reused-prompt", deleted=False).update(
++                deleted=True,
++                is_latest=False,
++            )
++            new_v1 = self.create_prompt_version(name="reused-prompt", version=1, is_latest=True, prompt="new-v1")
++
++        LLMPrompt.objects.filter(pk=new_v1.pk).update(created_at=datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC))
++        invalidate_prompt_latest_cache(self.team.id, "reused-prompt")
++
++        refreshed = get_prompt_by_name_from_cache(self.team, "reused-prompt", version=1)
++        assert refreshed is not None
++        self.assertEqual(refreshed["id"], str(new_v1.id))
++        self.assertNotEqual(refreshed["id"], str(old_v1.id))
++
++    def test_exact_fetch_refreshes_latest_cache_entry_missing_generation_marker(self):
++        self.create_prompt_version(name="cached-prompt", version=1, is_latest=False, prompt="v1")
++        self.create_prompt_version(name="cached-prompt", version=2, is_latest=True, prompt="v2")
++
++        latest_key = prompt_latest_cache_key(self.team.id, "cached-prompt")
++        latest_entry = llm_prompts_hypercache.get_from_cache(latest_key)
++        assert isinstance(latest_entry, dict)
++
++        stale_latest_entry = dict(latest_entry)
++        stale_latest_entry.pop("_first_version_id", None)
++        llm_prompts_hypercache.set_cache_value(latest_key, stale_latest_entry)
++
++        historical = get_prompt_by_name_from_cache(self.team, "cached-prompt", version=1)
++        assert historical is not None
++
++        refreshed_latest_entry = llm_prompts_hypercache.get_from_cache(latest_key)
++        assert isinstance(refreshed_latest_entry, dict)
++        assert "_first_version_id" in refreshed_latest_entry
+ 
+ 
+ class TestLLMPromptCacheSignals(BaseTest):
+-    def test_model_signal_invalidates_cache_on_commit_with_team_id(self):
++    def test_model_signal_invalidates_latest_and_exact_version_caches_on_commit(self):
+         with (
+             patch("posthog.models.llm_prompt.transaction.on_commit") as mock_on_commit,
+-            patch("posthog.storage.llm_prompt_cache.invalidate_team_prompt_cache") as mock_invalidate,
++            patch("posthog.storage.llm_prompt_cache.invalidate_prompt_latest_cache") as mock_invalidate_latest,
++            patch("posthog.storage.llm_prompt_cache.invalidate_prompt_version_cache") as mock_invalidate_version,
+         ):
+             mock_on_commit.side_effect = lambda callback: callback()
+ 
+@@ -168,4 +288,5 @@ class TestLLMPromptCacheSignals(BaseTest):
+             )
+ 
+         self.assertTrue(mock_on_commit.called)
+-        mock_invalidate.assert_called_with(self.team.id)
++        mock_invalidate_latest.assert_called_with(self.team.id, "signal-prompt")
++        mock_invalidate_version.assert_called_with(self.team.id, "signal-prompt", 1)
+diff --git a/posthog/tasks/__init__.py b/posthog/tasks/__init__.py
+index 01b1d70a9a8..ca98428a2a0 100644
+--- a/posthog/tasks/__init__.py
++++ b/posthog/tasks/__init__.py
+@@ -14,6 +14,7 @@ from . import (
+     hog_flows,
+     hog_functions,
+     integrations,
++    llm_prompt_cache,
+     plugin_server,
+     process_scheduled_changes,
+     remote_config,
+@@ -42,6 +43,7 @@ __all__ = [
+     "hog_flows",
+     "hog_functions",
+     "integrations",
++    "llm_prompt_cache",
+     "plugin_server",
+     "process_scheduled_changes",
+     "remote_config",
+diff --git a/posthog/tasks/llm_prompt_cache.py b/posthog/tasks/llm_prompt_cache.py
+new file mode 100644
+index 00000000000..6f6d0812831
+--- /dev/null
++++ b/posthog/tasks/llm_prompt_cache.py
+@@ -0,0 +1,27 @@
++import logging
++
++from celery import shared_task
++
++from posthog.storage.llm_prompt_cache import invalidate_prompt_version_cache_range
++from posthog.tasks.utils import CeleryQueue
++
++logger = logging.getLogger(__name__)
++
++
++@shared_task(ignore_result=True, queue=CeleryQueue.DEFAULT.value)
++def invalidate_archived_prompt_versions_cache_task(
++    team_id: int, prompt_name: str, start_version: int, end_version: int
++) -> None:
++    try:
++        invalidate_prompt_version_cache_range(team_id, prompt_name, start_version, end_version)
++    except Exception:
++        logger.exception(
++            "Failed to invalidate archived prompt version cache range",
++            extra={
++                "team_id": team_id,
++                "prompt_name": prompt_name,
++                "start_version": start_version,
++                "end_version": end_version,
++            },
++        )
++        raise
+diff --git a/posthog/tasks/test/__snapshots__/test_task_registration.ambr b/posthog/tasks/test/__snapshots__/test_task_registration.ambr
+index 8aba226b6d8..24c4a50a5c6 100644
+--- a/posthog/tasks/test/__snapshots__/test_task_registration.ambr
++++ b/posthog/tasks/test/__snapshots__/test_task_registration.ambr
+@@ -75,6 +75,7 @@
+     'posthog.tasks.integrations.refresh_integrations',
+     'posthog.tasks.llm_analytics_usage_report.capture_llm_analytics_report',
+     'posthog.tasks.llm_analytics_usage_report.send_llm_analytics_usage_reports',
++    'posthog.tasks.llm_prompt_cache.invalidate_archived_prompt_versions_cache_task',
+     'posthog.tasks.plugin_server.fatal_plugin_error',
+     'posthog.tasks.plugin_server.hog_function_state_transition',
+     'posthog.tasks.remote_config.sync_all_remote_configs',
+diff --git a/posthog/test/test_rate_limit.py b/posthog/test/test_rate_limit.py
+index bad8f5ef54c..54f44dbd35b 100644
+--- a/posthog/test/test_rate_limit.py
++++ b/posthog/test/test_rate_limit.py
+@@ -26,6 +26,7 @@ from posthog.rate_limit import (
+     AIResearchSustainedRateThrottle,
+     AISustainedRateThrottle,
+     HogQLQueryThrottle,
++    LLMPromptPublishBurstRateThrottle,
+     get_route_from_path,
+ )
+ 
+@@ -565,6 +566,76 @@ class TestUserAPI(APIBaseTest):
+         self.assertEqual(throttle.scope, "ai_research_sustained")
+         self.assertEqual(throttle.rate, "10/day")
+ 
++    @patch("posthog.rate_limit.team_is_allowed_to_bypass_throttle", return_value=False)
++    @patch(
++        "posthog.rate_limit.get_route_from_path", return_value="/api/environments/TEAM_ID/llm_prompts/name/PROMPT_NAME/"
++    )
++    @patch("posthog.rate_limit.statsd.incr")
++    @patch("posthog.rate_limit.is_rate_limit_enabled", return_value=True)
++    def test_llm_prompt_publish_burst_throttle_limits_web_authenticated_requests(
++        self, rate_limit_enabled_mock, incr_mock, route_mock, bypass_mock
++    ):
++        throttle = LLMPromptPublishBurstRateThrottle()
++        mock_request = Mock()
++        mock_request.user = Mock(is_authenticated=True, pk=self.user.pk)
++        mock_request.path = f"/api/environments/{self.team.pk}/llm_prompts/name/my-prompt/"
++        mock_view = Mock(team_id=self.team.pk)
++
++        with (
++            patch("posthog.rate_limit.PersonalAPIKeyAuthentication.find_key_with_source", return_value=None),
++            patch("rest_framework.throttling.SimpleRateThrottle.allow_request", return_value=False),
++        ):
++            result = throttle.allow_request(mock_request, mock_view)
++
++        self.assertFalse(result)
++        incr_mock.assert_any_call(
++            "rate_limit_exceeded",
++            tags={
++                "team_id": self.team.pk,
++                "scope": "llm_prompt_publish_burst",
++                "rate": "30/minute",
++                "route": "/api/environments/TEAM_ID/llm_prompts/name/PROMPT_NAME/",
++                "hashed_personal_api_key": None,
++            },
++        )
++
++    @patch("posthog.rate_limit.team_is_allowed_to_bypass_throttle", return_value=False)
++    @patch(
++        "posthog.rate_limit.get_route_from_path", return_value="/api/environments/TEAM_ID/llm_prompts/name/PROMPT_NAME/"
++    )
++    @patch("posthog.rate_limit.statsd.incr")
++    @patch("posthog.rate_limit.is_rate_limit_enabled", return_value=True)
++    def test_llm_prompt_publish_burst_throttle_limits_personal_api_key_requests(
++        self, rate_limit_enabled_mock, incr_mock, route_mock, bypass_mock
++    ):
++        throttle = LLMPromptPublishBurstRateThrottle()
++        mock_request = Mock()
++        mock_request.user = Mock(is_authenticated=True, pk=self.user.pk)
++        mock_request.path = f"/api/environments/{self.team.pk}/llm_prompts/name/my-prompt/"
++        mock_view = Mock(team_id=self.team.pk)
++        personal_api_key = "phx_test_personal_api_key"
++
++        with (
++            patch(
++                "posthog.rate_limit.PersonalAPIKeyAuthentication.find_key_with_source",
++                return_value=(personal_api_key, "header"),
++            ),
++            patch("rest_framework.throttling.SimpleRateThrottle.allow_request", return_value=False),
++        ):
++            result = throttle.allow_request(mock_request, mock_view)
++
++        self.assertFalse(result)
++        incr_mock.assert_any_call(
++            "rate_limit_exceeded",
++            tags={
++                "team_id": self.team.pk,
++                "scope": "llm_prompt_publish_burst",
++                "rate": "30/minute",
++                "route": "/api/environments/TEAM_ID/llm_prompts/name/PROMPT_NAME/",
++                "hashed_personal_api_key": hash_key_value(personal_api_key),
++            },
++        )
++
+     def test_local_evaluation_throttle_uses_default_rate_when_no_custom_limit(self):
+         throttle = LocalEvaluationThrottle()
+ 

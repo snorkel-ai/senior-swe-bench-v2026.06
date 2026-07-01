@@ -1,0 +1,175 @@
+version = "1.0"
+
+[environment]
+base_image = "turborepo-fix-prune-missing-sources:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "30G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 900.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "turborepo"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "turborepo"
+
+[metadata]
+family = "turborepo-fix-prune-missing-sources"
+variant = "hard"
+segment = "investigate"
+repo = "turborepo"
+tags = ["turborepo", "rust"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Customers running `turbo prune <app>` to ship a smaller monorepo to
+Docker are reporting that real source directories go missing from the
+pruned `out/` tree. The files are committed and are NOT git-ignored, and
+the app needs them at build time, but they simply don't make it into the
+pruned copy. It only happens for *some* directories — most of the
+workspace copies fine — which makes it look intermittent until you notice
+the pattern. The result is that the pruned output fails to build (or
+behaves incorrectly) because source files the app depends on were
+silently dropped.
+"""
+context = """`turbo prune <scope>` builds the pruned output by copying each in-scope
+workspace directory into `out/`. The copy goes through
+`turborepo_fs::recursive_copy(src, dst, use_gitignore)` in
+`crates/turborepo-fs/src/lib.rs`, which enumerates the source tree with an
+`ignore::WalkBuilder` so that `.gitignore`d files are not copied into the
+pruned output.
+
+The defect: `ignore::WalkBuilder` defaults to `.parents(true)`. With
+parents enabled, the walker ascends ABOVE the copy root and reads
+`.gitignore` files in parent directories, up to the enclosing git root.
+A repo-root `.gitignore` containing a path-anchored entry such as
+`/apps/web/coverage` (intended to ignore one specific coverage output
+directory) then over-matches unrelated nested directories that merely
+share the basename `coverage` — for example a real source folder at
+`apps/web/src/api/coverage`. Those files match the parent ignore rule
+during the copy walk and are dropped from `out/`.
+
+The bug is observable at two pre-existing public interfaces:
+  1. `turbo prune <scope>` — the user-visible CLI symptom (the reference
+     example's own regression test drives this).
+  2. `turborepo_fs::recursive_copy(src, dst, use_gitignore=true)` — the
+     copy helper whose contract ("respect only the `.gitignore` files
+     inside the copied tree") is violated. The bug reproduces directly
+     here: with a `.git` boundary and a root `.gitignore` of
+     `/apps/web/coverage`, copying `apps/web` drops
+     `apps/web/src/api/coverage` while still (correctly) honoring a
+     workspace-local `.gitignore`.
+
+Misdirection / red herrings the agent may chase before finding the one
+relevant flag:
+  - The `.gitignore` pattern *syntax*. The entry `/apps/web/coverage` is a
+    perfectly legitimate anchored pattern; nothing is wrong with how it is
+    written. The problem is WHICH `.gitignore` files are consulted during
+    the copy, not how the pattern matches.
+  - The `ignore` crate's pattern-matching / anchoring logic. The matcher
+    is correct; the inputs handed to it (parent gitignores) are the issue.
+  - The prune command's orchestration in `turborepo-lib` (which workspaces
+    to include, lockfile narrowing). The set of copied directories is
+    correct; the loss happens inside the per-directory copy.
+  - The lockfile pruning (`turborepo-lockfiles`) and the global/task hash
+    (`turborepo-task-hash`). Neither drops source files.
+
+Root cause and fix: add `.parents(false)` to the `WalkBuilder` chain in
+`recursive_copy`, so only `.gitignore` files WITHIN the copied tree
+influence the copy. Critically, gitignore handling must remain ON for
+files inside the tree — the fix must not be "turn `use_gitignore` /
+`git_ignore` off", which would over-correct and start copying genuinely
+ignored files (build artifacts, etc.) into the pruned output.
+
+The shipped image installs the workspace's pinned nightly Rust toolchain
+(nightly-2026-01-16 via `rust-toolchain.toml`), Node.js 22 + corepack,
+`protoc` and `capnp`, `lld` (the configured Linux linker), and pre-warms
+the cargo registry via `cargo fetch`.
+"""
+solution = """Canonical fix (the merged PR, one line):
+
+In `crates/turborepo-fs/src/lib.rs`, inside `recursive_copy`'s
+`src_metadata.is_dir()` branch, add `.parents(false)` to the
+`WalkBuilder` chain:
+
+    let walker = WalkBuilder::new(src.as_path())
+        .hidden(false)
+        .parents(false)            // <-- disables reading parent-dir .gitignores
+        .git_ignore(use_gitignore)
+        .git_global(false)
+        .git_exclude(use_gitignore)
+        ...
+
+This stops the walker from ascending above the copy root to read parent
+`.gitignore` files, so only ignore rules declared within the copied tree
+apply. The single root-anchored `/apps/web/coverage` entry no longer
+over-matches the nested `apps/web/src/api/coverage` source folder.
+
+Equally valid alternative fixes the verifier accepts (it tests behavior,
+not the specific edit):
+  - Any change that makes the copy walk ignore parent-directory
+    `.gitignore` files while still honoring in-tree ones — e.g. building
+    the walker from a temporarily reparented root, or configuring the
+    ignore builder so parent traversal is disabled by a different means.
+  - Implementations with non-English identifiers or reformatted code; the
+    verifier observes only the copied filesystem state.
+
+Wrong / non-optimal fixes the verifier rejects:
+  - Disabling gitignore handling for the copy (passing
+    `use_gitignore=false`, or `.git_ignore(false)` / dropping
+    `.git_exclude`). This "fixes" the symptom by copying everything,
+    including genuinely-ignored files, defeating the purpose of the
+    gitignore-aware copy. The pass-to-pass criterion (a workspace-local
+    `.gitignore` entry must still be respected) fails.
+  - Special-casing the basename `coverage`, or any name-specific
+    allowlist. Does not generalize; other nested dirs sharing a root
+    ignore basename still drop.
+  - Post-hoc re-copying dropped files after the walk. Fragile and still
+    re-applies the wrong ignore set.
+
+Red herrings the agent may chase: gitignore pattern syntax, the `ignore`
+crate's matcher, prune orchestration in `turborepo-lib`, lockfile pruning,
+the global/task hash.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["rust"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "framework-fluency", "logic-fix", "test-execution"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 1
+files = 1
+hunks = 1
+scope = "pinpoint"
+
+[metadata.origin]
+repo = "vercel/turborepo"
+pr_numbers = [12662]
+base_commit = "5983eb56ab87de669aee02c160325a1bb1370a47"
+base_commit_date = "2026-04-29"
+merged_at = "2026-04-29"
+
+
+
+

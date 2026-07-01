@@ -1,0 +1,34 @@
+{
+  "files": [
+    "packages/oauth-provider/src/oauth-endpoint.ts",
+    "packages/oauth-provider/src/oauth.ts",
+    "packages/oauth-provider/src/authorize.ts",
+    "packages/oauth-provider/src/introspect.ts",
+    "packages/oauth-provider/src/revoke.ts",
+    "packages/oauth-provider/src/token.ts",
+    "packages/oauth-provider/src/index.ts"
+  ],
+  "fail_to_pass": [],
+  "pass_to_pass": [
+    {
+      "name": "missing_vs_unsupported_distinguished",
+      "description": "Validation failures are classified by failure CLASS, not just by field, per RFC 6749 §5.2 and §3.1. A missing required parameter yields `invalid_request`; an unsupported value for a constrained enum yields the value-specific code (`unsupported_grant_type` for `/oauth2/token`, `unsupported_response_type` for `/oauth2/authorize`); and a structurally malformed request — wrong type, or a scalar parameter sent more than once — yields `invalid_request` even when that field also has an unsupported-value mapping. A solution that collapses missing-required and unsupported-value into a single code (e.g. a missing `grant_type` returning `unsupported_grant_type`), or that mislabels a duplicated `response_type` as `unsupported_response_type`, is worse: it loses the distinction RFC-compliant clients branch on. The senior-preferred shape keeps these three classes separable at the validation layer rather than hand-rolling per-field checks."
+    },
+    {
+      "name": "open_redirect_guard_on_authorize_errors",
+      "description": "Authorize validation errors are delivered to the relying party only when the requested `client_id` + `redirect_uri` resolve against a registered, ENABLED client. A missing/unknown `client_id`, or a `redirect_uri` the client never registered, must fall back to the server's own error page — never a redirect to the requested (potentially attacker-supplied) URI. A blanket `redirect errors to redirect_uri` fix that skips this resolution check opens an open-redirect hole and is a security regression, even though it would otherwise satisfy the RFC redirect-delivery requirement. The senior-preferred solution gates the redirect target on the trusted, registered URI."
+    },
+    {
+      "name": "response_mode_channel_selection",
+      "description": "The authorize error-redirect channel follows OIDC Core 1.0 §5 / RFC 6749 §4.2.2.1: an implicit or hybrid `response_type` (one containing `token` or `id_token`) delivers the error in the URL FRAGMENT; `code` and ambiguous/duplicated shapes use the query string; and an explicit `response_mode=query` overrides the fragment default. A solution that always uses the query string (or always the fragment) regardless of response type is worse — it can leak error parameters to the wrong channel for implicit clients. The senior-preferred solution derives the channel from the response type and honors an explicit `response_mode`."
+    },
+    {
+      "name": "unsupported_token_type_reserved_for_token_not_hint",
+      "description": "`token_type_hint` on `/oauth2/revoke` and `/oauth2/introspect` is advisory (RFC 7009 §2.2.1, RFC 7662 §2.1): an unrecognized value (e.g. `id_token`) must be IGNORED — the server falls back to searching across the token types it supports and the request still succeeds — rather than rejected. The `unsupported_token_type` error code is reserved for the token TYPE being unsupported, not for an unrecognized hint. A solution that keeps a strict enum on `token_type_hint` and rejects unknown values (or returns `unsupported_token_type` for the hint) is worse. The senior-preferred solution treats the hint as optional advice at BOTH endpoints."
+    },
+    {
+      "name": "all_error_emitting_endpoints_migrated",
+      "description": "The RFC `{ error, error_description }` envelope is returned consistently across ALL six error-emitting OAuth/OIDC endpoints — `/oauth2/token`, `/oauth2/authorize`, `/oauth2/revoke`, `/oauth2/introspect`, `/oauth2/register` (with RFC 7591 codes), and `/oauth2/end-session` — not just `/oauth2/token`. A partial migration that fixes the token endpoint while leaving the others emitting Better Auth's generic `VALIDATION_ERROR` envelope is worse: compliant clients still cannot classify failures from the un-migrated endpoints. The senior-preferred solution centralizes or consistently applies the envelope so the whole surface is RFC-compliant, including the per-endpoint default code differences (`invalid_client_metadata` for DCR vs `invalid_request` for the token family)."
+    }
+  ]
+}

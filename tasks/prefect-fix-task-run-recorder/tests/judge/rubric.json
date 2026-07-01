@@ -1,0 +1,16 @@
+{
+  "files": [
+    "src/prefect/server/services/task_run_recorder.py"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "reconciles_both_constraints",
+      "description": "The fix reconciles BOTH of the task_run table's uniqueness constraints when recording client-emitted task-run events — the primary key `id` AND the natural key `(flow_run_id, task_key, dynamic_key)` — rather than only resolving `id` conflicts. Concretely, the recorder must handle events that map to the same logical task run via the natural key even when they carry different ids (e.g. by coalescing/deduplicating events on the natural key when a flow_run_id is present, and/or selecting the upsert conflict target dynamically so a natural-key collision updates the existing row instead of raising). A change that addresses only one constraint — merely switching dedup from id to natural key, or only catching the IntegrityError — leaves one collision mode open and does NOT satisfy this criterion."
+    },
+    {
+      "name": "genuine_reconciliation_not_drop",
+      "description": "Conflicting events are genuinely reconciled into a single surviving task run that carries the LATEST state (by state timestamp), and the task-run state-history rows are attributed to that surviving canonical task-run id — not silently dropped, not left stuck at a stale state. The mechanism is implementation-agnostic: union-find/transitive coalescing, latest-wins grouping per natural key, dynamic conflict-target selection, or optimistic-upsert-then-retry-against-the-natural-key all qualify, and id-based behavior is preserved for task runs without a flow_run_id. Non-fixes that do NOT qualify: swallowing the IntegrityError with try/except and discarding the event, adding sleeps/jitter or extra retries at the consumer/flush layer, or deduplicating events upstream of the recorder."
+    }
+  ],
+  "pass_to_pass": []
+}

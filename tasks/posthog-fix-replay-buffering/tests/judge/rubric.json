@@ -1,0 +1,16 @@
+{
+  "files": [
+    "common/replay-shared/src/snapshot-store/SnapshotStore.ts",
+    "frontend/src/scenes/session-recordings/player/snapshotDataLogic.tsx",
+    "frontend/src/scenes/session-recordings/player/snapshot-store/LoadingScheduler.ts",
+    "frontend/src/scenes/session-recordings/player/sessionRecordingPlayerLogic.ts",
+    "frontend/src/scenes/session-recordings/player/utils/segment-kind-conversion.ts"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "documents_reactivity_boundary",
+      "description": "The fix surfaces the reactivity boundary contract — that the SnapshotStore and LoadingScheduler instances live outside Kea, and therefore any selector reading their state must be invalidated explicitly when those instances mutate (whether on data mutations or on pure scheduler-mode transitions). The diff records this contract through some form of in-code documentation (top-of-file comment, doc comment on the invalidation action, or inline comment near the affected selector dependency declaration) so a future engineer adding a new scheduler-reading selector discovers the contract before reintroducing the bug. Accepts any wording or location that conveys the contract; rejects diffs that leave the contract undocumented."
+    }
+  ],
+  "pass_to_pass": []
+}

@@ -1,0 +1,24 @@
+{
+  "files": [
+    "src/harbor/trial/trial.py"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "artifact_exclude_quoting",
+      "description": "Directory-artifact `exclude` patterns are applied so excluded paths do not appear in the collected artifacts, and the mechanism is safe against shell metacharacters in the source path / exclude patterns (no shell injection). Accept any implementation that achieves both the filtering and the injection-safety (an in-container archive with excludes, a download-then-filter pass, or equivalent); do not require a specific tool, flag spelling, or quoting helper."
+    },
+    {
+      "name": "step_healthcheck",
+      "description": "A per-step healthcheck, when configured, runs after the step's setup and before the step's agent, and a healthcheck failure aborts that step (records an exception and runs no agent for it) rather than crashing the whole trial. Accept any implementation that achieves this ordering and failure handling; do not require a specific healthcheck call signature or control-flow shape."
+    },
+    {
+      "name": "step_workdir_setup",
+      "description": "A step's `workdir/` files are uploaded into the container WORKDIR before the agent runs, the step's `workdir/setup.sh` (if present) is executed from WORKDIR, and a non-zero setup exit aborts the step. Accept any implementation that achieves this upload + run-from-WORKDIR + non-zero-exit-aborts behavior; do not require a specific upload/exec call shape."
+    },
+    {
+      "name": "malformed_step_rejected",
+      "description": "A multi-step task that declares a step whose on-disk layout is incomplete — e.g. a declared step that is missing its instruction (or its tests) — is rejected with a clear error rather than silently running a malformed/empty step. Award full credit for any implementation that surfaces an error for the incomplete step; accept rejection either eagerly (when the task/config is constructed/validated) or at run time, and accept any error type and any step-instruction storage shape (an on-disk `steps/{name}/instruction.md`, an inline instruction in the step config, or another scheme). Deduct only if a declared-but-incomplete step is run anyway with no error surfaced."
+    }
+  ],
+  "pass_to_pass": []
+}

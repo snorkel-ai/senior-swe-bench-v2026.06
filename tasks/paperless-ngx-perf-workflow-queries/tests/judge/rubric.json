@@ -1,0 +1,26 @@
+{
+  "files": [
+    "src/documents/views.py",
+    "src/documents/serialisers.py"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "list_endpoint_avoids_nested_m2m_nplus1",
+      "description": "The workflow list query plan (WorkflowViewSet.get_queryset, or wherever the list queryset is assembled) prefetches the nested ManyToMany relations hanging off triggers and actions — e.g. via Prefetch objects whose inner querysets prefetch_related the filter_*/assign_*/remove_* fields, or via double-underscore prefetch spans like 'triggers__filter_has_tags' / 'actions__assign_tags', or any equivalent. It does NOT rely on the bare prefetch_related('triggers', 'actions') that prefetches only the two reverse relations and leaves every nested M2M field to be lazy-loaded per record (the N+1 the PR eliminates)."
+    },
+    {
+      "name": "prune_uses_bulk_aggregation_not_per_object_loop",
+      "description": "The save-time cleanup of orphaned (unattached) triggers and actions uses a set-based aggregate-and-delete — e.g. WorkflowTrigger.objects.annotate(Count('workflows')).filter(...=0).delete() and the analogous statement for actions, or an equivalent Exists/subquery-based bulk delete — rather than a Python loop that fetches every trigger/action and issues a .workflows.count() query per object before deleting orphans one at a time."
+    },
+    {
+      "name": "action_ordering_preserved_after_optimization",
+      "description": "Actions are still returned ordered by their 'order' field after the optimization. Because WorkflowAction has no model-level Meta.ordering, the previous per-record re-ordering (the to_representation override) cannot simply be removed without re-establishing the order elsewhere. An acceptable solution guarantees ordering by some explicit means — an order_by('order', ...) baked into the action prefetch queryset, a Meta.ordering added to WorkflowAction, an in-memory sort of the prefetched actions, or a retained ordering step — rather than leaving actions in undefined database order."
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "query_plan_only_no_behavior_change",
+      "description": "The change is a query-plan optimization only. The API response produced by GET /api/workflows/ is unchanged in shape and values for any given data: every workflow still carries the same triggers and actions with the same nested fields and the same identifiers. No serialized field is added, removed, or altered, and no permission/authentication behavior changes — only the number and shape of the SQL queries differs."
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "files": [
+    "packages/elixir-client/lib/electric/client/application.ex",
+    "packages/elixir-client/lib/electric/client/poll.ex",
+    "packages/elixir-client/lib/electric/client/shape_state.ex",
+    "packages/elixir-client/lib/electric/client/stream.ex",
+    "packages/elixir-client/lib/electric/client/expired_shapes_cache.ex",
+    "packages/elixir-client/lib/electric/client/shape_key.ex"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "bounded_retry_with_clear_error_on_persistent_stale_cdn",
+      "description": "When the client detects that an intermediate cache is persistently serving a stale shape response despite cache-busting attempts, it gives up after a small bounded number of retry attempts (typically 3 to 10) and raises an Electric.Client.Error (or returns a Client.Error in the stream when errors: :stream is configured) whose message clearly indicates stale cached responses or CDN misbehavior so operators can distinguish the misconfiguration from a normal protocol error. The exact retry count and storage location for the retry counter vary between valid implementations; what matters is that the worst-case behavior is bounded and the terminal error message is operator-facing rather than the client silently looping indefinitely."
+    },
+    {
+      "name": "cache_buster_param_on_stale_retry",
+      "description": "When the client detects a stale cached response (a 200 response whose handle matches a handle previously expired by a must-refetch) and has no valid local handle to fall back to, the retry request includes a `cache-buster` query parameter (an equivalent random-per-retry parameter is acceptable, but the contract name `cache-buster` is what the production CDN configuration recognises and matches the TypeScript client's CACHE_BUSTER_QUERY_PARAM). Without a varying parameter the request URL is identical to the previous one and any intermediate cache that keys on URL replays the same stale response indefinitely."
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "expired_handle_tracking_is_bounded",
+      "description": "The mechanism that tracks expired shape handles has an explicit upper bound on the number of tracked entries — LRU eviction with a max-entries constant, time-based expiry, fixed-size ring buffer, or equivalent. The bound's exact value and eviction policy vary between valid implementations; what matters is that a long-running BEAM node observing many shape rotations cannot grow the tracking structure without limit and leak memory proportional to lifetime traffic."
+    }
+  ]
+}

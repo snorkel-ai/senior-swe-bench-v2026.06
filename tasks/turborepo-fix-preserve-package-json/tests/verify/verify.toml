@@ -1,0 +1,13 @@
+# The `turbo` binary that the test invokes via `assert_cmd::cargo::cargo_bin`
+# is built by the verifier's own `cargo test` invocation (the test target lives
+# in the same crate as the binary). tests/test-setup.sh additionally pre-warms
+# the build via `cargo build -p turbo` beforehand.
+[rust]
+crate = "crates/turborepo"
+# Generous timeout: the verifier runs three integration tests, each of
+# which spawns corepack (downloads pnpm 7.25.1 if not pre-warmed),
+# rewrites the fixture, runs `turbo prune` (~5-15s per invocation),
+# then parses the output. Cold first run pays the cost of compiling
+# the new test binary even on a warm workspace target/. 1500s leaves
+# margin for slow CI hosts.
+timeout = 1500

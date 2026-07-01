@@ -1,0 +1,180 @@
+version = "1.0"
+
+[environment]
+base_image = "harbor-add-multi-step-tasks:latest"
+build_timeout_sec = 1200.0
+cpus = 2
+memory = "4G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1800.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "harbor"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 14400.0
+
+[solution.env]
+REPO_NAME = "harbor"
+
+[metadata]
+family = "harbor-add-multi-step-tasks"
+variant = "hard"
+segment = "design"
+repo = "harbor"
+tags = ["harbor", "python-lib"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """harbor evaluates an agent by running exactly one agent turn followed by
+one verification per trial. We want to support *multi-step* tasks: a task
+that drives an agent through an ordered sequence of steps inside one
+persistent environment, verifying after each step, and deriving the
+trial's overall reward from the per-step results. Each step can carry its
+own instruction, its own tests, and its own agent/verifier configuration
+overriding the task-level defaults; the per-step outputs must be kept
+isolated from one another; and existing single-step tasks must keep
+behaving exactly as before.
+"""
+context = """The change is confined to harbor's core trial-execution engine and the
+task/trial data models. The relevant moving parts, all pre-existing in the
+codebase before this task:
+
+- `Trial.create(config)` + `await trial.run() -> TrialResult`
+  (`src/harbor/trial/trial.py`): the single-shot runner. Today it uploads
+  the task workdir, runs the agent once, runs the verifier once, collects
+  artifacts, and returns a `TrialResult`. This is the surface that grows a
+  multi-step branch.
+- `TaskConfig` (`src/harbor/models/task/config.py`): the parsed task.toml,
+  via the pre-existing public `TaskConfig.model_validate_toml(text)`. It
+  carries `[agent]` and `[verifier]` sub-configs. This is where the
+  `[[steps]]` array, the `multi_step_reward_strategy`, and a top-level
+  `artifacts` list are added.
+- `Task` / `TaskPaths` (`src/harbor/models/task/{task,paths}.py`): wrap a
+  task directory; expose the task instruction and validate that the
+  on-disk layout matches the config. These gain a notion of "configured
+  steps" (each step at `steps/{name}/` with its own `instruction.md` and
+  `tests/test.sh`), and the top-level instruction becomes optional when
+  steps are present.
+- `TrialResult` (`src/harbor/models/trial/result.py`) and `TrialPaths`
+  (`src/harbor/models/trial/paths.py`): the result object and the on-disk
+  trial layout (`agent/`, `verifier/`, `artifacts/`). These gain ordered
+  per-step results and a `steps/{name}/...` sub-layout.
+- `Verifier` (`src/harbor/verifier/verifier.py`) and `BaseEnvironment`
+  (`src/harbor/environments/base.py`): the verifier uploads the tests dir
+  and runs test.sh as a configured user; the environment runs an optional
+  healthcheck. Both gain small affordances so a step can reuse the same
+  environment without re-uploading shared tests and can override the
+  verifier user / healthcheck per step.
+
+The new top-level interface IS the contract: the task.toml `[[steps]]`
+schema, the `multi_step_reward_strategy` semantics, the ordered
+`TrialResult.step_results`, and the `steps/{name}/{agent,verifier,artifacts}/`
+output layout are the observable behavior. The single-step path is a
+fixed pre-existing contract that must not regress.
+"""
+solution = """Canonical approach (reference example): branch `Trial.run()` on whether the
+task declares steps. When it does, run a dedicated multi-step path that
+iterates the ordered steps inside the one already-started environment,
+and otherwise fall through to the existing single-step path unchanged.
+
+For each step, in order:
+- Resolve the step's effective agent/verifier config by overlaying the
+  step-level config on the task-level defaults (e.g. agent user and
+  timeout fall back to the task-level values when the step omits them).
+- Upload the step's `workdir/` into the container WORKDIR and, if present,
+  run its `workdir/setup.sh` from WORKDIR; a non-zero setup exit aborts
+  the step.
+- If the step declares a healthcheck, run it after setup and before the
+  agent; a healthcheck failure aborts the step (records an exception, no
+  agent run) rather than crashing the trial.
+- Run the agent for the step against the step's instruction.
+- Verify the step. The verifier reuses the already-uploaded shared tests
+  (skip re-upload) and runs test.sh as the step's effective user, merging
+  the step's verifier env over the task-level verifier env.
+- Relocate the step's `agent/`, `verifier/`, and `artifacts/` output out
+  of the trial root and into `steps/{name}/...`, then remove the now-empty
+  trial-root mount dirs (rmdir only — never delete non-empty dirs).
+- Collect per-step artifacts (task-level + trial-level + step-level merged)
+  and write a per-step `artifacts/manifest.json`; in a mounted environment
+  relocate, otherwise download. Directory artifacts honor `exclude`
+  patterns.
+- After each step, decide whether to abort: a step that produced an
+  exception and no verifier result aborts the run; a step whose reward
+  misses its `min_reward` threshold aborts the run.
+
+Finally derive the trial-level reward from the per-step results via the
+`multi_step_reward_strategy`, and clean up any empty trial-root mount
+dirs.
+
+Senior-engineer nuances any strong solution gets right (a naive one
+misses):
+- `mean` strategy: average each reward key across the steps that produced
+  a verifier result; a key absent from a given step counts as 0 for that
+  step; steps that produced no verifier result at all are excluded from
+  the denominator entirely.
+- `final` strategy: the trial reward is the last executed step's verifier
+  result verbatim — even if that is None.
+- `min_reward` gating: a scalar threshold gates the conventional 1-D
+  `reward` key; a dict threshold gates each named key independently; a
+  gated key that is missing, or whose step produced no/None reward, is
+  treated as -inf (i.e. it fails the gate and aborts).
+- Abort vs. continue: only a fatal step (exception AND no verifier result)
+  or a min_reward miss stops the run; a step that merely scored low but
+  produced a result (and has no min_reward, or passes it) continues.
+- Output isolation: per-step outputs land under `steps/{name}/` and the
+  trial root is left without empty `agent/`/`verifier/`/`artifacts/`
+  mount dirs; a multi-step trial writes no trial-root artifacts manifest.
+- Directory-artifact `exclude` filtering must be safe against shell
+  metacharacters in the source path and the exclude patterns (no shell
+  injection).
+- Single-step tasks (no steps) keep their exact current behavior:
+  `step_results` is None, the agent runs once, the trial-root artifacts
+  manifest is written.
+
+Non-optimal solutions that should NOT pass: averaging the mean over all
+steps including verifier-less ones (wrong denominator); treating an absent
+reward key as something other than 0 in the mean; returning a computed
+aggregate for `final` instead of the last step's result verbatim; letting
+a missing gated key pass the min_reward gate; continuing after a fatal
+step; leaving empty mount dirs in the trial root or writing per-step
+outputs into the trial root; regressing the single-step path.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-lib"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "framework-fluency", "interface-design", "data-model-design", "concurrency-reasoning"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 657
+files = 9
+hunks = 32
+scope = "extensive"
+
+[metadata.origin]
+repo = "harbor-framework/harbor"
+pr_numbers = [1234]
+base_commit = "e321c425ccc55ca5082fb7362ef8f58332bf7afc"
+base_commit_date = "2026-04-22"
+merged_at = "2026-04-23"
+
+
+
+

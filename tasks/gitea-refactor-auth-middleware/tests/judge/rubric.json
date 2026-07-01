@@ -1,0 +1,49 @@
+{
+  "files": [
+    "modules/web/handler.go",
+    "modules/web/router.go",
+    "modules/web/router_path.go",
+    "modules/web/routing/context.go",
+    "modules/web/routing/logger_manager.go",
+    "modules/web/routing/requestrecord.go",
+    "routers/api/actions/artifacts.go",
+    "routers/api/packages/api.go",
+    "routers/api/v1/api.go",
+    "routers/common/errpage.go",
+    "routers/common/middleware.go",
+    "routers/init.go",
+    "routers/install/routes.go",
+    "routers/private/internal.go",
+    "routers/web/githttp.go",
+    "routers/web/web.go",
+    "services/auth/auth.go",
+    "services/auth/basic.go",
+    "services/auth/oauth2.go",
+    "services/auth/reverseproxy.go",
+    "services/auth/sspi.go"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "workflow_badge_accepts_basic_auth",
+      "description": "The workflow badge endpoint (/{owner}/{repo}/actions/workflows/{workflow}/badge.svg) on a private repository now returns HTTP 200 with an SVG image when Basic auth credentials are supplied, instead of HTTP 404. The route-level auth marker (AllowBasic or equivalent) must enable Basic auth processing for this endpoint."
+    },
+    {
+      "name": "workflow_badge_accepts_oauth2_token",
+      "description": "The workflow badge endpoint on a private repository now returns HTTP 200 with an SVG image when a Bearer OAuth2 personal access token with repository read scope is supplied, instead of HTTP 404. The route-level auth marker (AllowOAuth2 or equivalent) must enable OAuth2 token processing for this endpoint."
+    },
+    {
+      "name": "auth_middleware_refactored_to_route_level_markers",
+      "description": "The path-based auth detection logic (isGitRawOrAttachPath, isArchivePath, isFeedPath, etc.) is removed and replaced by route-level middleware markers that declare which auth methods each route accepts. The new design allows routes to opt-in to Basic auth, OAuth2, or session-only auth at the router registration site rather than via URL pattern matching in a central middleware."
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "feed_endpoints_preserve_basic_auth",
+      "description": "Repository RSS and Atom feed URLs (.rss, .atom) on private repositories continue to return HTTP 200 for requests authenticated with Basic auth credentials after the refactor. The refactor must not regress feed reader clients that rely on Basic auth."
+    },
+    {
+      "name": "archive_and_raw_endpoints_preserve_basic_auth",
+      "description": "Repository archive downloads (/archive/*.zip, /archive/*.tar.gz) and raw file URLs (/raw/branch/...) on private repositories continue to return HTTP 200 for requests authenticated with Basic auth credentials after the refactor. Build pipelines and curl-based fetch scripts that depend on these endpoints must continue to work."
+    }
+  ]
+}

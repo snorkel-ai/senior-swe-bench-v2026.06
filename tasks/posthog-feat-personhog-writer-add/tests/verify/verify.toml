@@ -1,0 +1,9 @@
+# Verifier runner config for posthog-feat-personhog-writer-add.
+#
+# The single structural test shells out to `cargo check -p personhog-writer`.
+# Even with the image's pre-warmed Cargo dependency graph, compiling the new
+# crate and its (already-fetched) deps can take a couple of minutes, so the
+# pytest-level timeout is set generously above the default 300s. The subprocess
+# inside verify.py uses its own 1400s ceiling; this value must exceed it.
+[pytest]
+timeout = 1500

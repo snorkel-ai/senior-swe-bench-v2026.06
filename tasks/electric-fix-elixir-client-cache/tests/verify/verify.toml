@@ -1,0 +1,23 @@
+# Mix runner configuration.
+#
+# The Elixir runner (src/resources/scripts/runners/elixir.py) discovers
+# verify*_test.exs files in this directory, copies each into
+# {repo_dir}/{app}/test/__verification__/, then runs:
+#
+#   cd packages/elixir-client && \
+#       mix test test/__verification__/verify_test.exs --trace --no-color
+#
+# `app` is the path of the mix project (relative to /repo/electric)
+# whose test/ directory the verifier file is injected into. There is
+# no umbrella, so umbrella_root is empty (defaults to the same directory
+# as `app`).
+#
+# The Dockerfile pre-fetches and pre-compiles `mix deps` plus the
+# project test build, so the verifier launches against a hot
+# `_build/test` cache. With the warm cache the two tests complete in
+# well under a minute.
+
+[mix]
+app = "packages/elixir-client"
+umbrella_root = ""
+timeout = 300

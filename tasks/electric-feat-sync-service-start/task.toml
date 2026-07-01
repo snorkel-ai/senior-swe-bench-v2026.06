@@ -1,0 +1,300 @@
+version = "1.0"
+
+[environment]
+base_image = "electric-feat-sync-service-start:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1800.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "electric"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "electric"
+
+[metadata]
+family = "electric-feat-sync-service-start"
+variant = "hard"
+segment = "design"
+repo = "electric"
+tags = ["electric", "elixir"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Today the sync service's connection manager only stands up its database
+connection pool *after* the replication client has finished acquiring
+its advisory lock. That means anything that needs to talk to Postgres
+during the lock-waiting phase — most notably the lock-breaker that
+recovers abandoned advisory locks, but also the inspector cache and
+shutdown cleanup paths — has to open its own short-lived Postgres
+connection. We want the admin pool available from the moment the
+manager has its connection options, so all of that startup-time
+database work can ride on the existing pool. The (separate) snapshot
+pool that serves bulk shape-snapshot reads should keep its current
+timing — it still belongs after the replication client has finished
+configuring its connection.
+"""
+context = """The sync service in ``packages/sync-service`` is an Elixir/OTP
+application. Its connection lifecycle is owned by
+``Electric.Connection.Manager`` (``lib/electric/connection/manager.ex``),
+a GenServer-as-supervisor that drives a small state machine through
+``handle_continue/2`` callbacks. Today the machine looks roughly:
+
+```
+connection_resolver_ready
+  → {:start_replication_client, nil} → ... → {:start_replication_client, :configuring_connection}
+  → {:start_connection_pool, nil}    → {:start_connection_pool, :connecting}
+  → :start_shapes_supervisor
+  → :streaming
+```
+
+The single ``:start_connection_pool`` step today validates BOTH sets of
+connection options (replication-credentials for the admin pool and
+pooled-credentials for the snapshot pool), then starts BOTH pools
+concurrently after the replication client has already acquired the
+lock. While the replication client is in its ``:acquiring_lock`` /
+``:configuring_connection`` sub-states, no admin pool exists yet.
+
+A separate module — ``Electric.Postgres.LockBreakerConnection``
+(``lib/electric/postgres/lock_breaker_connection.ex``) — exists
+specifically to handle abandoned-lock recovery. When the manager
+detects it has been waiting for the lock too long and the replication
+client's backend pid is known, it spins up a one-shot
+``Postgrex.SimpleConnection`` process, hands it the slot name, and
+asks it to look up backends holding the advisory lock for an
+inactive replication slot and ``pg_terminate_backend`` them. The
+process unlinks itself from the manager so a query failure can't
+crash the manager, and it ``exit(:shutdown)``s after running the
+query once. The SQL itself is a single CTE that joins
+``pg_replication_slots`` (filtering for ``active = false``) with
+``pg_locks`` (matching by ``hashtext(slot_name)``), excludes the
+replication client's own backend pid, and feeds the result into
+``pg_terminate_backend``.
+
+Files involved (all in the ``packages/sync-service`` mix app):
+- ``lib/electric/connection/manager.ex`` — connection manager state
+  machine (the bulk of the change).
+- ``lib/electric/postgres/lock_breaker_connection.ex`` — dedicated
+  ``Postgrex.SimpleConnection`` process for abandoned-lock recovery.
+- ``lib/electric/connection/manager/pool.ex`` — pool wrapper module
+  (unchanged; receives a ``role: :admin | :snapshot`` argument and
+  reports back via ``Electric.Connection.Manager.connection_pool_ready/3``).
+- ``lib/electric/stack_supervisor.ex`` — root supervisor; module doc
+  describes the connection-manager startup sequence and needs to stay
+  consistent with the new sequence.
+
+Key public surfaces that already exist and must keep working:
+- ``Electric.Connection.Manager.admin_pool/1`` and
+  ``Electric.Connection.Manager.snapshot_pool/1`` — both return
+  registered process names (atoms via ``Electric.ProcessRegistry``).
+- ``Electric.Connection.Manager.pool_name/2`` — the underlying
+  generator (takes ``role: :admin | :snapshot``).
+- ``Electric.Connection.Manager.pool_sizes/1`` — splits a total
+  ``pool_size`` into ``%{admin: N, snapshot: M}`` (admin gets up to 4
+  connections, the rest go to snapshot).
+- The ``connection_pool_ready/3`` cast that ``Manager.Pool`` already
+  sends when its connections are all up. Both pool roles use the same
+  cast; the manager must be able to tell them apart.
+- ``Electric.StatusMonitor.mark_connection_pool_ready/3`` and
+  ``mark_connection_pool_as_errored/3`` — both already accept a role.
+
+Privileges and credentials. The admin pool needs to be able to run:
+``ALTER PUBLICATION``, ``DROP PUBLICATION``, ``pg_drop_replication_slot``,
+``pg_terminate_backend``. These require the publication / slot owner,
+which is the *replication user*. The pooled connection user may be
+lower-privilege — for example on Crunchy Bridge, superusers can't
+connect through PgBouncer, so the pooled user is intentionally
+non-super. ``pg_terminate_backend`` even silently returns ``false``
+for cross-role targets instead of erroring out, which would make
+the lock breaker silently fail with the pooled credentials. The
+admin pool must therefore use the replication credentials, not the
+pooled credentials. This is documented in the PR's "Alternatives
+considered" section.
+
+Test infrastructure. The existing
+``packages/sync-service/test/electric/connection/manager_test.exs``
+is the canonical reference for everything under
+``Connection.Manager``. It uses ``Support.ComponentSetup`` (test
+fixture chain via ``with_unique_db``, ``with_stack_id_from_test``,
+``with_status_monitor``, etc.), ``Support.DbSetup`` (per-test unique
+Postgres databases), and stack events via
+``Registry.register(stack_events_registry, {:stack_status, stack_id}, nil)``
+to observe state-machine progression. The slot name comes from
+``with_slot_name`` (a deterministic 16-char hash of the test name).
+There's a ``start_connection_manager(ctx)`` test helper, used
+throughout the file, that wires up the full per-stack supervision
+tree. The ``lock_breaker_guard`` describe block (around line 419)
+shows the canonical pattern for holding the advisory lock externally
+via a ``Task`` running ``DBConnection.run`` + ``pg_advisory_lock``.
+The lock-breaker check is normally on a periodic timer; tests cancel
+the timer and synthesize an immediate ``{:timeout, tref,
+{:check_status, :replication_lock}}`` info message. A
+``wait_for_pg_backend_pid/2`` helper polls ``:sys.get_state/1`` until
+``state.replication_pg_backend_pid`` is set (it's nil until the
+replication client has connected and reported back).
+"""
+solution = """The reference implementation splits the single ``:start_connection_pool``
+step into two symmetric steps and inlines the lock breaker.
+
+1. **Two pool steps with a shared helper.** ``Connection.Manager``
+   gains two new ``handle_continue/2`` clauses:
+
+   - ``:start_admin_pool`` runs FIRST, after ``connection_resolver_ready``,
+     using the replication-credentials connection options. State
+     transitions: ``{:start_admin_pool, nil} →
+     {:start_admin_pool, :connecting} → {:start_replication_client,
+     nil}`` once the admin pool casts back ``:connection_pool_ready``.
+   - ``:start_snapshot_pool`` runs LAST, after the replication client
+     has finished configuring (lock acquired, slot ready), using the
+     pooled-credentials connection options. State transitions:
+     ``{:start_snapshot_pool, nil} → {:start_snapshot_pool, :connecting}
+     → :start_shapes_supervisor`` once the snapshot pool casts back.
+
+   Both steps share a single ``start_single_pool(state, role,
+   conn_opts_fn, conn_type)`` helper that validates the connection
+   options, computes the appropriate pool size and queue tuning
+   (``queue_target: 5_000, queue_interval: 10_000`` only for snapshot,
+   matching the existing tuning), and starts ``Connection.Manager.Pool``.
+
+2. **Distinguish admin vs snapshot in the ready callback.** The single
+   ``handle_cast({:connection_pool_ready, role, pid}, ...)`` clause
+   becomes two: one matching ``role: :admin`` (advances to
+   ``{:start_replication_client, nil}`` and continues to
+   ``:start_replication_client``) and one matching ``role: :snapshot``
+   (advances to ``:start_shapes_supervisor`` and continues to
+   ``:start_shapes_supervisor``). Each one also calls
+   ``mark_connection_succeeded/1`` on the backoff state.
+
+3. **Lock breaker is inlined.** The ``handle_continue(:check_lock_not_abandoned, ...)``
+   clause that today calls ``LockBreakerConnection.start`` +
+   ``LockBreakerConnection.stop_backends_and_close`` becomes a direct
+   ``Postgrex.query/3`` call against the admin pool. A new private
+   ``execute_lock_breaker_query/4`` helper wraps the query in
+   ``case``/``catch`` clauses that log a warning on any failure and
+   continue gracefully. The SQL itself is unchanged — extracted into
+   a ``@doc false`` ``lock_breaker_query/3`` function (or kept inline
+   in a private helper, equivalent behavior).
+
+4. **``LockBreakerConnection`` and its test file are deleted.** The
+   ``Postgrex.SimpleConnection`` behaviour, the ``handle_info`` /
+   ``handle_result`` callbacks, the ``Process.unlink`` dance, and the
+   ``exit(:shutdown)`` are all gone. ``handle_result``'s
+   ``raise %Postgrex.Error{}`` path is replaced by the
+   ``Logger.warning`` in the new helper.
+
+5. **Module doc in ``stack_supervisor.ex``** is updated to reflect the
+   new three-step sequence (admin pool → replication client → snapshot
+   pool) under section 3 of the supervision-tree documentation.
+
+6. **One existing test in ``manager_test.exs``** loses an
+   ``assert_receive {:validate, ^repl_opts}`` line. Reason: in the new
+   flow the replication-credentials options are validated during
+   ``:start_admin_pool`` (which runs BEFORE the test starts watching),
+   and ``ConnectionResolver.validate/2`` caches the validated options
+   so the snapshot pool's later validation doesn't re-emit the message.
+   The pooled-credentials options ARE re-validated during
+   ``:start_snapshot_pool`` and the corresponding assertion stays.
+
+Acceptable alternatives:
+
+- **Different step atoms** (``:setup_admin_pool``,
+  ``:provision_admin_pool``, etc.). Stories observe via
+  ``Connection.Manager.admin_pool/1`` and stack events, not by
+  matching specific step atoms.
+- **Different decomposition of the shared helper**: two separate
+  helpers, one inline `Enum.reduce`, or two separate `handle_continue`
+  clauses with no helper at all. Behavioral observable is identical.
+- **Different lock-breaker plumbing**: keep the SQL as a private
+  function instead of a ``@doc false`` public, or collapse
+  ``execute_lock_breaker_query/4`` into the
+  ``handle_continue(:check_lock_not_abandoned, ...)`` clause.
+- **Different fallback warning text**: any text that conveys
+  "lock breaker query failed" and uses ``Logger.warning`` is fine.
+- **Different pool credential decision** is NOT acceptable: using
+  pooled credentials for the admin pool would silently break
+  ``pg_terminate_backend`` on cross-role targets. The PR explicitly
+  rejects this alternative.
+- **Different lock-breaker strategy** (e.g. keeping a dedicated
+  Postgrex.SimpleConnection process but routing it through the admin
+  pool): this defeats the simplification goal and is rejected by the
+  PR. Per the PR body: "the lock breaker is then simplified to use
+  the admin pool directly, eliminating the dedicated
+  ``LockBreakerConnection`` module". The rubric criterion captures
+  this design intent.
+- **Non-English identifiers / different naming conventions** are
+  fine — verifier and stories test through pre-existing public API
+  (``Connection.Manager.admin_pool/1`` is the existing English name).
+
+What naive implementations get wrong:
+
+- **Using the pooled credentials for the admin pool.** The PR's
+  alternatives section explicitly enumerates this as the rejected
+  option — pooled users can be lower-privilege and ``ALTER
+  PUBLICATION`` / ``pg_terminate_backend`` need the replication user.
+- **Forgetting that the validated-connection-opts cache is keyed by
+  type, not by raw opts.** ``ConnectionResolver.validate/2`` caches
+  by ``:replication`` / ``:pool``, not by the raw keyword list. So a
+  manager that validates ``:replication`` opts during admin-pool
+  startup and then validates them again during snapshot-pool startup
+  will see a cache hit and skip the second resolver call.
+- **Reusing a single ``handle_cast`` for both pool roles.** The new
+  flow advances to different next steps depending on which role
+  reported ready; folding both into one clause and branching on role
+  works but tends to leave dead code paths.
+- **Forgetting the queue tuning for the snapshot pool.**
+  ``queue_target: 5_000`` and ``queue_interval: 10_000`` are tuned for
+  long-running snapshot queries. The admin pool doesn't want them
+  (admin queries are short, failing fast is better).
+- **Forgetting to handle pool startup failures separately.** Today
+  the single pool step has one fallback that retries
+  ``:start_connection_pool``; the new flow has two distinct steps
+  that need separate retry policies in ``should_retry_connection?``.
+- **Letting the lock-breaker query crash the manager.**
+  ``LockBreakerConnection`` previously absorbed errors by being an
+  unlinked one-shot process; an inline ``Postgrex.query/3`` call
+  needs an explicit ``case``/``catch`` to keep the manager alive on
+  query errors.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["elixir"]
+runtime_dependence = "runtime-helpful"
+skills = ["interface-design", "framework-fluency", "architectural-refactoring", "state-management", "concurrency-reasoning", "codebase-exploration", "distributed-systems"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 444
+files = 5
+hunks = 14
+scope = "extensive"
+
+[metadata.origin]
+repo = "electric-sql/electric"
+pr_numbers = [4077]
+base_commit = "b9c67f300da5bd4b869c9f2b107c2f3ddb53b77b"
+base_commit_date = "2026-04-01"
+merged_at = "2026-04-02"
+
+
+
+

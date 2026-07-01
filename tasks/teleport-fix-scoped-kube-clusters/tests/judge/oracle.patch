@@ -1,0 +1,260 @@
+diff --git a/lib/kube/utils/utils.go b/lib/kube/utils/utils.go
+index f28f040c6c1..2fafabee1a7 100644
+--- a/lib/kube/utils/utils.go
++++ b/lib/kube/utils/utils.go
+@@ -159,10 +159,15 @@ func ListKubeClustersWithFilters(ctx context.Context, p client.GetResourcesClien
+ 	return extractAndSortKubeClusters(kss), nil
+ }
+ 
++type kubeClusterKey struct {
++	name  string
++	scope string
++}
++
+ func extractAndSortKubeClusters(kss []types.KubeServer) []types.KubeCluster {
+-	uniqueClusters := make(map[string]types.KubeCluster)
++	uniqueClusters := make(map[kubeClusterKey]types.KubeCluster)
+ 	for _, ks := range kss {
+-		uniqueClusters[ks.GetName()] = ks.GetCluster()
++		uniqueClusters[kubeClusterKey{name: ks.GetName(), scope: ks.GetScope()}] = ks.GetCluster()
+ 	}
+ 	kubeClusters := make([]types.KubeCluster, 0, len(uniqueClusters))
+ 	for _, cluster := range uniqueClusters {
+diff --git a/lib/services/local/presence.go b/lib/services/local/presence.go
+index 2b6d531cb6e..313122dff4d 100644
+--- a/lib/services/local/presence.go
++++ b/lib/services/local/presence.go
+@@ -40,6 +40,7 @@ import (
+ 	"github.com/gravitational/teleport/api/utils/retryutils"
+ 	"github.com/gravitational/teleport/lib/backend"
+ 	"github.com/gravitational/teleport/lib/itertools/stream"
++	scopecache "github.com/gravitational/teleport/lib/scopes/cache"
+ 	"github.com/gravitational/teleport/lib/services"
+ 	"github.com/gravitational/teleport/lib/services/local/generic"
+ 	"github.com/gravitational/teleport/lib/utils"
+@@ -1554,6 +1555,27 @@ func (s *PresenceService) listResources(ctx context.Context, req proto.ListResou
+ 	return &resp, nil
+ }
+ 
++func getFakePaginationKey(ki backend.KeyedItem) string {
++	// TODO(eriktate/scopes): this will need to be reassessed when we implement scoped namespacing
++	if kubeCluster, ok := ki.(types.KubeCluster); ok {
++		if scope := kubeCluster.GetScope(); scope != "" {
++			// It should not be possible for EncodeStringToCursor to fail given that we've already
++			// confirmed the scope is non-empty and "@" is not a valid character for kube cluster
++			// names. However, in the case that it does fail for some reason, we fall back to
++			// backend.GetPaginationKey() since it will still work perfectly fine in lieu of
++			// duplicates cluster names across scope boundaries.
++			if key, err := scopecache.EncodeStringCursor(scopecache.Cursor[string]{
++				Key:   kubeCluster.GetName(),
++				Scope: scope,
++			}); err == nil {
++				return key
++			}
++		}
++	}
++
++	return backend.GetPaginationKey(ki)
++}
++
+ // listResourcesWithSort supports sorting by falling back to retrieving all resources
+ // with GetXXXs, filter, and then fake pagination.
+ func (s *PresenceService) listResourcesWithSort(ctx context.Context, req proto.ListResourcesRequest) (*types.ListResourcesResponse, error) {
+@@ -1775,7 +1797,7 @@ func FakePaginate(resources []types.ResourceWithLabels, req FakePaginateParams)
+ 	// Trim resources that precede start key.
+ 	if req.StartKey != "" {
+ 		for i, resource := range filtered {
+-			if backend.GetPaginationKey(resource) == req.StartKey {
++			if getFakePaginationKey(resource) == req.StartKey {
+ 				pageStart = i
+ 				break
+ 			}
+@@ -1787,7 +1809,7 @@ func FakePaginate(resources []types.ResourceWithLabels, req FakePaginateParams)
+ 	if pageEnd >= len(filtered) {
+ 		pageEnd = len(filtered)
+ 	} else {
+-		nextKey = backend.GetPaginationKey(filtered[pageEnd])
++		nextKey = getFakePaginationKey(filtered[pageEnd])
+ 	}
+ 
+ 	return &types.ListResourcesResponse{
+diff --git a/lib/services/matchers.go b/lib/services/matchers.go
+index 50ad74423cb..179f14650da 100644
+--- a/lib/services/matchers.go
++++ b/lib/services/matchers.go
+@@ -30,6 +30,7 @@ import (
+ 	"github.com/gravitational/teleport/api/types"
+ 	apiutils "github.com/gravitational/teleport/api/utils"
+ 	azureutils "github.com/gravitational/teleport/api/utils/azure"
++	"github.com/gravitational/teleport/lib/scopes"
+ 	libslices "github.com/gravitational/teleport/lib/utils/slices"
+ 	"github.com/gravitational/teleport/lib/utils/typical"
+ )
+@@ -144,7 +145,7 @@ func (r *resourceWithTargetHealth) GetTargetHealthStatus() types.TargetHealthSta
+ // ResourceSeenKey is used as a key for a map that keeps track
+ // of unique resource names and address. Currently "addr"
+ // only applies to resource Application.
+-type ResourceSeenKey struct{ name, kind, addr string }
++type ResourceSeenKey struct{ name, kind, addr, scope string }
+ 
+ // MatchResourcesByFilters filters provided resources with profiled filter.
+ func MatchResourcesByFilters[E types.ResourceWithLabels, S ~[]E](all S, filter MatchResourceFilter) (S, error) {
+@@ -175,11 +176,19 @@ func MatchResourceByFilters(resource types.ResourceWithLabels, filter MatchResou
+ 	var specResource types.ResourceWithLabels
+ 	kind := resource.GetKind()
+ 
++	scope := ""
++	switch res := resource.(type) {
++	case *types.KubernetesClusterV3:
++		scope = res.GetScope()
++	case types.KubeServer:
++		scope = res.GetScope()
++	}
+ 	// We assume when filtering for services like KubeService, AppServer, and DatabaseServer
+ 	// the user is wanting to filter the contained resource ie. KubeClusters, Application, and Database.
+ 	key := ResourceSeenKey{
+-		kind: kind,
+-		name: resource.GetName(),
++		kind:  kind,
++		name:  resource.GetName(),
++		scope: scopes.NormalizeForEquality(scope),
+ 	}
+ 	switch kind {
+ 	case types.KindNode,
+diff --git a/tool/tsh/common/kube.go b/tool/tsh/common/kube.go
+index 9401e07c156..8c3d944d332 100644
+--- a/tool/tsh/common/kube.go
++++ b/tool/tsh/common/kube.go
+@@ -993,34 +993,34 @@ func (c *kubeLSCommand) showKubeClusters(w io.Writer, kubeClusters types.KubeClu
+ 	return nil
+ }
+ 
+-func getKubeClusterTextRow(kc types.KubeCluster, selectedCluster string, verbose bool) []string {
++func getKubeClusterTextRow(kc types.KubeCluster, selected, verbose bool) []string {
+ 	var selectedMark string
+ 	var row []string
+-	if selectedCluster != "" && kc.GetName() == selectedCluster {
++	if selected {
+ 		selectedMark = "*"
+ 	}
+ 	displayName := common.FormatResourceName(kc, verbose)
+ 	labels := common.FormatLabels(kc.GetAllLabels(), verbose)
+-	row = append(row, displayName, labels, selectedMark)
++	row = append(row, displayName, labels, kc.GetScope(), selectedMark)
+ 	return row
+ }
+ 
+ func formatKubeClustersAsText(kubeClusters types.KubeClusters, selectedCluster string, quiet, verbose bool) string {
+ 	var (
+-		columns = []string{"Kube Cluster Name", "Labels", "Selected"}
++		columns = []string{"Kube Cluster Name", "Labels", "Scope", "Selected"}
+ 		t       asciitable.Table
+ 		rows    [][]string
+ 	)
+ 
+ 	for _, cluster := range kubeClusters {
+-		r := getKubeClusterTextRow(cluster, selectedCluster, verbose)
++		r := getKubeClusterTextRow(cluster, isClusterSelected(kubeClusters, cluster, selectedCluster), verbose)
+ 		rows = append(rows, r)
+ 	}
+ 
+ 	switch {
+ 	case quiet:
+-		// no column headers and only include the cluster name and labels.
+-		t = asciitable.MakeHeadlessTable(2)
++		// no column headers and only include the cluster name, scope, and labels.
++		t = asciitable.MakeHeadlessTable(3)
+ 		for _, row := range rows {
+ 			t.AddRow(row)
+ 		}
+@@ -1035,11 +1035,32 @@ func formatKubeClustersAsText(kubeClusters types.KubeClusters, selectedCluster s
+ 	return t.AsBuffer().String()
+ }
+ 
++func isClusterSelected(kubeClusters []types.KubeCluster, cluster types.KubeCluster, selectedCluster string) bool {
++	if cluster.GetName() != selectedCluster {
++		return false
++	}
++
++	// if there are duplicate cluster names present in the list, we can't disambiguate so none of them should be
++	// selected
++	var found bool
++	for _, cl := range kubeClusters {
++		if cl.GetName() == cluster.GetName() {
++			if found {
++				return false
++			}
++			found = true
++		}
++	}
++
++	return true
++}
++
+ func serializeKubeClusters(kubeClusters []types.KubeCluster, selectedCluster, format string) (string, error) {
+ 	type cluster struct {
+ 		KubeClusterName string            `json:"kube_cluster_name"`
+ 		Labels          map[string]string `json:"labels"`
+ 		Selected        bool              `json:"selected"`
++		Scope           string            `json:"scope"`
+ 	}
+ 	clusterInfo := make([]cluster, 0, len(kubeClusters))
+ 	for _, cl := range kubeClusters {
+@@ -1050,7 +1071,8 @@ func serializeKubeClusters(kubeClusters []types.KubeCluster, selectedCluster, fo
+ 		clusterInfo = append(clusterInfo, cluster{
+ 			KubeClusterName: cl.GetName(),
+ 			Labels:          labels,
+-			Selected:        cl.GetName() == selectedCluster,
++			Selected:        isClusterSelected(kubeClusters, cl, selectedCluster),
++			Scope:           cl.GetScope(),
+ 		})
+ 	}
+ 	var out []byte
+@@ -1150,7 +1172,7 @@ func (c *kubeLSCommand) runAllClusters(cf *CLIConf) error {
+ 
+ func formatKubeListingsAsText(listings kubeListings, quiet, verbose bool) string {
+ 	var (
+-		columns = []string{"Proxy", "Cluster", "Kube Cluster Name", "Labels"}
++		columns = []string{"Proxy", "Cluster", "Kube Cluster Name", "Labels", "Scope"}
+ 		t       asciitable.Table
+ 		rows    [][]string
+ 	)
+@@ -1158,14 +1180,14 @@ func formatKubeListingsAsText(listings kubeListings, quiet, verbose bool) string
+ 		r := append([]string{
+ 			listing.Proxy,
+ 			listing.Cluster,
+-		}, getKubeClusterTextRow(listing.KubeCluster, "", verbose)...)
++		}, getKubeClusterTextRow(listing.KubeCluster, false, verbose)...)
+ 		rows = append(rows, r)
+ 	}
+ 
+ 	switch {
+ 	case quiet:
+ 		// quiet, so no column headers.
+-		t = asciitable.MakeHeadlessTable(4)
++		t = asciitable.MakeHeadlessTable(5)
+ 		for _, row := range rows {
+ 			t.AddRow(row)
+ 		}
+@@ -1388,15 +1410,18 @@ func matchClustersByNameOrDiscoveredName(name string, clusters types.KubeCluster
+ 		return clusters
+ 	}
+ 
+-	// look for an exact full name match.
++	// look for exact full name matches.
++	var out types.KubeClusters
+ 	for _, kc := range clusters {
+ 		if kc.GetName() == name {
+-			return types.KubeClusters{kc}
++			out = append(out, kc)
+ 		}
+ 	}
++	if len(out) > 0 {
++		return out
++	}
+ 
+ 	// or look for exact "discovered name" matches.
+-	var out types.KubeClusters
+ 	for _, kc := range clusters {
+ 		discoveredName, ok := kc.GetLabel(types.DiscoveredNameLabel)
+ 		if ok && discoveredName == name {

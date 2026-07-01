@@ -1,0 +1,477 @@
+instructions = """
+All stories use the "pytest" driver and exercise the pre-existing LLM-analytics
+taggers REST endpoint through PostHog's DRF test client. Import the harness
+first (it performs Django setup), then drive the live endpoint — never import
+or reference serializer/viewset internals.
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        valid_tagger_config,
+        create_tagger,
+    )
+
+Available helpers (all built on pre-existing PostHog infrastructure only):
+  - get_team_and_user() -> (team, user)
+      Creates a fresh Org -> Project -> Team + User chain (unique each call)
+      via posthog.test.base.setup_test_organization_team_and_user.
+  - get_authenticated_client(user) -> DRF APIClient force-logged-in as user.
+  - valid_tagger_config(**overrides) -> a valid LLM tagger_config dict
+      ({prompt, tags:[{name,description}], min_tags, max_tags}); an LLM tagger
+      requires a prompt and at least one tag (validated in Tagger.save()).
+  - create_tagger(team, user, name=None, **overrides) -> a persisted Tagger row
+      created directly via the ORM (use this when a story needs a pre-existing
+      tagger to edit). Pass deleted=True to start from a soft-deleted row.
+  - create_provider_key(team, name="Main key", provider="openai") -> a persisted
+      LLMProviderKey row for the team; its id can be passed as
+      model_configuration["provider_key_id"], and the server derives
+      model_configuration.provider_key_name from the key's name on read.
+
+The endpoint base is /api/environments/{team.id}/taggers/. Create is POST to
+that URL; edit is PATCH to /api/environments/{team.id}/taggers/{tagger_id}/.
+Always pass format="json". Read the persisted row count SCOPED TO THE STORY'S
+OWN TEAM with ``Tagger.objects.filter(team=team).count()`` (import Tagger from
+``products.llm_analytics.backend.models.taggers``) — a story's test cases share
+one database, so an unscoped global count would accumulate rows across cases;
+scoping to ``team`` (fresh per ``get_team_and_user()`` call) keeps each case
+independent.
+
+Each expected key has an ``EXPECTED:`` line in the procedure describing how to
+assert it.
+Multi-database marker (PostHog framework mechanics): mark EVERY pytest test with
+``@pytest.mark.django_db(transaction=True, databases="__all__")``. A plain
+``@pytest.mark.django_db`` or a non-transactional ``databases="__all__"`` can
+ERROR at setup with ``OperationalError: Temporary failure in name resolution`` —
+PostHog configures auxiliary databases (persons, visual_review) on a host that is
+not reachable in this backend-only environment, and a non-transactional
+all-databases marker eagerly connects to them. The transactional form connects
+lazily (only the default database is touched) and the conftest tolerates the
+cross-database teardown.
+
+"""
+
+[settings]
+va_max_turns = 60
+va_timeout_sec = 1800
+script_timeout_sec = 600
+# PostHog's `exclude-newer` pin fails to parse on the pinned uv, so an
+# unpinned `uv run` silently re-resolves the lockfile during validation
+# (upgrading setuptools, dropping pkg_resources, crashing Django startup).
+uv_no_sync = true
+
+[settings.pytest]
+python = "uv run python"
+django_settings = "posthog.settings"
+
+
+# =============================================================================
+# Story 1 — create rejects the soft-deletion field (fail_to_pass)
+# =============================================================================
+
+[[story]]
+id = "create_rejects_deleted"
+driver = "pytest"
+description = "When a user tries to create a tagger while trying to set its soft-deletion state, it should be rejected with a field-scoped client error."
+procedure = """
+Discovery first — do NOT guess how the rejection looks; read the solution:
+
+0. Read the taggers API module the solution edited at
+   ``/repo/posthog/products/llm_analytics/backend/api/taggers.py`` and find how a
+   create-time soft-deletion (``deleted``) value is handled. Confirm it is turned
+   into a client-side validation rejection attributed to the ``deleted`` field
+   itself (a field-scoped error keyed on ``deleted``) — not silently dropped, and
+   not a server error. Use the source only to understand the attribution shape so
+   you classify the live response below correctly; the assertions are on the live
+   endpoint, not on the source.
+
+Imports:
+
+    import sys, json
+    sys.path.insert(0, "/tests")
+    from test_harness import get_team_and_user, get_authenticated_client, valid_tagger_config
+    from products.llm_analytics.backend.models.taggers import Tagger
+
+Steps:
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+
+2. Build the POST body:
+   ``body = {"name": "Feature Tagger", "tagger_config": valid_tagger_config()}``.
+   If ``inputs["send_deleted"]`` is true, add ``body["deleted"] = True``.
+
+3. POST it: ``resp = client.post(f"/api/environments/{team.id}/taggers/", body, format="json")``.
+
+4. Compute observables:
+   - ``status_code = resp.status_code``.
+   - ``tagger_count = Tagger.objects.filter(team=team).count()`` (scope to this
+     story's own team — see the header note).
+   - Classify HOW the soft-deletion field is attributed in the error body.
+     ``err = resp.json() if resp.status_code >= 400 else {}``. Set
+     ``deleted_attribution`` to:
+       * ``"field"`` if ``err`` is a dict and ``"deleted"`` is one of its keys
+         (the rejection is scoped to the soft-deletion field);
+       * ``"non_field"`` if ``"deleted"`` appears only elsewhere in
+         ``json.dumps(err)`` (e.g. inside a non-field / detail message);
+       * ``"absent"`` otherwise (no error — e.g. an accepted create).
+
+- EXPECTED: ``status_code`` equals ``expected["status_code"]`` exactly.
+- EXPECTED: ``tagger_count`` equals ``expected["tagger_count"]`` exactly.
+- EXPECTED: ``deleted_attribution`` equals ``expected["deleted_attribution"]``
+  exactly (a rejected create is scoped to the soft-deletion field; an accepted
+  create has no such error).
+
+Return ``{"status_code": status_code, "tagger_count": tagger_count, "deleted_attribution": deleted_attribution}``.
+"""
+
+[[story.test_case]]
+# Soft-deletion field present on create -> field-scoped rejection, nothing persisted.
+[story.test_case.inputs]
+send_deleted = true
+[story.test_case.expected]
+status_code = 400
+tagger_count = 0
+deleted_attribution = "field"
+
+[[story.test_case]]
+# Ordinary create (no soft-deletion field) -> succeeds.
+[story.test_case.inputs]
+send_deleted = false
+[story.test_case.expected]
+status_code = 201
+tagger_count = 1
+deleted_attribution = "absent"
+
+
+# =============================================================================
+# Story 2 — create rejects the server-derived provider key name (fail_to_pass)
+# =============================================================================
+
+[[story]]
+id = "write_rejects_provider_key_name"
+driver = "pytest"
+description = "When a user tries to write the server-derived provider key name on the nested model configuration, it should be rejected with a client error attributable to that nested field."
+procedure = """
+Discovery first — do NOT guess how the rejection looks; read the solution:
+
+0. Read the taggers API module the solution edited at
+   ``/repo/posthog/products/llm_analytics/backend/api/taggers.py`` and find how a
+   written ``provider_key_name`` on the nested model configuration is handled.
+   Confirm it is turned into a client-side validation rejection attributed to that
+   nested field — not silently dropped, and not a server error. Note the SHAPE the
+   implementation uses, because valid implementations differ: the error may nest
+   under the ``model_configuration`` field as a sub-object
+   (``{"model_configuration": {"provider_key_name": [...]}}``) or appear as a
+   flattened key combining parent and child
+   (``{"model_configuration__provider_key_name": [...]}``). BOTH count as
+   "attributed to the nested provider_key_name field". Use the source only to
+   classify the live response below; the assertions are on the live endpoint.
+
+Imports:
+
+    import sys, json
+    sys.path.insert(0, "/tests")
+    from test_harness import get_team_and_user, get_authenticated_client, valid_tagger_config, create_tagger
+    from products.llm_analytics.backend.models.taggers import Tagger
+
+Steps:
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+
+2. Build a nested model configuration:
+   ``model_configuration = {"provider": "openai", "model": "gpt-4o"}``.
+   If ``inputs["send_provider_key_name"]`` is true, add
+   ``model_configuration["provider_key_name"] = "Main key"``.
+
+3. Issue the write named by ``inputs["action"]``:
+   - ``"create"``: POST
+     ``{"name": "Feature Tagger", "tagger_config": valid_tagger_config(),
+        "model_configuration": model_configuration}`` to
+     ``f"/api/environments/{team.id}/taggers/"`` with ``format="json"``.
+   - ``"update"``: first create a pre-existing tagger via the ORM,
+     ``tagger = create_tagger(team, user)``, then PATCH
+     ``f"/api/environments/{team.id}/taggers/{tagger.id}/"`` with
+     ``{"model_configuration": model_configuration}`` and ``format="json"``.
+
+4. Compute observables:
+   - ``status_code = resp.status_code``.
+   - ``tagger_count = Tagger.objects.filter(team=team).count()`` (scope to this
+     story's own team — see the header note).
+   - Classify HOW ``provider_key_name`` is attributed in the error body.
+     ``err = resp.json() if resp.status_code >= 400 else {}``. Using the
+     attribution shape you discovered above, set ``pk_attribution`` to:
+       * ``"nested"`` if the error attributes ``provider_key_name`` to the
+         ``model_configuration`` field — i.e. it appears inside the
+         ``model_configuration`` sub-object, OR a key combines
+         ``model_configuration`` and ``provider_key_name`` (flattened form);
+       * ``"top_level"`` if ``provider_key_name`` is attributed as its own
+         root-level field key, NOT tied to ``model_configuration``;
+       * ``"non_field"`` if ``provider_key_name`` appears only inside a
+         non-field / detail message;
+       * ``"absent"`` if it does not appear at all (e.g. an accepted write).
+
+- EXPECTED: ``status_code`` equals ``expected["status_code"]`` exactly.
+- EXPECTED: ``tagger_count`` equals ``expected["tagger_count"]`` exactly (a
+  rejected write adds no row and the pre-existing tagger count is unchanged).
+- EXPECTED: ``pk_attribution`` equals ``expected["pk_attribution"]`` exactly (a
+  rejection is scoped to the nested model-configuration field; an accepted write
+  has no such error).
+
+Return ``{"status_code": status_code, "tagger_count": tagger_count, "pk_attribution": pk_attribution}``.
+"""
+
+[[story.test_case]]
+# Create writing the server-derived key name -> rejected at the nested field, nothing persisted.
+[story.test_case.inputs]
+action = "create"
+send_provider_key_name = true
+[story.test_case.expected]
+status_code = 400
+tagger_count = 0
+pk_attribution = "nested"
+
+[[story.test_case]]
+# Create with a clean model configuration -> succeeds.
+[story.test_case.inputs]
+action = "create"
+send_provider_key_name = false
+[story.test_case.expected]
+status_code = 201
+tagger_count = 1
+pk_attribution = "absent"
+
+[[story.test_case]]
+# Edit writing the server-derived key name -> rejected at the nested field; no new row.
+[story.test_case.inputs]
+action = "update"
+send_provider_key_name = true
+[story.test_case.expected]
+status_code = 400
+tagger_count = 1
+pk_attribution = "nested"
+
+[[story.test_case]]
+# Edit with a clean model configuration -> accepted.
+[story.test_case.inputs]
+action = "update"
+send_provider_key_name = false
+[story.test_case.expected]
+status_code = 200
+tagger_count = 1
+pk_attribution = "absent"
+
+
+# =============================================================================
+# Story 3 — soft-delete via edit still works (pass_to_pass / over-correction guard)
+# =============================================================================
+
+[[story]]
+id = "update_allows_soft_delete"
+driver = "pytest"
+description = "Soft-deleting an existing tagger by editing it should stay as a supported flow."
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import get_team_and_user, get_authenticated_client, create_tagger
+
+Steps:
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+
+2. Create a pre-existing tagger via the ORM, starting from the initial
+   soft-deletion state in inputs:
+   ``tagger = create_tagger(team, user, deleted=inputs["initial_deleted"])``.
+
+3. PATCH it to flip the soft-deletion state:
+   ``resp = client.patch(f"/api/environments/{team.id}/taggers/{tagger.id}/",
+        {"deleted": inputs["patch_deleted"]}, format="json")``.
+
+4. Compute observables:
+   - ``status_code = resp.status_code``.
+   - ``tagger.refresh_from_db()``; ``deleted_after = bool(tagger.deleted)``.
+
+- EXPECTED: ``status_code`` equals ``expected["status_code"]`` exactly (the
+  edit is accepted).
+- EXPECTED: ``deleted_after`` equals ``expected["deleted_after"]`` exactly (the
+  persisted soft-deletion state reflects the edit).
+
+Return ``{"status_code": status_code, "deleted_after": deleted_after}``.
+"""
+
+[[story.test_case]]
+# Soft-delete a live tagger via edit.
+[story.test_case.inputs]
+initial_deleted = false
+patch_deleted = true
+[story.test_case.expected]
+status_code = 200
+deleted_after = true
+
+[[story.test_case]]
+# Restore (un-delete) a soft-deleted tagger via edit.
+[story.test_case.inputs]
+initial_deleted = true
+patch_deleted = false
+[story.test_case.expected]
+status_code = 200
+deleted_after = false
+
+
+# =============================================================================
+# Story 4 — a valid create still works and keeps its response shape (pass_to_pass)
+# =============================================================================
+
+[[story]]
+id = "valid_create_succeeds"
+driver = "pytest"
+description = "When a user makes a valid create request, it works and returns the full read representation with the response body shape clients rely on."
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user, get_authenticated_client, valid_tagger_config,
+        create_provider_key,
+    )
+    from products.llm_analytics.backend.models.taggers import Tagger
+
+Steps:
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+
+2. Build the POST body:
+   ``body = {"name": "Feature Tagger", "enabled": inputs["enabled"],
+             "tagger_config": valid_tagger_config()}``.
+   If ``inputs["with_provider_key"]`` is true, attach a model configuration that
+   pins a real provider key so the server can derive the key NAME on read:
+   ``key = create_provider_key(team, name="Main key")``;
+   ``body["model_configuration"] = {"provider": "openai", "model": "gpt-4o",
+        "provider_key_id": str(key.id)}``.
+
+3. POST it to ``f"/api/environments/{team.id}/taggers/"`` with ``format="json"``.
+
+4. Compute observables:
+   - ``status_code = resp.status_code``.
+   - ``tagger_count = Tagger.objects.filter(team=team).count()`` (scope to this
+     story's own team — see the header note).
+   - ``data = resp.json() if resp.status_code < 400 else {}``.
+   - ``response_enabled = bool(data.get("enabled"))``.
+   - Count the top-level read-representation keys present:
+     ``present_key_count = sum(1 for k in ("id", "created_at", "created_by", "deleted") if k in data)``.
+   - The server-derived provider key NAME from the response's model configuration
+     (the read representation re-serializes it; it is NOT a field the caller sent):
+     ``mc = data.get("model_configuration") or {}``;
+     ``derived_key_name = mc.get("provider_key_name") or "none"``.
+
+- EXPECTED: ``status_code`` equals ``expected["status_code"]`` exactly.
+- EXPECTED: ``tagger_count`` equals ``expected["tagger_count"]`` exactly.
+- EXPECTED: ``response_enabled`` equals ``expected["response_enabled"]`` exactly.
+- EXPECTED: ``present_key_count`` equals ``expected["present_key_count"]`` exactly
+  (the response keeps id, created_at, created_by, and deleted).
+- EXPECTED: ``derived_key_name`` equals ``expected["derived_key_name"]`` exactly
+  (when a provider key is pinned, the create response carries the server-derived
+  key name through the full read representation).
+
+Return ``{"status_code": status_code, "tagger_count": tagger_count,
+          "response_enabled": response_enabled, "present_key_count": present_key_count,
+          "derived_key_name": derived_key_name}``.
+"""
+
+[[story.test_case]]
+# Plain valid create (no model configuration) -> full read representation.
+[story.test_case.inputs]
+enabled = true
+with_provider_key = false
+[story.test_case.expected]
+status_code = 201
+tagger_count = 1
+response_enabled = true
+present_key_count = 4
+derived_key_name = "none"
+
+[[story.test_case]]
+[story.test_case.inputs]
+enabled = false
+with_provider_key = false
+[story.test_case.expected]
+status_code = 201
+tagger_count = 1
+response_enabled = false
+present_key_count = 4
+derived_key_name = "none"
+
+[[story.test_case]]
+# Valid create pinning a provider key -> the server-derived key name survives
+# read re-serialization in the create response.
+[story.test_case.inputs]
+enabled = true
+with_provider_key = true
+[story.test_case.expected]
+status_code = 201
+tagger_count = 1
+response_enabled = true
+present_key_count = 4
+derived_key_name = "Main key"
+
+
+# =============================================================================
+# Story 5 — a valid edit of an ordinary field still works (pass_to_pass)
+# =============================================================================
+
+[[story]]
+id = "valid_update_succeeds"
+driver = "pytest"
+description = "When a user edits an ordinary field of an existing tagger (its name and enabled flag), it updates the tagger."
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import get_team_and_user, get_authenticated_client, create_tagger
+    from products.llm_analytics.backend.models.taggers import Tagger
+
+Steps:
+
+1. ``team, user = get_team_and_user()`` and ``client = get_authenticated_client(user)``.
+
+2. Create a pre-existing tagger via the ORM:
+   ``tagger = create_tagger(team, user, name="original", enabled=True)``.
+
+3. PATCH ordinary fields:
+   ``resp = client.patch(f"/api/environments/{team.id}/taggers/{tagger.id}/",
+        {"name": inputs["new_name"], "enabled": inputs["new_enabled"]}, format="json")``.
+
+4. Compute observables:
+   - ``status_code = resp.status_code``.
+   - ``tagger.refresh_from_db()``.
+   - ``name_after = tagger.name``.
+   - ``enabled_after = bool(tagger.enabled)``.
+
+- EXPECTED: ``status_code`` equals ``expected["status_code"]`` exactly.
+- EXPECTED: ``name_after`` equals ``expected["name_after"]`` exactly.
+- EXPECTED: ``enabled_after`` equals ``expected["enabled_after"]`` exactly.
+
+Return ``{"status_code": status_code, "name_after": name_after, "enabled_after": enabled_after}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+new_name = "renamed-alpha"
+new_enabled = false
+[story.test_case.expected]
+status_code = 200
+name_after = "renamed-alpha"
+enabled_after = false
+
+[[story.test_case]]
+[story.test_case.inputs]
+new_name = "renamed-beta"
+new_enabled = true
+[story.test_case.expected]
+status_code = 200
+name_after = "renamed-beta"
+enabled_after = true

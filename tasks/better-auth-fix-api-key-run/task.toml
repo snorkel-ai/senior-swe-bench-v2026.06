@@ -1,0 +1,202 @@
+version = "1.0"
+
+[environment]
+base_image = "better-auth-fix-api-key-run:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "better-auth"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "better-auth"
+
+[metadata]
+family = "better-auth-fix-api-key-run"
+variant = "hard"
+segment = "investigate"
+repo = "better-auth"
+tags = ["better-auth", "typescript-lib"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """The `@better-auth/api-key` plugin can keep API keys in a secondary
+storage backend (Redis-style KV) instead of the primary database.
+Listing a reference's keys from secondary storage walks a per-reference
+index of key ids and fetches each key one at a time, awaiting every
+read before issuing the next. The wall-clock cost of listing therefore
+grows linearly with the number of keys — a reference with dozens of
+keys pays dozens of serial round-trips to the KV store. Separately, the
+secondary-storage write path keeps that per-reference index in sync by
+reading the id list, mutating it, and writing it back; when two key
+creations for the same reference run concurrently, both read the same
+snapshot of the list and the second write clobbers the first, silently
+dropping a key id from the index. The task is to make secondary-storage
+key listing fast (concurrent fetches instead of serial) without
+regressing correctness, and to make concurrent key creation stop losing
+ids from the per-reference index.
+"""
+context = """Setting:
+- The api-key plugin (`packages/api-key/src/`) supports three storage
+  modes selected by the plugin options: `database` (primary DB only),
+  `secondary-storage` (KV only), and `secondary-storage` with
+  `fallbackToDatabase: true` (KV as a cache in front of the DB).
+- `packages/api-key/src/adapter.ts` holds the storage layer. For the
+  KV modes it maintains three kinds of entries: a record keyed by the
+  hashed key, a record keyed by the key id, and a per-reference index
+  (`api-key:by-ref:<referenceId>`) that stores the JSON array of key
+  ids belonging to that user/org.
+- Listing in a KV mode reads the per-reference index to get the id
+  list, then loads each key by id, then applies sorting/pagination in
+  memory. Pre-change the per-id loads run inside a sequential
+  `for (const id of keyIds) { await ... }` loop, so N keys cost N
+  serial KV reads. The fallback path has the same shape when it
+  repopulates the cache from the database after a miss.
+- Writes (`setApiKeyInStorage`) and deletes
+  (`deleteApiKeyFromStorage`) update the per-reference index with a
+  read-modify-write: `get` the id array, push/filter the id, `set` it
+  back. Two concurrent writers for the same reference can interleave
+  their get/set and lose one another's id.
+- `packages/api-key/src/routes/list-api-keys.ts` is the list endpoint.
+  When several api-key plugin configs are registered it groups them by
+  storage backend and queries each group, merging results by id.
+  Pre-change it queries the groups one after another.
+
+Investigation evidence:
+- A deployment using secondary storage reported that listing keys for
+  references with many keys is slow and that the latency scales with
+  the key count rather than staying roughly flat.
+- The same deployment (running in fallback mode) reported that creating
+  several keys for one user in quick succession sometimes leaves one of
+  the freshly created keys out of subsequent `list` responses, even
+  though the key itself is usable. The missing key reappears once the
+  cache is repopulated from the database.
+
+Behavioural observation surface:
+- Everything is observable through the plugin's public typed API driven
+  by a test instance. `getTestInstance({ secondaryStorage, plugins:
+  [apiKey({ storage: "secondary-storage", ... })] })` (from
+  `better-auth/test`) wires the plugin to a caller-supplied
+  `secondaryStorage` object. Because the caller owns that object, its
+  `get` / `set` / `delete` can be wrapped to count in-flight calls or
+  to widen timing windows.
+- `client.apiKey.create`, `client.apiKey.list`, and
+  `client.apiKey.delete` (or the equivalent `auth.api.*` methods)
+  exercise the storage layer end to end. The per-reference index lives
+  at the well-known key `api-key:by-ref:<referenceId>` and per-id
+  records at `api-key:by-id:<id>`.
+
+Note on patch scope:
+- The reference change introduces a small bounded-concurrency helper
+  (a worker pool capped at a fixed degree) and uses it for the parallel
+  fetches and the fallback repopulation. Bounding the concurrency is a
+  sensible production choice but is not the observable contract: an
+  unbounded `Promise.all` over the id list satisfies the same
+  behavioural goal for the listing path.
+- The reference change makes the write/delete paths in fallback mode
+  invalidate the per-reference index (delete it) instead of
+  read-modify-writing it, which removes the lost-id race because the
+  next list rebuilds the index from the database. Any approach that
+  stops concurrent writers from dropping ids in fallback mode is
+  acceptable — invalidation is one such approach.
+- The secondary-storage-only mode (no database to fall back to) keeps
+  the per-reference index as the source of truth, so it still maintains
+  the index on writes; the lost-id race is addressed specifically for
+  the fallback mode where a database rebuild is available.
+"""
+solution = """Canonical fix (reference change):
+- In `adapter.ts`, replace the sequential per-id `for await` loops in
+  `listApiKeys` (both the secondary-storage-only path and the
+  fallback-repopulate path) with concurrent fetches. The reference adds
+  a `mapConcurrent(items, fn, concurrency)` worker-pool helper (default
+  concurrency 10) and maps the id list through it, then filters out
+  nulls. The fallback repopulation likewise fans the per-key `set`
+  calls out concurrently and writes the per-reference index once at the
+  end with the full id set.
+- Change the fallback-mode write and delete paths so they stop
+  read-modify-writing the per-reference index. The reference splits the
+  index maintenance into a helper and, in fallback mode, simply deletes
+  (invalidates) the `api-key:by-ref:<referenceId>` entry alongside the
+  per-key writes/deletes (all issued together). The next list misses
+  the index, falls back to the database, and rebuilds it — so two
+  concurrent creates can no longer clobber each other's id. The
+  secondary-storage-only mode retains read-modify-write because the
+  index is authoritative there.
+- In `routes/list-api-keys.ts`, query the per-backend storage groups
+  concurrently (`Promise.all` over the groups) instead of in series,
+  then merge by id.
+
+Why this works:
+- Listing latency stops scaling linearly with key count because the
+  per-id reads (and the fallback per-key writes) overlap.
+- The lost-id race disappears in fallback mode because writers no
+  longer depend on a read-then-write of a shared array; the index is
+  treated as a cache that is invalidated and lazily rebuilt from the
+  database truth.
+- Sorting and pagination still run in memory over the fetched set, so
+  list ordering and limits are unchanged.
+
+Alternative valid fixes:
+1. Unbounded `Promise.all(keyIds.map(id => getById(id)))` for the
+   listing fetches instead of a bounded worker pool.
+2. A different bounded-concurrency primitive (semaphore, chunked
+   batches, p-limit-style) and/or a different concurrency cap.
+3. A different race-avoidance strategy in fallback mode (e.g. writing
+   the index only from list-time database rebuilds and never touching
+   it on create/delete) as long as concurrent creates don't drop ids.
+4. Keeping the index helper inline rather than extracting a named
+   helper; different helper/variable names (including non-English).
+
+Non-optimal "fixes" the verifier rejects:
+- Leaving the per-id reads sequential (the latency symptom persists;
+  the listing concurrency check fails).
+- Parallelising reads but leaving the fallback write path doing a
+  per-writer read-modify-write of the shared index (the concurrent
+  create test still drops an id).
+- Breaking list correctness — returning the wrong set of keys, or
+  losing sorting/pagination — to chase concurrency.
+"""
+
+[metadata.taxonomy]
+task_type = "performance"
+stack = ["typescript-lib"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "concurrency-reasoning", "performance-optimization", "framework-fluency", "logic-fix", "test-execution"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 170
+files = 2
+hunks = 12
+scope = "broad"
+
+[metadata.origin]
+repo = "better-auth/better-auth"
+pr_numbers = [9187]
+base_commit = "2c1b1994d5b2677f0bd12611d4da13efdef25807"
+base_commit_date = "2026-04-14"
+merged_at = "2026-04-17"
+
+
+
+

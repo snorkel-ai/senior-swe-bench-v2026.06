@@ -1,0 +1,18 @@
+{
+  "files": [
+    "packages/sync-service/lib/electric/replication/eval/env.ex",
+    "packages/sync-service/lib/electric/replication/eval/env/known_functions.ex",
+    "packages/sync-service/lib/electric/replication/eval/known_definition.ex",
+    "packages/sync-service/lib/electric/replication/eval/lookups.ex",
+    "packages/sync-service/lib/electric/replication/eval/parser.ex",
+    "packages/sync-service/lib/electric/replication/eval/runner.ex",
+    "packages/sync-service/lib/electric/replication/eval/walker.ex"
+  ],
+  "fail_to_pass": [],
+  "pass_to_pass": [
+    {
+      "name": "existing_variadic_primitives_preserved",
+      "description": "The pre-existing variadic primitives `index_access` and `slice_access` (used by Postgres array indexing/slicing in eval-engine expressions) continue to work as before. They retain their strict-mode semantics: when any element of the variadic Array argument is nil, the function call collapses to nil. The runner's strict-vs-non-strict dispatch path correctly distinguishes between strict variadic functions (these two) and non-strict variadic functions (the new `coalesce`, `greatest`, `least`)."
+    }
+  ]
+}

@@ -1,0 +1,315 @@
+version = "1.0"
+
+[environment]
+base_image = "electric-feat-add-variadic-function:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "electric"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "electric"
+
+[metadata]
+family = "electric-feat-add-variadic-function"
+variant = "hard"
+segment = "design"
+repo = "electric"
+tags = ["electric", "elixir"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """The sync engine's WHERE-clause eval engine accepts a Postgres-flavoured
+expression language used by shape definitions and order-by clauses,
+parses it into an AST of `Const`, `Ref`, `Func`, `Array`, and
+`RowExpr` nodes, and walks that AST per-row to evaluate predicates.
+Customers running shapes whose WHERE clauses use `coalesce(...)`,
+`greatest(...)`, or `least(...)` hit a hard rejection at parse time —
+those three functions accept variadic arguments and the parser
+currently has no representation for variadic functions. This task
+extends the eval engine with first-class variadic function support
+and adds the three conditional functions on top of that machinery.
+"""
+context = """The eval engine lives in
+`packages/sync-service/lib/electric/replication/eval/`. The hot path:
+
+- `Parser.parse_and_validate_expression(query, opts)` accepts a SQL
+  expression string, parses it via `pg_query`, and walks the
+  Postgres AST (`PgQuery.*` nodes) into the engine's own
+  `Const | Ref | Func | Array | RowExpr` nodes via per-node
+  `node_to_ast/4` clauses. Final step: `reduce_ast` folds constants
+  using `Walker.fold` over the parser's AST.
+- `Runner.execute(expr, ref_values)` walks that engine AST and
+  returns `{:ok, value}` or `{:error, term()}`. It dispatches on
+  node type via `do_execute/3`, with a special case for
+  `%Func{strict?: true, variadic_arg: pos}` (used today by the
+  `index_access`/`slice_access` array primitives, the only
+  pre-existing variadic functions).
+- Functions are registered through the `defpostgres` macro in
+  `Env.KnownFunctions`. The macro is implemented in
+  `KnownDefinition` and parses signatures like `name(t1, t2) -> t3`,
+  `t1 + t2 -> t3`, etc. via regexes. Polymorphic `anycompatible`
+  arguments + a per-call type-resolution step (`Lookups.pick_concrete_function_overload`)
+  pick the concrete overload at parse time.
+- `find_available_functions/2` picks the candidate overloads for a
+  call by exact `{name, arity}` match. With no variadic awareness,
+  variadic calls of a given arity have no candidate.
+
+Today, `coalesce`, `greatest`, and `least`:
+
+- Are NOT registered as functions at all.
+- Are parsed by `pg_query` into dedicated AST nodes —
+  `PgQuery.CoalesceExpr` and `PgQuery.MinMaxExpr` (with `op` of
+  `:IS_GREATEST` or `:IS_LEAST`) — rather than into
+  `PgQuery.FuncCall`. The parser has no `node_to_ast/4` clause
+  for either, so they fall through to the catch-all that yields
+  "X is not supported in this context".
+- The `Walker.fold` traversal also has no `Walkable` impl for
+  these two structs, so even if a parser clause existed, the
+  generic walker would not recurse into their children.
+
+The `%Func{}` AST node already has a `variadic_arg` field from the
+array-indexing primitives. That field is
+internal-only today: `defpostgres` cannot set it. The runner's
+strict-variadic dispatch (`do_execute(%Func{strict?: true,
+variadic_arg: pos} ...)`) reads it. Extending variadic to
+user-registered functions means letting `defpostgres` set this key
+and threading it through the parse-time overload resolution.
+
+Tests for the eval engine live in
+`packages/sync-service/test/electric/replication/eval/parser_test.exs`
+and `runner_test.exs`. They drive the public `Parser` and `Runner`
+APIs with SQL expression strings and assert on parsed AST shape and
+runtime values. The pre-existing `validate_order_by` rejection of
+`coalesce(...)` inside an ORDER BY clause is intentional and lives
+in a separate code path; it is not part of this change. There is a
+unit-test friendly `Env.empty(funcs: %{...})` constructor the tests
+use to register fake overloads (e.g. to verify exact-arity
+preference over variadic expansion).
+
+The PR body and review surfaced four senior-engineer decisions:
+- Variadic arguments are packed into a single `%Array{type: {:array, T}}`
+  AST node at the variadic position rather than left as a flat tuple
+  on the `Func.args` list. This keeps downstream uniformity (`Array`
+  reduction, runner dispatch on a single shape).
+- Exact-arity overloads must beat variadic expansions when both
+  match the same call.
+- `coalesce` short-circuits at BOTH parse-time constant reduction
+  AND runtime evaluation. Without parse-time short-circuit,
+  `coalesce(NULL::int4, 1, 1/0)` would fail at parse time on the
+  `1/0` reduction; without runtime short-circuit,
+  `coalesce(non_null_ref, 1/0)` would fail at runtime even when
+  the first argument resolves.
+- Explicit `VARIADIC` user calls (`func(VARIADIC ARRAY[...])`)
+  are rejected with a clear error rather than silently ignored —
+  nothing downstream is wired to handle the array-passing
+  semantics.
+"""
+solution = """The reference implementation extends `defpostgres` and the parser
+with variadic-function support, registers the three conditional
+functions on top of that machinery, and reorganises the parser's
+constant-folding pass + the runner's executor to support
+short-circuiting.
+
+1. **`Env.func` type** gains an optional `:variadic_arg` key
+   (non-negative integer or absent). `KnownDefinition` permits the
+   key in its `@known_definition_keys` list so the macro can carry
+   it through to the runtime function map.
+
+2. **`KnownDefinition.parse_function`** gains a `caller` parameter
+   and parses each comma-separated argument for a leading
+   `VARIADIC` token (case-insensitive). At most one VARIADIC is
+   allowed, and only at the last position. Compile errors fire
+   for non-trailing or duplicate VARIADIC. The stripped types are
+   stored in `args` as before; the variadic position (or `nil`)
+   is recorded under `variadic_arg`.
+
+3. **`KnownFunctions` adds the three functions**:
+   - `coalesce(VARIADIC anycompatible) -> anycompatible` —
+     `strict?: false`, delegates to `Enum.find(values, &(not is_nil(&1)))`.
+   - `greatest(VARIADIC anycompatible) -> anycompatible` —
+     `strict?: false`, `Enum.reject(nil)` then folds with a
+     comparison helper (`pick_extreme(:greatest)`).
+   - `least(VARIADIC anycompatible) -> anycompatible` — same
+     shape as `greatest` with `pick_extreme(:least)`.
+
+   The comparison helper handles `Date`, `Time`, `NaiveDateTime`,
+   `DateTime` via the standard library's `compare/2` functions
+   and falls back to `Kernel.</`>` for everything else.
+
+4. **`Lookups.expand_variadic_function_overload(choice, arity)`**
+   takes a variadic overload and a target arity and produces a
+   non-variadic copy by repeating the variadic type:
+   `args = fixed_args ++ List.duplicate(variadic_type, arity - variadic_arg)`.
+
+5. **`Parser.find_available_functions(name, arity, location, env)`**
+   now takes `name`/`arity`/`location` (instead of a `PgQuery.FuncCall`),
+   collects exact-arity overloads + variadic-expansion candidates
+   from smaller-arity entries whose final arg is variadic, and sorts
+   so exact overloads precede variadic ones. The downstream
+   `pick_concrete_function_overload` then picks the first viable
+   candidate, naturally preferring exact when both work.
+
+6. **`from_concrete`** packs variadic arguments into an
+   `%Array{type: {:array, variadic_type}, location: variadic_location}`
+   at the variadic position and sets `Func.variadic_arg`.
+
+7. **A new `handle_function_call(name, args, location, env, opts \\ [])`**
+   in `parser.ex` is the shared entry point for FuncCall,
+   CoalesceExpr, and MinMaxExpr nodes. It rejects explicit
+   `VARIADIC` calls (when `opts[:explicit_variadic?] == true`)
+   with `"explicit VARIADIC function calls are not currently
+   supported"` and otherwise delegates to a private
+   `do_handle_function_call`.
+
+8. **Two new `node_to_ast/4` clauses**:
+   - `%PgQuery.CoalesceExpr{}` → `handle_function_call("coalesce", args, location, env)`.
+   - `%PgQuery.MinMaxExpr{}` → `handle_function_call(name, args, location, env)`
+     where `name` is `"greatest"` or `"least"` based on the `op`
+     field (`:IS_GREATEST` / `:IS_LEAST`).
+   The existing `PgQuery.FuncCall` clause is rewritten to use
+   `handle_function_call` with `explicit_variadic?: call.func_variadic`.
+
+9. **Walker support**: `defimpl Electric.Walkable, for: PgQuery.CoalesceExpr`
+   and `for: PgQuery.MinMaxExpr` exposing `[args: args]`. The
+   parser's tree walker uses these to recurse into children.
+
+10. **`Parser.reduce_ast`** is rewritten from
+    `Walker.fold(ast, fn ... do_maybe_reduce)` into a per-node
+    recursive `reduce_node/1` (clauses for `Const`, `Ref`,
+    `UnknownConst`, `Array`, `RowExpr`, `Func`). The dedicated
+    `reduce_node(%Func{name: "coalesce", variadic_arg: 0,
+    args: [%Array{} = variadic_args]})` clause walks the Array's
+    elements left-to-right via `reduce_coalesce_elements`,
+    stopping at the first non-nil constant. If all elements
+    reduce to nil, returns a `Const{value: nil}`. If a non-nil
+    constant is found, returns it. If a non-constant element is
+    encountered before a non-nil constant, returns a `coalesce`
+    Func with the simplified prefix + remaining elements as its
+    Array. Other Func nodes go through `do_maybe_reduce` as today.
+
+11. **`Runner.execute_node`** is similarly rewritten from a
+    `Walker.fold` into per-node recursion. The dedicated
+    `execute_node(%Func{name: "coalesce", variadic_arg: 0,
+    args: [%Array{elements: ...}]})` clause walks elements
+    one at a time via `execute_coalesce`, stopping at the
+    first non-nil. Other Func nodes go through `apply_func`
+    which carries the existing strict / variadic_arg dispatch.
+
+Acceptable alternatives:
+
+- Different VARIADIC parsing key naming. The behavioural
+  contract is "the macro records which argument is variadic,
+  defpostgres rejects malformed signatures, the parser packs
+  arguments into a single AST node, and the runner unpacks them".
+  Stories drive the public Parser + Runner APIs and observe
+  computed values, not field names.
+- Different short-circuit decomposition. A valid implementation
+  could push parse-time short-circuit into a generic "non-strict
+  function with first non-nil semantics" helper rather than a
+  coalesce-specific clause. The behavioural test
+  (`coalesce(NULL::int4, 1, 1/0)` reduces to `1`) holds either
+  way.
+- Different overload-preference mechanism. Sorting candidates
+  variadic-last vs gating variadic expansion on no-exact-match
+  vs an explicit "exact wins" check both produce the same
+  observable: when both an exact-arity overload and a variadic
+  expansion are available, the exact wins.
+- Different AST packing. Rather than `%Array{...}` as the
+  variadic container, a plain list under a new `%Variadic{...}`
+  node would also work — the test surface only observes the
+  evaluated value, not the AST shape.
+- Different comparison strategy for `greatest`/`least`.
+  Using `Enum.max_by/Enum.min_by` with a custom comparator,
+  or pattern-matching every datetime type explicitly, are both
+  fine. The test surface uses `least(date '2024-01-02', date
+  '2024-01-01', NULL::date)` and observes the returned date
+  value — any approach that picks the right one is acceptable.
+- Non-English identifiers. The verifier and stories drive SQL
+  strings and assert on values; identifier names in the
+  implementation can be in any language.
+
+What naive implementations get wrong:
+
+- **Short-circuit only at runtime, not parse time.** Then
+  `coalesce(NULL::int4, 1, 1/0)` fails to parse because the
+  generic constant-folding pass tries to reduce `1/0` and
+  raises divide-by-zero.
+- **Reducing `coalesce` arguments to a single `Const` when ALL
+  arguments are non-nil constants without short-circuit
+  semantics.** A typical "fold all args, then apply" pass would
+  evaluate every argument; with `1/0` as the third argument
+  and the second a non-nil constant, the third reduction
+  fails.
+- **Variadic packing as a flat tuple on `Func.args` rather than
+  a single `Array` node.** Downstream code (the runner's
+  `Func` dispatch, the walker's fold, the existing variadic
+  primitives' strict-mode check) all assume the variadic
+  payload sits at one position; flattening it back out breaks
+  those assumptions.
+- **Variadic overload picked when an exact one matches.** Then
+  a custom `foo(int4, int4) -> int4` registered alongside a
+  variadic `foo(VARIADIC int4) -> int4` would non-deterministically
+  pick whichever is iterated first.
+- **`greatest`/`least` collapsing to nil whenever any argument
+  is nil.** Postgres semantics: nils are filtered out, the
+  function returns nil only when EVERY argument is nil.
+- **Passing the `Date`/`Time` etc. structures through `Kernel.>`
+  raw.** Elixir's `>` on a `%Date{}` happens to match map-key
+  ordering, which agrees with calendar order in some cases but
+  not in others. The PR's `compare/2` indirection through the
+  standard-library helpers is the safe path.
+- **Forgetting to add the `Walkable` impls for `CoalesceExpr` and
+  `MinMaxExpr`.** Then nested-call expressions like
+  `coalesce(test, lower(x))` would not have their inner
+  `lower(x)` recursed into during the parser's walk.
+- **Silently ignoring explicit `VARIADIC` user calls.** Then
+  the call `array_cat(VARIADIC ARRAY[...])` would parse to a
+  function with the array left undecomposed, breaking
+  downstream evaluation.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["elixir"]
+runtime_dependence = "runtime-helpful"
+skills = ["interface-design", "framework-fluency", "logic-fix", "architectural-refactoring", "data-model-design", "api-contract-design", "codebase-exploration"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 316
+files = 7
+hunks = 15
+scope = "extensive"
+
+[metadata.origin]
+repo = "electric-sql/electric"
+pr_numbers = [4114]
+base_commit = "0a65f8ef1e2ade4b796e5b0958a23dc3db0b1536"
+base_commit_date = "2026-04-10"
+merged_at = "2026-04-13"
+
+
+
+

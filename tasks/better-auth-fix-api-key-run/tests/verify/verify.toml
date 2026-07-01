@@ -1,0 +1,13 @@
+# test_parent = packages/api-key/src so the copied test sits inside the
+# @better-auth/api-key package and imports the plugin via relative `.`;
+# that is plain source resolution, so agent edits to adapter.ts and
+# routes/list-api-keys.ts take effect without an api-key rebuild.
+# config_dir = "" (repo root) so vitest finds the root vitest.config.ts,
+# whose ssr.resolve.conditions ["dev-source"] resolves workspace imports
+# to source. timeout = 540s covers first-run vite cold-start plus the
+# test-setup.sh rebuild.
+
+[jest]
+runner = "vitest"
+test_parent = "packages/api-key/src"
+timeout = 540

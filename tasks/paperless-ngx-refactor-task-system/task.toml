@@ -1,0 +1,178 @@
+version = "1.0"
+
+[environment]
+base_image = "paperless-ngx-refactor-task-system:latest"
+build_timeout_sec = 1800.0
+cpus = 2
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1800.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "paperless-ngx"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "paperless-ngx"
+
+[metadata]
+family = "paperless-ngx-refactor-task-system"
+variant = "hard"
+segment = "design"
+repo = "paperless-ngx"
+tags = ["paperless-ngx", "python-service", "sql-database"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Paperless-ngx runs all of its heavy lifting — document consumption,
+classifier training, sanity checks, e-mail fetching, LLM indexing, bulk
+edits, trash emptying, share-link bundling — as background Celery tasks.
+Today the bookkeeping for those tasks is thin and inconsistent: each task
+records itself ad-hoc, the stored result is an opaque string, there is no
+uniform notion of *when* a task was queued vs. started vs. finished, no
+per-task structured inputs, and no way to ask "how is the task system
+doing?" beyond a flat list. We want to redesign the task system so that
+EVERY background job is tracked automatically and uniformly — with a
+structured status lifecycle, queue/run timing, per-task input and result
+data, and the source that triggered it (scheduled, web UI, upload, folder,
+e-mail, system, manual). On top of that we want a proper monitoring API:
+list tasks, an aggregated summary over a recent window, the currently
+in-flight tasks, a way for an admin to trigger a runnable task by hand, and
+acknowledgement — all behind sensible permissions. Critically, existing API
+clients must keep working: the previous (v9) task response shape, field
+names, and values must be reproduced exactly for clients that ask for it,
+while new clients get the richer (v10) representation. As part of the
+cleanup the third-party `django_celery_results` result backend should be
+removed entirely.
+"""
+context = """Touchpoints: the Django app `documents` — `models.PaperlessTask`,
+`serialisers` (task serializers), `views.TasksViewSet`, `filters`,
+`signals/handlers`, `tasks`, `consumer`, `data_models`, and the
+`documents`/`paperless` migrations; plus `paperless.settings` (Celery /
+installed-apps), `paperless.models`/`permissions` (a renamed monitoring
+permission), and the many task call sites across `documents` (barcodes,
+bulk_edit, sanity_checker, workflows, management commands), `paperless_ai`,
+and `paperless_mail` that dispatch Celery tasks.
+
+The redesign is signal-driven: Celery emits lifecycle signals
+(`before_task_publish`, `task_prerun`, `task_postrun`, `task_failure`,
+`task_revoked`). Hooking those is what makes tracking automatic and uniform
+— a per-task-site bookkeeping approach is exactly what this replaces.
+
+Existing patterns to mirror: the repo already supports Accept-header API
+versioning (`application/json; version=N`, allowed versions 9 and 10) — the
+task endpoint must serve a backwards-compatible v9 shape and a new v10 shape
+from the same ViewSet, switching serializer AND pagination by version. DRF
+ViewSet `@action`s, `DjangoFilterBackend` filter sets, guardian-based
+object permissions, and the `view_*` model permissions are all established
+patterns elsewhere in `documents`.
+
+Senior decisions / traps (do not lose these):
+- Timing math is subtle: wait time is (started − created), duration is
+  (done − started); the postrun handler must NOT claim a task that ended in
+  a failure state — the failure signal owns that transition.
+- `input_data` must be JSON-safe: dates serialize to ISO strings, paths to
+  strings; consume tasks capture the original filename + mime type +
+  overrides.
+- Consume results become structured (success / duplicate / stopped); a
+  duplicate is recorded as a FAILURE, not a success, and the v9 `result`
+  string must be reconstructed from the structured data.
+- The v9 layer is an external contract: legacy field names
+  (`task_name`, `task_file_name`, `type`, `status` uppercase, `result`,
+  `related_document`, `duplicate_documents`) and their value mappings must
+  match exactly, and the v9 listing must stay UNPAGINATED.
+- Non-staff users may see only their own + unowned tasks.
+- Removing `django_celery_results` means dropping it from INSTALLED_APPS and
+  the result-backend settings AND writing a migration that drops its tables.
+"""
+solution = """Canonical fix follows the (backend portion of the) reference example:
+
+1. Rewrite `PaperlessTask` (documents/models.py) into a structured model:
+   `Status` (pending/started/success/failure/revoked), `TaskType` (12 task
+   kinds), `TriggerSource` (7 sources), `COMPLETE_STATUSES`; fields
+   task_id (unique), task_type, trigger_source, status, date_created/
+   started/done, duration_seconds, wait_time_seconds, input_data (JSON),
+   result_data (JSON), acknowledged; `is_complete` and
+   `related_document_ids` properties. Add a documents migration for the
+   schema change and a second migration dropping the celery-results tables.
+
+2. Drive the lifecycle from Celery signals (documents/signals/handlers.py):
+   `before_task_publish` creates a PENDING row (resolving task_type from a
+   tracked-task map, trigger_source from the task headers — default MANUAL —
+   and extracting per-task input_data); `task_prerun` → STARTED + started
+   time; `task_postrun` → SUCCESS + done time + computed duration/wait
+   (skipping failure states, flipping duplicates to FAILURE);
+   `task_failure` → FAILURE with error info; `task_revoked` → REVOKED.
+
+3. Structured consume results (documents/data_models.py + consumer.py +
+   tasks.py): TypedDict success/duplicate/stopped results; a new
+   `ConsumeFileDuplicateError`; tasks return structured values and no longer
+   create PaperlessTask rows by hand.
+
+4. Serializers (documents/serialisers.py): `TaskSerializerV10` (new fields +
+   *_display + related_document_ids) and `TaskSerializerV9` (legacy field
+   reconstruction with value remaps + permission-filtered duplicate_documents),
+   plus `TaskSummarySerializer` and `RunTaskSerializer`.
+
+5. `TasksViewSet` (documents/views.py) + `PaperlessTaskFilterSet`
+   (documents/filters.py): version-switched serializer + pagination, non-staff
+   scoping, v9 query-param mapping, `summary`/`active`/`run`/`acknowledge`
+   actions, permission gating via the renamed `view_system_monitoring`.
+
+6. Standardize task dispatch: convert `.delay(...)` call sites across
+   documents (barcodes, bulk_edit, sanity_checker, workflows, management
+   commands), paperless_ai, and paperless_mail to
+   `.apply_async(..., headers={"trigger_source": ...})`; add the scheduled
+   trigger header in the beat schedule (paperless/settings/custom.py).
+
+7. Remove `django_celery_results` from INSTALLED_APPS and the result-backend
+   settings (paperless/settings/__init__.py); rename the monitoring
+   permission (paperless/models.py + migration + documents/permissions.py)
+   and surface a task summary in the system-status view (paperless/views.py).
+
+Shortcuts that should NOT pass: per-task ad-hoc row creation that ignores
+Celery signals (lifecycle stories drive the signals); a v9 response that is
+paginated or uses new field names; a summary endpoint without the day-window
+cap or permission gate; dropping the celery-results app without a migration;
+exposing other users' tasks to a non-staff requester.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-service", "sql-database"]
+runtime_dependence = "runtime-essential"
+skills = ["codebase-exploration", "event-driven-design", "architectural-refactoring", "api-contract-design", "data-model-design", "framework-fluency", "cross-service-reasoning", "security-reasoning", "state-management", "dependency-research"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 1832
+files = 28
+hunks = 122
+scope = "extensive"
+
+[metadata.origin]
+repo = "paperless-ngx/paperless-ngx"
+pr_numbers = [12584, 12591, 12611, 12612, 12614, 12624, 12633, 12634, 12637]
+base_commit = "20aa0937e8c4e3f167fb487b67010f7ba29d6d24"
+base_commit_date = "2026-04-20"
+merged_at = "2026-04-24"
+
+
+
+

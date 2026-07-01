@@ -1,0 +1,14 @@
+{
+  "files": [
+    "models/project/issue.go",
+    "models/issues/issue_project.go",
+    "routers/web/repo/projects.go"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "move_appends_sorting",
+      "description": "This criterion concerns the NEW issue-sidebar column-move feature this task adds (moving an issue between columns from the issue/PR sidebar). If that feature is not present in the change under review (no sidebar column-move path exists), this criterion is NOT satisfied — pre-existing append/sorting logic exercised only by other flows (for example the column-deletion path that re-homes a deleted column's issues) does NOT count. When the new sidebar move IS present: moving an issue into a column that already contains other issues must append the moved issue to the END of that column's ordering rather than reusing an existing sort position — its `sorting` is one past the column's current maximum (max(sorting)+1, or 0 when the target column is empty), so it neither collides with nor shadows issues already in the column, and their ordering is preserved. The author is free to compute this however they like (a shared next-sorting helper, an inline max(sorting)+1 query, or reuse of the existing column-move service are all acceptable). A move implementation that drops the moved issue at a fixed/zero/duplicate sorting value, colliding with the issues already present, does NOT satisfy this criterion."
+    }
+  ],
+  "pass_to_pass": []
+}

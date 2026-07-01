@@ -1,0 +1,42 @@
+{
+  "files": [
+    "rust/personhog-writer/Cargo.toml",
+    "rust/personhog-writer/src/main.rs",
+    "rust/personhog-writer/src/lib.rs",
+    "rust/personhog-writer/src/consumer.rs",
+    "rust/personhog-writer/src/writer.rs",
+    "rust/personhog-writer/src/store.rs",
+    "rust/personhog-writer/src/pg.rs",
+    "rust/personhog-writer/src/buffer.rs",
+    "rust/personhog-writer/src/properties.rs",
+    "rust/personhog-writer/src/config.rs",
+    "rust/personhog-writer/src/error.rs",
+    "rust/personhog-writer/src/kafka.rs",
+    "rust/Cargo.toml",
+    "bin/start-rust-service",
+    "bin/mprocs.yaml"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "offset_commit_only_after_durable_write",
+      "description": "Kafka consumer offsets for the person-state topic are committed only AFTER a batch has been durably written to Postgres, never before. The committed offset is the processed offset + 1 (next-to-read), and the commit happens on the success path once the upsert returns Ok — so a crash between consuming a record and writing it causes Kafka to redeliver that record (at-least-once) rather than skipping it (data loss). Reject any design that commits or stores offsets eagerly on receipt / decode / buffering, or that advances offsets independently of write success. The design is consumer-task-split or single-loop agnostic; what matters is the ordering invariant: durable write happens-before offset commit. Accept either auto-commit explicitly gated on write completion or manual commit issued from the write success path."
+    },
+    {
+      "name": "failure_class_partitioning",
+      "description": "Postgres write failures are partitioned into distinct handling classes rather than treated uniformly. (1) Transient errors (connection reset, pool timeout, deadlock, serialization failure, and similar retryable conditions) cause the whole chunk to be retried with bounded backoff — a capped, roughly exponential delay — and give up after a small bounded number of attempts rather than retrying forever. (2) Data errors (a constraint violation or bad-row condition that would abort a multi-row INSERT) fall back to per-row inserts so that one poison row does not discard the rest of the chunk. (3) Fatal/unrecoverable errors stop the service (signal failure / process exit) instead of being silently swallowed. The exact backoff schedule, attempt count, and error taxonomy are implementation choices; what is required is that these three behaviors are distinguishable and that a transient blip is retried while a single bad row is isolated."
+    },
+    {
+      "name": "bounded_memory_under_backpressure",
+      "description": "Consumption and writing are decoupled so that a slow or stalled Postgres applies backpressure to the Kafka consumer instead of growing the in-memory buffer without limit. Acceptable mechanisms include handing flushed batches to the writer over a bounded channel (e.g. a bounded mpsc whose full state blocks the producing side), a hard buffer capacity ceiling that pauses/blocks consumption when reached (e.g. BUFFER_CAPACITY), or an equivalent flow-control primitive. Reject designs where the buffer or an unbounded queue can grow without limit while the writer is behind (e.g. an unbounded channel, or spawning an unbounded number of in-flight write tasks). The single-task and two-task designs both qualify as long as a stalled write path cannot cause unbounded accumulation of pending updates."
+    },
+    {
+      "name": "target_table_allowlist",
+      "description": "The target table name comes from configuration and is interpolated into the upsert SQL as an identifier (it cannot be passed as a bound parameter). Because of that, the configured name is validated against a fixed allowlist of known table names BEFORE being interpolated, so an unexpected or attacker-controlled value cannot inject arbitrary SQL or write to an arbitrary table. Reject designs that interpolate the configured table name into the statement unchecked. A hardcoded constant table name with no configurability is acceptable only if the table is genuinely not configurable; if the table is configurable (as the env contract implies), the allowlist check must be present."
+    },
+    {
+      "name": "json_passthrough_on_hot_path",
+      "description": "On the success path, already-valid `properties` (and the property-metadata blobs: properties_last_updated_at, properties_last_operation) are written without being re-parsed and re-serialized per row. The reference approach passes the raw JSON bytes through as text and casts them to jsonb inside the SQL statement (e.g. UNNEST of text[] cast ::jsonb), so no per-row serde round-trip occurs on the normal write. JSON parsing is acceptable only on the exceptional trim/skip path (when a blob exceeds the size threshold and must be trimmed or rejected). Reject designs that deserialize-then-reserialize every record's properties on the common success path."
+    }
+  ],
+  "pass_to_pass": []
+}

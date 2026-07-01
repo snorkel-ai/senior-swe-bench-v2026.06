@@ -1,0 +1,11 @@
+# Verifier runner config.
+#
+# Timeout breakdown (worst case observed in-image):
+#   - Django setup + pytest collection + test DB creation:   ~15s
+#   - T1 list fixture (8 workflows + M2M) + capture:         ~5s
+#   - T2 prune fixture (80 orphans) + PATCH + capture:       ~5s
+#   - T3 + T4 small fixtures:                                ~5s
+#   - uv sync / cold-cache + CI variance slack:              ~remainder
+# Budget: 600s (10 min) for safety under heavy CI.
+[shell]
+timeout = 600

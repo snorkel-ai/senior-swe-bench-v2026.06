@@ -1,0 +1,315 @@
+stack_profile = "python-library"
+
+instructions = """
+General environment for every story in this task.
+
+ENVIRONMENT
+- The harbor repo is at /repo/harbor. validation-setup.sh has installed the
+  harbor package editable into a virtualenv at /repo/harbor/.venv together
+  with pytest, so tests can `import harbor...` directly.
+- Run under the repo interpreter /repo/harbor/.venv/bin/python (the
+  [settings.pytest].python below already points there).
+- DO NOT modify anything under /repo/harbor. The validation orchestrator
+  zeros the score if the source tree changes between setup and verification.
+
+THE HELPER (test_harness.py — importable as `from test_harness import ...`)
+The harness provides on-disk/plumbing helpers only; it never asserts an
+outcome, never names a Windows docker internal, and never pins a
+solution-chosen public name. Available helpers:
+  - `scaffold_task_dir(base_dir, *, test_ext=".sh", solve_ext=".sh") -> Path`
+    creates a minimal task directory (instruction.md, task.toml,
+    environment/Dockerfile, tests/test<ext>, solution/solve<ext>).
+  - `make_script_dir(base_dir, *filenames) -> Path` creates a plain dir
+    holding exactly the named script files.
+  - `build_task_config_toml(*, version=None, os_field=None, os_value=None)
+    -> str` builds a minimal task-config TOML. `version` is written as the
+    legacy top-level `version` key. When BOTH `os_field` and `os_value` are
+    given, the line `<os_field> = "<os_value>"` is written under
+    `[environment]`; pass neither to omit the OS declaration entirely
+    (modelling a pre-existing Linux task). You supply `os_field` — the
+    harness does not assume what the OS field is called.
+  - `make_preflight_trial(*, tmp_path, task_os_member, agent) -> (trial,
+    agent)` assembles a minimal `Trial` around the caller-built `agent`,
+    exposing `task_os_member` on every surface a preflight might read it
+    from (the environment object and the trial's task object, under several
+    plausible attribute names). It does NOT build the agent and does NOT
+    decide how capability is advertised — you build `agent` with the
+    capability mechanism the implementation actually uses. Inspect
+    `agent.setup.await_count` to see whether the (mocked, async) agent setup
+    was reached.
+  - `script_name_or_none(path) -> str` returns `path.name`, or the sentinel
+    string "__none__" when discovery returned None.
+
+SENTINELS
+- When an expected value is the string "__none__", the underlying call
+  returned None / found nothing — assert the actual result is None (use
+  `script_name_or_none(...)` to normalise).
+
+DISCOVERY (read the implementation; do not assume the reference's names)
+Several public names in this feature are solution-chosen. Discover each from
+`instructions/details.md` and the harbor source you are validating, then code
+against what you find — never hardcode a guessed name:
+  - the OS enum type and the string values of its two members;
+  - the name of the OS field on the environment-config model (and therefore
+    the `task.toml` key under `[environment]` that declares the OS);
+  - the schema/config-version field and the task-config TOML-loading
+    classmethod;
+  - the task-paths class's OS-filtered script-discovery method, and the
+    environment-paths OS factory / Windows factory;
+  - how an agent advertises Windows-task support (a class attribute or a
+    method) and its name;
+  - where the trial enforces agent/OS compatibility before agent setup — it
+    may live at the top of the agent-setup coroutine, or in a separate
+    (synchronous) guard method the trial calls just before setup.
+
+TEST AUTHORING CONVENTION
+- Each story's procedure defines exactly ONE pytest test function taking
+  `inputs` and `expected` as fixture arguments (the driver parametrizes
+  them from the story's test cases).
+- Compare enum members by their `.value` string, never by the Python member
+  identifier or `repr`.
+- Run only the assertions described in the procedure — do not add extra
+  exploratory assertions that may differ across valid implementations.
+"""
+
+[settings]
+va_max_turns = 60
+va_timeout_sec = 1500
+script_timeout_sec = 600
+
+[settings.pytest]
+python = "/repo/harbor/.venv/bin/python"
+
+
+# ===========================================================================
+# Story 1 — OS declaration in task.toml + script flavour discovery/execution
+# ===========================================================================
+[[story]]
+id = "windows_task_config_and_scripts"
+driver = "pytest"
+description = """
+A task can declare its target operating system in its task.toml under
+[environment]. Scripts need to be adapted (batch scripts for Windows that run
+through the Windows command interpreter), and PowerShell/cmd scripts are no
+longer valid task entrypoints.
+"""
+procedure = """
+Discover, from instructions/details.md and the harbor source: the OS enum type
+and its members; the name of the OS field on the environment-config model; the
+task-config model and its TOML-loading classmethod; and the task-paths class
+with its OS-filtered script-discovery method. Import `build_task_config_toml`,
+`scaffold_task_dir`, and `script_name_or_none` from `test_harness`.
+
+OS DECLARATION
+- Let `os_field` be the discovered name of the OS field on the
+  environment-config model. Use it everywhere below (do not assume "os").
+- Read the enum's two members' `.value` strings; set `linux_enum_value` and
+  `windows_enum_value`.
+- Construct the environment-config with no arguments; set `default_os_value`
+  to the `.value` of its OS field (read via `os_field`).
+- Construct the environment-config passing `os_field=inputs["env_os_input"]`
+  (i.e. `EnvironmentConfig(**{os_field: inputs["env_os_input"]})`); set
+  `direct_os_value` to the `.value` of its OS field.
+- Construct the environment-config passing the bad value
+  `inputs["bad_os_input"]` for `os_field` inside a try/except; set
+  `unknown_os_error_type` to the caught exception class's `__name__` (expect a
+  pydantic ValidationError).
+- Build a TOML string via `build_task_config_toml(
+    version=inputs["toml_version"],
+    os_field=None if inputs["toml_os"] == "__omit__" else os_field,
+    os_value=None if inputs["toml_os"] == "__omit__" else inputs["toml_os"])`,
+  load it through the task-config model's TOML-loading classmethod, and set
+  `roundtrip_os_value` to the loaded config's environment OS `.value` and
+  `roundtrip_schema_version` to its schema/config version field.
+
+SCRIPT FLAVOUR BY OS (behavioural — through the task-paths public surface)
+- Scaffold a task directory via `scaffold_task_dir(tmp_path / "t",
+  test_ext=inputs["scaffold_test_ext"])`. Construct the task-paths object on
+  it. Using the task-paths OS-filtered test-discovery method, set
+  `taskpaths_windows_test_name` via `script_name_or_none(...)` for the windows
+  member and `taskpaths_linux_test_name` for the linux member.
+- Set `scaffold_is_valid` to "valid" if the task-paths validity check returns
+  true, else "invalid".
+- EXPECTED: linux_enum_value equals expected["linux_enum_value"].
+- EXPECTED: windows_enum_value equals expected["windows_enum_value"].
+- EXPECTED: default_os_value equals expected["default_os_value"].
+- EXPECTED: direct_os_value equals expected["direct_os_value"].
+- EXPECTED: unknown_os_error_type equals expected["unknown_os_error_type"].
+- EXPECTED: roundtrip_os_value equals expected["roundtrip_os_value"].
+- EXPECTED: roundtrip_schema_version equals expected["roundtrip_schema_version"].
+- EXPECTED: taskpaths_windows_test_name equals expected["taskpaths_windows_test_name"].
+- EXPECTED: taskpaths_linux_test_name equals expected["taskpaths_linux_test_name"].
+- EXPECTED: scaffold_is_valid equals expected["scaffold_is_valid"].
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+env_os_input = "windows"
+bad_os_input = "macos"
+toml_version = "1.2"
+toml_os = "windows"
+scaffold_test_ext = ".bat"
+[story.test_case.expected]
+linux_enum_value = "linux"
+windows_enum_value = "windows"
+default_os_value = "linux"
+direct_os_value = "windows"
+unknown_os_error_type = "ValidationError"
+roundtrip_os_value = "windows"
+roundtrip_schema_version = "1.2"
+taskpaths_windows_test_name = "test.bat"
+taskpaths_linux_test_name = "__none__"
+scaffold_is_valid = "valid"
+
+[[story.test_case]]
+[story.test_case.inputs]
+env_os_input = "linux"
+bad_os_input = "darwin"
+toml_version = "1.0"
+toml_os = "__omit__"
+scaffold_test_ext = ".ps1"
+[story.test_case.expected]
+linux_enum_value = "linux"
+windows_enum_value = "windows"
+default_os_value = "linux"
+direct_os_value = "linux"
+unknown_os_error_type = "ValidationError"
+roundtrip_os_value = "linux"
+roundtrip_schema_version = "1.0"
+taskpaths_windows_test_name = "__none__"
+taskpaths_linux_test_name = "__none__"
+scaffold_is_valid = "invalid"
+
+
+# ===========================================================================
+# Story 2 — per-OS container paths
+# ===========================================================================
+[[story]]
+id = "windows_container_paths"
+driver = "pytest"
+description = """
+Windows containers should use Windows-style, drive-rooted mount points for the
+logs, tests, and solution directories (and the verifier reward path beneath
+logs).
+"""
+procedure = """
+- Discover and import the environment-paths type from harbor's trial-paths
+  module and the OS enum from harbor's task-config module.
+- Select the environment paths for the OS named by `inputs["os_input"]` using
+  the type's OS factory (pass the enum member whose `.value` equals
+  `inputs["os_input"]`).
+- Set `logs_dir`, `tests_dir`, `solution_dir`, `verifier_dir`,
+  `reward_json_path` to the string forms of those path attributes, each with
+  any backslashes normalised to forward slashes
+  (`str(value).replace(chr(92), "/")`) — a drive-rooted Windows path is
+  correct whether the implementation renders it with forward or back slashes.
+- Independently obtain the Windows environment paths via the type's
+  Windows-specific factory and set `for_windows_solution_dir` to the
+  forward-slash-normalised string form of its solution directory.
+- EXPECTED: logs_dir equals expected["logs_dir"].
+- EXPECTED: tests_dir equals expected["tests_dir"].
+- EXPECTED: solution_dir equals expected["solution_dir"].
+- EXPECTED: verifier_dir equals expected["verifier_dir"].
+- EXPECTED: reward_json_path equals expected["reward_json_path"].
+- EXPECTED: for_windows_solution_dir equals expected["for_windows_solution_dir"].
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+os_input = "linux"
+[story.test_case.expected]
+logs_dir = "/logs"
+tests_dir = "/tests"
+solution_dir = "/solution"
+verifier_dir = "/logs/verifier"
+reward_json_path = "/logs/verifier/reward.json"
+for_windows_solution_dir = "C:/solution"
+
+[[story.test_case]]
+[story.test_case.inputs]
+os_input = "windows"
+[story.test_case.expected]
+logs_dir = "C:/logs"
+tests_dir = "C:/tests"
+solution_dir = "C:/solution"
+verifier_dir = "C:/logs/verifier"
+reward_json_path = "C:/logs/verifier/reward.json"
+for_windows_solution_dir = "C:/solution"
+
+
+# ===========================================================================
+# Story 3 — agent Windows-capability + trial preflight
+# ===========================================================================
+[[story]]
+id = "agent_os_compat_contract"
+driver = "pytest"
+description = """
+Agents should declare whether they can run Windows tasks. Off by default for
+real agents, but need to add no-op and oracle support. A Windows task paired
+with an agent that cannot run Windows fails fast with a clear error.
+"""
+procedure = """
+- Import the base agent class, the no-op agent class, and the oracle agent
+  class from harbor's agents package. Discover how an agent advertises
+  Windows-task support — a class attribute or a method — and its name. Using
+  that mechanism, read the capability for each class and set `base_flag`,
+  `nop_flag`, `oracle_flag` to "True"/"False" strings (str of the bool).
+- Discover and import the OS enum from harbor's task-config module; build the
+  enum member whose `.value` equals `inputs["task_os"]` as `task_os_member`.
+- Import `make_preflight_trial` from `test_harness` and `import asyncio` and
+  `from unittest.mock import AsyncMock, MagicMock`.
+- Build a mock agent and set its Windows-capability via the SAME discovered
+  mechanism to `inputs["agent_supports_windows"]`: for a class attribute set
+  that attribute on the mock; for a method set that method's `.return_value`.
+  Also set `agent.name.return_value = "test-agent"`, `agent.setup = AsyncMock()`,
+  and `agent.to_agent_info.return_value = MagicMock()`.
+- Build the trial via `trial, agent = make_preflight_trial(
+    tmp_path=tmp_path, task_os_member=task_os_member, agent=agent)`.
+- Discover where the trial enforces agent/OS compatibility before agent setup.
+  Drive that pre-setup path inside ONE try/except that catches `Exception`:
+    * If the implementation enforces the preflight in a SEPARATE method that
+      runs before agent setup, call that (synchronous) method first.
+    * Then call `asyncio.run(trial._setup_agent())`.
+  If any exception is raised, set `preflight_outcome` = "raised"; otherwise
+  "completed".
+- Set `setup_awaited` to "yes" if `agent.setup.await_count` is greater than 0,
+  else "no".
+- EXPECTED: base_flag equals expected["base_flag"].
+- EXPECTED: nop_flag equals expected["nop_flag"].
+- EXPECTED: oracle_flag equals expected["oracle_flag"].
+- EXPECTED: preflight_outcome equals expected["preflight_outcome"].
+- EXPECTED: setup_awaited equals expected["setup_awaited"].
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+agent_supports_windows = false
+task_os = "windows"
+[story.test_case.expected]
+base_flag = "False"
+nop_flag = "True"
+oracle_flag = "True"
+preflight_outcome = "raised"
+setup_awaited = "no"
+
+[[story.test_case]]
+[story.test_case.inputs]
+agent_supports_windows = true
+task_os = "windows"
+[story.test_case.expected]
+base_flag = "False"
+nop_flag = "True"
+oracle_flag = "True"
+preflight_outcome = "completed"
+setup_awaited = "yes"
+
+[[story.test_case]]
+[story.test_case.inputs]
+agent_supports_windows = false
+task_os = "linux"
+[story.test_case.expected]
+base_flag = "False"
+nop_flag = "True"
+oracle_flag = "True"
+preflight_outcome = "completed"
+setup_awaited = "yes"

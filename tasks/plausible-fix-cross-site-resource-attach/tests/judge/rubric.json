@@ -1,0 +1,15 @@
+{
+  "files": [
+    "lib/plausible/goal.ex",
+    "lib/plausible/goals/goals.ex",
+    "lib/plausible/segments/segment.ex",
+    "lib/plausible/segments/segments.ex",
+    "lib/plausible/shield/country_rule.ex",
+    "lib/plausible/shield/hostname_rule.ex",
+    "lib/plausible/shield/ip_rule.ex",
+    "lib/plausible/shield/page_rule.ex",
+    "lib/plausible_web/live/shared_link_settings.ex"
+  ],
+  "fail_to_pass": [],
+  "pass_to_pass": []
+}

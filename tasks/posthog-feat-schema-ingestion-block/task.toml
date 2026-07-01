@@ -1,0 +1,207 @@
+version = "1.0"
+
+[environment]
+base_image = "posthog-feat-schema-ingestion-block:latest"
+build_timeout_sec = 1500.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 2400.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "posthog"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "posthog"
+
+[metadata]
+family = "posthog-feat-schema-ingestion-block"
+variant = "hard"
+segment = "design"
+repo = "posthog"
+tags = ["posthog", "python-service", "typescript-service", "typescript-frontend"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """PostHog supports defining property groups against an event so users
+can document the schema an event is meant to follow. The system has
+not yet enforced those schemas — events stream into ClickHouse no
+matter how badly they violate the registered shape, and analytics
+queries silently see null for required properties. Customers with
+strict-data requirements have asked for an opt-in mode: per event
+definition, they want to flip a switch that says "reject events
+that don't match this schema at ingestion time, and surface them
+so I can debug what's broken".
+
+Build that end-to-end. The model layer is already in place
+(EventDefinition has an enforcement-mode column with `allow` /
+`reject`, and EventSchema/SchemaPropertyGroup are already in
+production), but the API does not expose the toggle, the ingestion
+pipeline does not enforce anything, and the data-management UI has
+no controls for it. The new ingestion warning needs to be visible
+in the existing ingestion-warnings view.
+
+Type checking should match the semantics that already apply
+elsewhere in the system — values that ClickHouse can't store
+should not be accepted as a valid property value just because
+JavaScript can hold them.
+"""
+context = """Event ingestion in PostHog runs in the Node.js service under
+nodejs/. Events flow through a multi-stage pipeline (parse, validate
+metadata, validate properties, resolve team, apply restrictions,
+drop old events, …); the relevant subpipeline for this feature is
+the post-team-preprocessing one in
+nodejs/src/ingestion/analytics/post-team-preprocessing-subpipeline.ts.
+Steps are factories returning ProcessingStep<T, T>; the helpers `ok`
+and `drop` from nodejs/src/ingestion/pipelines/results.ts encode the
+success/drop outcome.
+
+Schema configuration lives in three Django models in
+posthog/models/schema.py: SchemaPropertyGroup (a reusable bundle of
+properties), SchemaPropertyGroupProperty (one row per property,
+typed as String/Numeric/Boolean/DateTime/Object plus an
+`is_required` flag), and EventSchema (a join table linking an
+EventDefinition to zero-or-more SchemaPropertyGroups). The data is
+stored in Postgres (`posthog_eventdefinition`, `posthog_eventschema`,
+`posthog_schemapropertygroupproperty`) and the ingestion pipeline
+already has a PostgresRouter on the hub.
+
+PostHog has an existing LazyLoader pattern in
+nodejs/src/utils/lazy-loader.ts that other team-scoped caches
+(team-manager.ts, action-manager-cdp.ts) use to amortize Postgres
+reads with a per-key refresh window — this is a natural primitive
+to reach for when caching schemas.
+
+The frontend uses Kea for state; the relevant logic file is
+frontend/src/scenes/data-management/events/eventDefinitionSchemaLogic.ts
+and the component is EventDefinitionSchema.tsx. There is an existing
+sibling `definitionLogic` that already loads the EventDefinition row
+the component is showing.
+
+PostHog also has an "ingestion warnings" surface in
+frontend/src/scenes/data-management/ingestion-warnings/ where each
+known warning type has a description and a custom renderer; new
+ingestion warning types need entries in both maps.
+
+Naive implementations get the type-coercion semantics wrong because
+the Node.js side is permissive (`Number("")` is 0,
+`typeof Infinity === 'number'`) but ClickHouse silently drops these
+values. The reference example cross-checked the
+Numeric/Boolean/DateTime rules against
+`posthog/hogql/transforms/property_types.py`'s
+`PropertySwapper._field_type_to_property_call` — that is the source
+of truth for which JS values can survive a PostHog property column.
+"""
+solution = """Reference example:
+
+1. Backend (Django, Python). Adds `enforcement_mode` to the
+   EventDefinition serializer (and the EE variant) so the existing
+   PATCH endpoint accepts it; adds `mixins.UpdateModelMixin` to the
+   EventSchemaViewSet so the existing event_schemas/{id} URL accepts
+   PATCH (used by the frontend to edit schemas in place).
+
+2. Node.js ingestion pipeline. Adds a `validateEventAgainstSchema`
+   pure function that mirrors PostHog's ClickHouse coercion rules
+   for the five property types, plus a
+   `createValidateEventSchemaStep(schemaManager)` factory that wraps
+   it as a ProcessingStep. Adds an `EventSchemaEnforcementManager`
+   that uses LazyLoader to cache per-team schemas (refresh window 2
+   minutes, 30s jitter) and emits the lookup with a single SQL query
+   joining posthog_eventdefinition (filtered to
+   enforcement_mode='reject') to posthog_eventschema and
+   posthog_schemapropertygroupproperty (filtered to is_required=true),
+   aggregating accepted property types via `array_agg(DISTINCT ...)`.
+   Wires everything into the post-team-preprocessing subpipeline
+   behind an `EVENT_SCHEMA_ENFORCEMENT_ENABLED` feature flag (default
+   true).
+
+3. Frontend (React/Kea/TS). Adds a `SchemaEnforcementMode` enum to
+   types.ts, an `enforcement_mode` field on `EventDefinition`, an
+   `update` method on `api.eventSchemas`, a `LemonCheckbox` toggle
+   on `<EventDefinitionSchema>` with disabled-reason copy when no
+   schemas exist, a `schemaEnforcementMode` selector + matching
+   listener `updateSchemaEnforcementMode` on
+   `eventDefinitionSchemaLogic` (connecting to the existing
+   `definitionLogic` to read the current value and write back via
+   `setDefinition`), and a renderer + description for the new
+   `schema_validation_failed` warning type in IngestionWarningsView.
+
+Valid alternatives:
+- Different file/folder layout for the validator + manager. The
+  natural placement is `nodejs/src/ingestion/event-preprocessing/`
+  for the step and `nodejs/src/utils/` for the manager, but
+  alternatives are accepted as long as the step is wired into the
+  ingestion subpipeline.
+- Different class name for the manager and step factory.
+- Different warning type string consumed end-to-end by both the
+  Node.js drop site and the frontend renderer.
+- Custom `@action(detail=True, methods=['patch'])` on the
+  EventSchemaViewSet instead of `UpdateModelMixin`, as long as PATCH
+  returns a 2xx status.
+- Different SQL shape for the schema lookup (joins, CTE, multiple
+  roundtrips). What matters is that `enforcement_mode='reject'` and
+  `is_required=true` filters are applied and that types are
+  aggregated when a property appears in multiple groups for the same
+  event.
+- The kill-switch flag `EVENT_SCHEMA_ENFORCEMENT_ENABLED` may be
+  omitted; not having a kill-switch is suboptimal but not wrong.
+- Inlined validator (no separate pure function export).
+
+What naive implementations get wrong:
+- Using `typeof v === 'number'` for Numeric and accepting NaN /
+  Infinity / booleans, which ClickHouse silently drops.
+- Accepting `1`/`0` or `"yes"`/`"no"` for Boolean.
+- Treating `null`/`undefined` as type_mismatch instead of
+  missing_required.
+- Forgetting that an event can belong to multiple property groups
+  with type disagreement and rejecting valid events that match one
+  group but not another.
+- Loading enforced schemas on every event with no caching.
+- Putting the validation step before team resolution (no team in
+  scope).
+- Watching only `posthog_eventschema` rows but not gating on
+  `EventDefinition.enforcement_mode='reject'`.
+- Forgetting to filter to `is_required=true` and rejecting events
+  for missing optional properties.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-service", "typescript-service", "typescript-frontend"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "interface-design", "cross-service-reasoning", "framework-fluency", "data-model-design", "api-contract-design", "state-management"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 437
+files = 17
+hunks = 39
+scope = "extensive"
+
+[metadata.origin]
+repo = "PostHog/posthog"
+pr_numbers = [42450]
+base_commit = "7b55ed749f24284504b7abf32e93e15c1e454eda"
+base_commit_date = "2026-02-19"
+merged_at = "2026-02-19"
+
+
+
+

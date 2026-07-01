@@ -1,0 +1,1508 @@
+diff --git a/elixir/lib/portal_web/components/core_components.ex b/elixir/lib/portal_web/components/core_components.ex
+index c43d4b9adf..d69a49bc1a 100644
+--- a/elixir/lib/portal_web/components/core_components.ex
++++ b/elixir/lib/portal_web/components/core_components.ex
+@@ -1718,7 +1718,7 @@ defmodule PortalWeb.CoreComponents do
+   """
+   attr :status, :atom,
+     required: true,
+-    values: [:online, :offline, :active, :disabled, :healthy, :degraded]
++    values: [:online, :offline, :active, :disabled, :healthy, :degraded, :expired]
+ 
+   def status_badge(assigns) do
+     assigns = assign(assigns, :cfg, status_badge_config(assigns.status))
+@@ -1781,4 +1781,12 @@ defmodule PortalWeb.CoreComponents do
+       dot_class: "bg-red-500"
+     }
+   end
++
++  defp status_badge_config(:expired) do
++    %{
++      label: "Expired",
++      pill_class: "bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400",
++      dot_class: "bg-gray-400"
++    }
++  end
+ end
+diff --git a/elixir/lib/portal_web/live/clients.ex b/elixir/lib/portal_web/live/clients.ex
+index 54abf0fa26..ef352ee4d0 100644
+--- a/elixir/lib/portal_web/live/clients.ex
++++ b/elixir/lib/portal_web/live/clients.ex
+@@ -13,6 +13,12 @@ defmodule PortalWeb.Clients do
+       socket
+       |> assign(page_title: "Clients")
+       |> assign(selected_client: nil)
++      |> assign(
++        policy_authorizations: [],
++        policy_authorizations_page: 1,
++        policy_authorizations_has_next: false,
++        policy_authorizations_expanded_id: nil
++      )
+       |> assign(base_client_assigns())
+       |> assign_live_table("clients",
+         query_module: Database,
+@@ -30,14 +36,32 @@ defmodule PortalWeb.Clients do
+   end
+ 
+   def handle_params(%{"id" => id} = params, uri, %{assigns: %{live_action: :show}} = socket) do
++    t = Map.get(params, "tab", "overview")
++    tab = if t in ~w[overview authorizations], do: String.to_existing_atom(t), else: :overview
++
++    page =
++      case Integer.parse(Map.get(params, "page", "1")) do
++        {n, ""} when n >= 1 -> n
++        _ -> 1
++      end
++
+     socket = handle_live_tables_params(socket, params, uri)
+     client = Database.get_client_for_panel(id, socket.assigns.subject)
+ 
+     if client do
++      {policy_authorizations, has_next} =
++        Database.list_policy_authorizations_for_client(client, socket.assigns.subject, page)
++
+       {:noreply,
+        socket
+        |> assign(selected_client: client)
+-       |> assign(show_client_assigns())}
++       |> assign(show_client_assigns(tab))
++       |> assign(
++         policy_authorizations: policy_authorizations,
++         policy_authorizations_page: page,
++         policy_authorizations_has_next: has_next,
++         policy_authorizations_expanded_id: nil
++       )}
+     else
+       {:noreply, push_patch(socket, to: ~p"/#{socket.assigns.account}/clients")}
+     end
+@@ -217,6 +241,10 @@ defmodule PortalWeb.Clients do
+         panel={client_panel_state(assigns)}
+         confirm_state={client_confirm_state(assigns)}
+         query_params={@query_params}
++        policy_authorizations={@policy_authorizations}
++        policy_authorizations_page={@policy_authorizations_page}
++        policy_authorizations_has_next={@policy_authorizations_has_next}
++        policy_authorizations_expanded_id={@policy_authorizations_expanded_id}
+       />
+     </div>
+     """
+@@ -225,6 +253,7 @@ defmodule PortalWeb.Clients do
+   defp client_panel_state(assigns) do
+     %{
+       panel_view: assigns.client_panel.view,
++      panel_tab: assigns.client_panel.tab,
+       client_edit_form: assigns.client_panel.edit_form
+     }
+   end
+@@ -239,6 +268,7 @@ defmodule PortalWeb.Clients do
+     [
+       client_panel: %{
+         view: :details,
++        tab: :overview,
+         edit_form: nil
+       },
+       client_confirm: %{
+@@ -247,12 +277,16 @@ defmodule PortalWeb.Clients do
+     ]
+   end
+ 
+-  defp show_client_assigns, do: base_client_assigns()
++  defp show_client_assigns(tab) do
++    assigns = base_client_assigns()
++    Keyword.update!(assigns, :client_panel, &Map.put(&1, :tab, tab))
++  end
+ 
+   defp edit_client_assigns(form) do
+     [
+       client_panel: %{
+         view: :edit_client,
++        tab: :overview,
+         edit_form: form
+       },
+       client_confirm: %{
+@@ -274,6 +308,34 @@ defmodule PortalWeb.Clients do
+     {:noreply, push_patch(socket, to: ~p"/#{socket.assigns.account}/clients?#{params}")}
+   end
+ 
++  def handle_event("switch_client_tab", %{"tab" => tab}, socket) do
++    params =
++      socket.assigns.query_params
++      |> Map.put("tab", tab)
++      |> Map.delete("page")
++
++    {:noreply,
++     push_patch(socket,
++       to: ~p"/#{socket.assigns.account}/clients/#{socket.assigns.selected_client.id}?#{params}"
++     )}
++  end
++
++  def handle_event("change_policy_authorizations_page", %{"page" => page}, socket) do
++    params = Map.put(socket.assigns.query_params, "page", page)
++
++    {:noreply,
++     push_patch(socket,
++       to: ~p"/#{socket.assigns.account}/clients/#{socket.assigns.selected_client.id}?#{params}"
++     )}
++  end
++
++  def handle_event("toggle_policy_authorization_row", %{"id" => id}, socket) do
++    expanded =
++      if socket.assigns.policy_authorizations_expanded_id == id, do: nil, else: id
++
++    {:noreply, assign(socket, policy_authorizations_expanded_id: expanded)}
++  end
++
+   def handle_event("open_client_edit_form", _params, socket) do
+     {:noreply,
+      push_patch(socket,
+@@ -377,6 +439,10 @@ defmodule PortalWeb.Clients do
+     import Portal.Repo.Query
+     alias Portal.{Presence.Clients, ClientSession, Safe}
+     alias Portal.Device
++    alias Portal.Policy
++    alias Portal.PolicyAuthorization
++    alias Portal.Group
++    alias Portal.Resource
+     alias Portal.Repo.Filter
+     alias Portal.Repo.OffsetPaginator
+ 
+@@ -650,5 +716,71 @@ defmodule PortalWeb.Clients do
+       # Return the queryable unchanged since actual filtering happens above
+       {queryable, true}
+     end
++
++    @page_size 25
++
++    @spec list_policy_authorizations_for_client(
++            Portal.Device.t(),
++            Portal.Authentication.Subject.t(),
++            non_neg_integer()
++          ) :: {[map()], boolean()}
++    def list_policy_authorizations_for_client(client, subject, page \\ 1) do
++      offset = (page - 1) * @page_size
++
++      from(pa in PolicyAuthorization, as: :policy_authorizations)
++      |> where(
++        [policy_authorizations: pa],
++        pa.initiating_device_id == ^client.id or pa.receiving_device_id == ^client.id
++      )
++      |> join(:inner, [policy_authorizations: pa], p in Policy,
++        on: p.id == pa.policy_id,
++        as: :policies
++      )
++      |> join(:left, [policies: p], g in Group,
++        on: g.id == p.group_id,
++        as: :groups
++      )
++      |> join(:inner, [policies: p], r in Resource,
++        on: r.id == p.resource_id,
++        as: :resources
++      )
++      |> join(:left, [policy_authorizations: pa], id in Device,
++        on: id.id == pa.initiating_device_id,
++        as: :initiating_devices
++      )
++      |> join(:left, [policy_authorizations: pa], rd in Device,
++        on: rd.id == pa.receiving_device_id,
++        as: :receiving_devices
++      )
++      |> select(
++        [
++          policy_authorizations: pa,
++          groups: g,
++          resources: r,
++          initiating_devices: id,
++          receiving_devices: rd
++        ],
++        %{
++          authorization: pa,
++          group: g,
++          resource: r,
++          initiating_device: id,
++          receiving_device: rd
++        }
++      )
++      |> order_by([policy_authorizations: pa], desc: pa.inserted_at, desc: pa.id)
++      |> limit(^(@page_size + 1))
++      |> offset(^offset)
++      |> Safe.scoped(subject, :replica)
++      |> Safe.all()
++      |> case do
++        {:error, _} ->
++          {[], false}
++
++        rows ->
++          has_next = length(rows) > @page_size
++          {Enum.take(rows, @page_size), has_next}
++      end
++    end
+   end
+ end
+diff --git a/elixir/lib/portal_web/live/clients/components.ex b/elixir/lib/portal_web/live/clients/components.ex
+index 25a9a89063..104a2a16be 100644
+--- a/elixir/lib/portal_web/live/clients/components.ex
++++ b/elixir/lib/portal_web/live/clients/components.ex
+@@ -202,6 +202,10 @@ defmodule PortalWeb.Clients.Components do
+   attr :panel, :map, required: true
+   attr :confirm_state, :map, required: true
+   attr :query_params, :map, default: %{}
++  attr :policy_authorizations, :list, default: []
++  attr :policy_authorizations_page, :integer, default: 1
++  attr :policy_authorizations_has_next, :boolean, default: false
++  attr :policy_authorizations_expanded_id, :string, default: nil
+ 
+   def client_panel(assigns) do
+     assigns =
+@@ -232,7 +236,12 @@ defmodule PortalWeb.Clients.Components do
+           :if={@panel_view != :edit_client}
+           account={@account}
+           client={@client}
++          tab={@panel_tab}
+           confirm_delete_client={@confirm_delete_client}
++          policy_authorizations={@policy_authorizations}
++          policy_authorizations_page={@policy_authorizations_page}
++          policy_authorizations_has_next={@policy_authorizations_has_next}
++          policy_authorizations_expanded_id={@policy_authorizations_expanded_id}
+         />
+       </div>
+     </div>
+@@ -322,17 +331,68 @@ defmodule PortalWeb.Clients.Components do
+ 
+   attr :account, :any, required: true
+   attr :client, :any, required: true
++  attr :tab, :atom, default: :overview
+   attr :confirm_delete_client, :boolean, default: false
++  attr :policy_authorizations, :list, default: []
++  attr :policy_authorizations_page, :integer, default: 1
++  attr :policy_authorizations_has_next, :boolean, default: false
++  attr :policy_authorizations_expanded_id, :string, default: nil
+ 
+   def client_details_view(assigns) do
+     ~H"""
+     <div class="flex flex-col h-full overflow-hidden">
+       <.client_details_header client={@client} />
+       <div class="flex flex-1 min-h-0 divide-x divide-[var(--border)]">
+-        <div class="flex-1 overflow-y-auto">
+-          <.client_owner_section account={@account} client={@client} />
+-          <.client_device_section client={@client} />
+-          <.client_network_section client={@client} />
++        <div class="flex-1 flex flex-col overflow-hidden">
++          <div
++            role="tablist"
++            class="flex items-end gap-0 px-5 border-b border-[var(--border)] bg-[var(--surface-raised)] shrink-0"
++          >
++            <button
++              role="tab"
++              aria-selected={@tab == :overview}
++              phx-click="switch_client_tab"
++              phx-value-tab="overview"
++              class={[
++                "flex items-center gap-1.5 px-1 py-2.5 mr-5 text-xs font-medium border-b-2 transition-colors",
++                if(@tab == :overview,
++                  do: "border-[var(--brand)] text-[var(--brand)]",
++                  else: "border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
++                )
++              ]}
++            >
++              Overview
++            </button>
++            <button
++              role="tab"
++              aria-selected={@tab == :authorizations}
++              phx-click="switch_client_tab"
++              phx-value-tab="authorizations"
++              class={[
++                "flex items-center gap-1.5 px-1 py-2.5 mr-5 text-xs font-medium border-b-2 transition-colors",
++                if(@tab == :authorizations,
++                  do: "border-[var(--brand)] text-[var(--brand)]",
++                  else: "border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
++                )
++              ]}
++            >
++              Authorizations
++            </button>
++          </div>
++          <div :if={@tab == :overview} class="flex-1 overflow-y-auto">
++            <.client_owner_section account={@account} client={@client} />
++            <.client_device_section client={@client} />
++            <.client_network_section client={@client} />
++          </div>
++          <.client_policy_authorizations_tab
++            :if={@tab == :authorizations}
++            account={@account}
++            client={@client}
++            policy_authorizations={@policy_authorizations}
++            page={@policy_authorizations_page}
++            has_next={@policy_authorizations_has_next}
++            expanded_id={@policy_authorizations_expanded_id}
++          />
+         </div>
+         <.client_sidebar client={@client} confirm_delete_client={@confirm_delete_client} />
+       </div>
+@@ -340,6 +400,154 @@ defmodule PortalWeb.Clients.Components do
+     """
+   end
+ 
++  attr :account, :any, required: true
++  attr :client, :any, required: true
++  attr :policy_authorizations, :list, default: []
++  attr :page, :integer, default: 1
++  attr :has_next, :boolean, default: false
++  attr :expanded_id, :string, default: nil
++
++  def client_policy_authorizations_tab(assigns) do
++    ~H"""
++    <div class="flex-1 flex flex-col overflow-hidden">
++      <div
++        :if={@policy_authorizations == []}
++        class="flex flex-col items-center justify-center h-full gap-2 text-[var(--text-tertiary)]"
++      >
++        <.icon name="ri-shield-check-line" class="w-8 h-8" />
++        <p class="text-sm">No recent authorizations</p>
++      </div>
++      <div :if={@policy_authorizations != []} class="flex-1 flex flex-col overflow-hidden">
++        <div class="flex-1 overflow-y-auto">
++          <table class="w-full text-xs">
++            <thead class="sticky top-0 bg-[var(--surface)] z-10">
++              <tr class="border-b border-[var(--border)] text-[var(--text-tertiary)]">
++                <th class="text-left px-4 py-2 font-medium">Resource</th>
++                <th class="text-left px-4 py-2 font-medium">Group</th>
++                <th class="text-left px-4 py-2 font-medium">Authorized</th>
++                <th class="text-left px-4 py-2 font-medium">Expires</th>
++                <th class="w-6"></th>
++              </tr>
++            </thead>
++            <tbody>
++              <%= for row <- @policy_authorizations do %>
++                <tr
++                  phx-click="toggle_policy_authorization_row"
++                  phx-keydown="toggle_policy_authorization_row"
++                  phx-key="Enter"
++                  phx-value-id={row.authorization.id}
++                  tabindex="0"
++                  class="border-b border-[var(--border)] hover:bg-[var(--surface-raised)] cursor-pointer focus:outline-none focus:bg-[var(--surface-raised)]"
++                >
++                  <td class="px-4 py-2 text-[var(--text-primary)]">
++                    {row.resource.name}
++                  </td>
++                  <td class="px-4 py-2 text-[var(--text-secondary)]">
++                    {if row.group, do: row.group.name, else: "Everyone"}
++                  </td>
++                  <td class="px-4 py-2 text-[var(--text-tertiary)]">
++                    <.relative_datetime datetime={row.authorization.inserted_at} />
++                  </td>
++                  <td class="px-4 py-2 text-[var(--text-tertiary)]">
++                    <.relative_datetime datetime={row.authorization.expires_at} />
++                  </td>
++                  <td class="px-4 py-2 text-[var(--text-tertiary)]">
++                    <.icon
++                      name={
++                        if @expanded_id == row.authorization.id,
++                          do: "ri-arrow-up-s-line",
++                          else: "ri-arrow-down-s-line"
++                      }
++                      class="w-4 h-4"
++                    />
++                  </td>
++                </tr>
++                <tr
++                  :if={@expanded_id == row.authorization.id}
++                  class="border-b border-[var(--border)] bg-[var(--surface-raised)]"
++                >
++                  <td colspan="5" class="px-4 py-3">
++                    <div class="grid grid-cols-2 gap-x-8 gap-y-2 text-xs">
++                      <div>
++                        <p class="text-[var(--text-tertiary)] font-medium mb-1">
++                          {case row.initiating_device && row.initiating_device.type do
++                            :gateway -> "Initiator (Gateway)"
++                            :client -> "Initiator (Client)"
++                            _ -> "Initiator"
++                          end}
++                        </p>
++                        <p class="text-[var(--text-primary)]">
++                          {if row.initiating_device, do: row.initiating_device.name, else: "—"}
++                        </p>
++                        <p class="text-[var(--text-tertiary)] font-mono mt-0.5">
++                          {if row.authorization.client_remote_ip,
++                            do: Portal.Types.INET.to_string(row.authorization.client_remote_ip),
++                            else: "—"}
++                        </p>
++                      </div>
++                      <div>
++                        <p class="text-[var(--text-tertiary)] font-medium mb-1">
++                          {case row.receiving_device && row.receiving_device.type do
++                            :gateway -> "Receiver (Gateway)"
++                            :client -> "Receiver (Client)"
++                            _ -> "Receiver"
++                          end}
++                        </p>
++                        <p class="text-[var(--text-primary)]">
++                          {if row.receiving_device, do: row.receiving_device.name, else: "—"}
++                        </p>
++                        <p class="text-[var(--text-tertiary)] font-mono mt-0.5">
++                          {if row.authorization.gateway_remote_ip,
++                            do: Portal.Types.INET.to_string(row.authorization.gateway_remote_ip),
++                            else: "—"}
++                        </p>
++                      </div>
++                      <div>
++                        <p class="text-[var(--text-tertiary)] font-medium mb-1">Owner</p>
++                        <p class="text-[var(--text-primary)]">
++                          {if @client.actor, do: @client.actor.name, else: "—"}
++                        </p>
++                      </div>
++                      <div>
++                        <p class="text-[var(--text-tertiary)] font-medium mb-1">Policy</p>
++                        <.link
++                          navigate={~p"/#{@account}/policies/#{row.authorization.policy_id}"}
++                          class="text-[var(--brand)] hover:underline"
++                        >
++                          {if row.group, do: row.group.name, else: "Everyone"} → {row.resource.name}
++                        </.link>
++                      </div>
++                    </div>
++                  </td>
++                </tr>
++              <% end %>
++            </tbody>
++          </table>
++        </div>
++        <div class="flex items-center justify-between px-4 py-2 border-t border-[var(--border)] shrink-0">
++          <button
++            phx-click="change_policy_authorizations_page"
++            phx-value-page={@page - 1}
++            disabled={@page == 1}
++            class="flex items-center gap-1 text-xs transition-colors disabled:text-[var(--text-muted)] disabled:cursor-not-allowed text-[var(--text-secondary)] hover:enabled:text-[var(--text-primary)]"
++          >
++            <.icon name="ri-arrow-left-s-line" class="w-4 h-4" /> Previous
++          </button>
++          <span class="text-xs text-[var(--text-tertiary)]">Page {@page}</span>
++          <button
++            phx-click="change_policy_authorizations_page"
++            phx-value-page={@page + 1}
++            disabled={not @has_next}
++            class="flex items-center gap-1 text-xs transition-colors disabled:text-[var(--text-muted)] disabled:cursor-not-allowed text-[var(--text-secondary)] hover:enabled:text-[var(--text-primary)]"
++          >
++            Next <.icon name="ri-arrow-right-s-line" class="w-4 h-4" />
++          </button>
++        </div>
++      </div>
++    </div>
++    """
++  end
++
+   attr :client, :any, required: true
+ 
+   def client_details_header(assigns) do
+diff --git a/elixir/lib/portal_web/live/policies.ex b/elixir/lib/portal_web/live/policies.ex
+index 78d61a2904..66bafa35fc 100644
+--- a/elixir/lib/portal_web/live/policies.ex
++++ b/elixir/lib/portal_web/live/policies.ex
+@@ -28,6 +28,12 @@ defmodule PortalWeb.Policies do
+       |> assign(stale: false)
+       |> assign(page_title: "Policies")
+       |> assign(selected_policy: nil, policy_providers: [])
++      |> assign(
++        policy_authorizations: [],
++        policy_authorizations_page: 1,
++        policy_authorizations_has_next: false,
++        policy_authorizations_expanded_id: nil
++      )
+       |> assign(base_policy_assigns(socket))
+       |> assign_live_table("policies",
+         query_module: Database,
+@@ -46,10 +52,22 @@ defmodule PortalWeb.Policies do
+   end
+ 
+   def handle_params(%{"id" => id} = params, uri, %{assigns: %{live_action: :show}} = socket) do
++    t = Map.get(params, "tab", "overview")
++    tab = if t in ~w[overview authorizations], do: String.to_existing_atom(t), else: :overview
++
++    page =
++      case Integer.parse(Map.get(params, "page", "1")) do
++        {n, ""} when n >= 1 -> n
++        _ -> 1
++      end
++
+     socket = handle_live_tables_params(socket, params, uri)
+     policy = Database.get_policy(id, socket.assigns.subject)
+     providers = Database.all_active_providers(socket.assigns.account, socket.assigns.subject)
+ 
++    {policy_authorizations, has_next} =
++      Database.list_policy_authorizations_for_policy(policy, socket.assigns.subject, page)
++
+     filter_site =
+       with %{"policies_filter" => %{"site_id" => site_id}} <- params do
+         Database.get_site(site_id, socket.assigns.subject)
+@@ -72,8 +90,12 @@ defmodule PortalWeb.Policies do
+          filter_resource: filter_resource,
+          selected_policy: policy,
+          policy_providers: providers,
+-         return_to: uri_path(uri)
+-       ] ++ show_policy_assigns(socket)
++         return_to: uri_path(uri),
++         policy_authorizations: policy_authorizations,
++         policy_authorizations_page: page,
++         policy_authorizations_has_next: has_next,
++         policy_authorizations_expanded_id: nil
++       ] ++ show_policy_assigns(socket, tab)
+      )}
+   end
+ 
+@@ -331,6 +353,10 @@ defmodule PortalWeb.Policies do
+         panel={policy_panel_state(assigns)}
+         conditions_state={policy_conditions_state(assigns)}
+         confirm_state={policy_confirm_state(assigns)}
++        policy_authorizations={@policy_authorizations}
++        policy_authorizations_page={@policy_authorizations_page}
++        policy_authorizations_has_next={@policy_authorizations_has_next}
++        policy_authorizations_expanded_id={@policy_authorizations_expanded_id}
+       />
+     </div>
+     """
+@@ -340,7 +366,8 @@ defmodule PortalWeb.Policies do
+     %{
+       panel_view: assigns.policy_panel.view,
+       panel_form: assigns.policy_panel.form,
+-      panel_selected_resource: assigns.policy_panel.selected_resource
++      panel_selected_resource: assigns.policy_panel.selected_resource,
++      panel_tab: assigns.policy_panel.tab
+     }
+   end
+ 
+@@ -376,7 +403,8 @@ defmodule PortalWeb.Policies do
+       policy_panel: %{
+         view: :list,
+         form: nil,
+-        selected_resource: nil
++        selected_resource: nil,
++        tab: :overview
+       },
+       policy_conditions: %{
+         timezone: Map.get(socket.private[:connect_params] || %{}, "timezone", "UTC"),
+@@ -404,13 +432,17 @@ defmodule PortalWeb.Policies do
+ 
+   defp default_policy_assigns(socket), do: base_policy_assigns(socket)
+ 
+-  defp show_policy_assigns(socket), do: base_policy_assigns(socket)
++  defp show_policy_assigns(socket, tab) do
++    assigns = base_policy_assigns(socket)
++    Keyword.update!(assigns, :policy_panel, &Map.put(&1, :tab, tab))
++  end
+ 
+   defp new_policy_assigns(socket, form) do
+     Keyword.put(base_policy_assigns(socket), :policy_panel, %{
+       view: :new_form,
+       form: form,
+-      selected_resource: nil
++      selected_resource: nil,
++      tab: :overview
+     })
+   end
+ 
+@@ -418,7 +450,8 @@ defmodule PortalWeb.Policies do
+     Keyword.put(base_policy_assigns(socket), :policy_panel, %{
+       view: :edit_form,
+       form: form,
+-      selected_resource: policy.resource
++      selected_resource: policy.resource,
++      tab: :overview
+     }) ++ init_condition_assigns(policy, socket)
+   end
+ 
+@@ -442,6 +475,34 @@ defmodule PortalWeb.Policies do
+     {:noreply, push_patch(socket, to: ~p"/#{socket.assigns.account}/policies?#{params}")}
+   end
+ 
++  def handle_event("switch_policy_tab", %{"tab" => tab}, socket) do
++    params =
++      socket.assigns.query_params
++      |> Map.put("tab", tab)
++      |> Map.delete("page")
++
++    {:noreply,
++     push_patch(socket,
++       to: ~p"/#{socket.assigns.account}/policies/#{socket.assigns.selected_policy.id}?#{params}"
++     )}
++  end
++
++  def handle_event("change_policy_authorizations_page", %{"page" => page}, socket) do
++    params = Map.put(socket.assigns.query_params, "page", page)
++
++    {:noreply,
++     push_patch(socket,
++       to: ~p"/#{socket.assigns.account}/policies/#{socket.assigns.selected_policy.id}?#{params}"
++     )}
++  end
++
++  def handle_event("toggle_policy_authorization_row", %{"id" => id}, socket) do
++    expanded =
++      if socket.assigns.policy_authorizations_expanded_id == id, do: nil, else: id
++
++    {:noreply, assign(socket, policy_authorizations_expanded_id: expanded)}
++  end
++
+   def handle_event("handle_keydown", %{"key" => "Escape"}, socket)
+       when socket.assigns.policy_panel.view in [:new_form, :edit_form] do
+     path =
+@@ -922,6 +983,10 @@ defmodule PortalWeb.Policies do
+     import Ecto.Query
+     import Portal.Repo.Query
+     alias Portal.{Safe, Policy, Site, Resource, Group}
++    alias Portal.PolicyAuthorization
++    alias Portal.ClientToken
++    alias Portal.Actor
++    alias Portal.Device
+     alias Portal.Authentication
+ 
+     def get_site(id, subject) do
+@@ -1222,5 +1287,57 @@ defmodule PortalWeb.Policies do
+         join(queryable, :inner, [policies: p], r in assoc(p, :resource), as: :resource)
+       end
+     end
++
++    @page_size 25
++
++    @spec list_policy_authorizations_for_policy(
++            Portal.Policy.t(),
++            Portal.Authentication.Subject.t(),
++            non_neg_integer()
++          ) :: {[map()], boolean()}
++    def list_policy_authorizations_for_policy(policy, subject, page \\ 1) do
++      offset = (page - 1) * @page_size
++
++      from(pa in PolicyAuthorization, as: :policy_authorizations)
++      |> where([policy_authorizations: pa], pa.policy_id == ^policy.id)
++      |> join(:inner, [policy_authorizations: pa], t in ClientToken,
++        on: t.id == pa.token_id,
++        as: :tokens
++      )
++      |> join(:left, [tokens: t], a in Actor,
++        on: a.id == t.actor_id,
++        as: :actors
++      )
++      |> join(:left, [policy_authorizations: pa], id in Device,
++        on: id.id == pa.initiating_device_id,
++        as: :initiating_devices
++      )
++      |> join(:left, [policy_authorizations: pa], rd in Device,
++        on: rd.id == pa.receiving_device_id,
++        as: :receiving_devices
++      )
++      |> select(
++        [policy_authorizations: pa, actors: a, initiating_devices: id, receiving_devices: rd],
++        %{
++          authorization: pa,
++          actor: a,
++          initiating_device: id,
++          receiving_device: rd
++        }
++      )
++      |> order_by([policy_authorizations: pa], desc: pa.inserted_at, desc: pa.id)
++      |> limit(^(@page_size + 1))
++      |> offset(^offset)
++      |> Safe.scoped(subject, :replica)
++      |> Safe.all()
++      |> case do
++        {:error, _} ->
++          {[], false}
++
++        rows ->
++          has_next = length(rows) > @page_size
++          {Enum.take(rows, @page_size), has_next}
++      end
++    end
+   end
+ end
+diff --git a/elixir/lib/portal_web/live/policies/components.ex b/elixir/lib/portal_web/live/policies/components.ex
+index f1cca109d1..8d33607915 100644
+--- a/elixir/lib/portal_web/live/policies/components.ex
++++ b/elixir/lib/portal_web/live/policies/components.ex
+@@ -157,6 +157,10 @@ defmodule PortalWeb.Policies.Components do
+   attr :panel, :map, required: true
+   attr :conditions_state, :map, required: true
+   attr :confirm_state, :map, required: true
++  attr :policy_authorizations, :list, default: []
++  attr :policy_authorizations_page, :integer, default: 1
++  attr :policy_authorizations_has_next, :boolean, default: false
++  attr :policy_authorizations_expanded_id, :string, default: nil
+ 
+   def policy_panel(assigns) do
+     cs = assigns.conditions_state
+@@ -225,8 +229,13 @@ defmodule PortalWeb.Policies.Components do
+         account={@account}
+         policy={@policy}
+         providers={@providers}
++        tab={@panel.panel_tab}
+         confirm_disable_policy={@confirm_state.confirm_disable_policy}
+         confirm_delete_policy={@confirm_state.confirm_delete_policy}
++        policy_authorizations={@policy_authorizations}
++        policy_authorizations_page={@policy_authorizations_page}
++        policy_authorizations_has_next={@policy_authorizations_has_next}
++        policy_authorizations_expanded_id={@policy_authorizations_expanded_id}
+       />
+     </div>
+     """
+@@ -573,8 +582,13 @@ defmodule PortalWeb.Policies.Components do
+   attr :account, :any, required: true
+   attr :policy, :any, required: true
+   attr :providers, :list, default: []
++  attr :tab, :atom, default: :overview
+   attr :confirm_disable_policy, :boolean, default: false
+   attr :confirm_delete_policy, :boolean, default: false
++  attr :policy_authorizations, :list, default: []
++  attr :policy_authorizations_page, :integer, default: 1
++  attr :policy_authorizations_has_next, :boolean, default: false
++  attr :policy_authorizations_expanded_id, :string, default: nil
+ 
+   def policy_details_view(assigns) do
+     ~H"""
+@@ -584,8 +598,13 @@ defmodule PortalWeb.Policies.Components do
+         account={@account}
+         policy={@policy}
+         providers={@providers}
++        tab={@tab}
+         confirm_disable_policy={@confirm_disable_policy}
+         confirm_delete_policy={@confirm_delete_policy}
++        policy_authorizations={@policy_authorizations}
++        policy_authorizations_page={@policy_authorizations_page}
++        policy_authorizations_has_next={@policy_authorizations_has_next}
++        policy_authorizations_expanded_id={@policy_authorizations_expanded_id}
+       />
+     </div>
+     """
+@@ -594,15 +613,66 @@ defmodule PortalWeb.Policies.Components do
+   attr :account, :any, required: true
+   attr :policy, :any, required: true
+   attr :providers, :list, default: []
++  attr :tab, :atom, default: :overview
+   attr :confirm_disable_policy, :boolean, default: false
+   attr :confirm_delete_policy, :boolean, default: false
++  attr :policy_authorizations, :list, default: []
++  attr :policy_authorizations_page, :integer, default: 1
++  attr :policy_authorizations_has_next, :boolean, default: false
++  attr :policy_authorizations_expanded_id, :string, default: nil
+ 
+   def policy_details_layout(assigns) do
+     ~H"""
+     <div class="flex flex-1 min-h-0 divide-x divide-[var(--border)]">
+-      <div class="flex-1 flex flex-col overflow-y-auto">
+-        <.policy_access_mapping account={@account} policy={@policy} />
+-        <.policy_conditions_list account={@account} policy={@policy} providers={@providers} />
++      <div class="flex-1 flex flex-col overflow-hidden">
++        <div
++          role="tablist"
++          class="flex items-end gap-0 px-5 border-b border-[var(--border)] bg-[var(--surface-raised)] shrink-0"
++        >
++          <button
++            role="tab"
++            aria-selected={@tab == :overview}
++            phx-click="switch_policy_tab"
++            phx-value-tab="overview"
++            class={[
++              "flex items-center gap-1.5 px-1 py-2.5 mr-5 text-xs font-medium border-b-2 transition-colors",
++              if(@tab == :overview,
++                do: "border-[var(--brand)] text-[var(--brand)]",
++                else: "border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
++              )
++            ]}
++          >
++            Overview
++          </button>
++          <button
++            role="tab"
++            aria-selected={@tab == :authorizations}
++            phx-click="switch_policy_tab"
++            phx-value-tab="authorizations"
++            class={[
++              "flex items-center gap-1.5 px-1 py-2.5 mr-5 text-xs font-medium border-b-2 transition-colors",
++              if(@tab == :authorizations,
++                do: "border-[var(--brand)] text-[var(--brand)]",
++                else: "border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
++              )
++            ]}
++          >
++            Authorizations
++          </button>
++        </div>
++        <div :if={@tab == :overview} class="flex-1 overflow-y-auto">
++          <.policy_access_mapping account={@account} policy={@policy} />
++          <.policy_conditions_list account={@account} policy={@policy} providers={@providers} />
++        </div>
++        <.policy_authorizations_tab
++          :if={@tab == :authorizations}
++          account={@account}
++          policy={@policy}
++          policy_authorizations={@policy_authorizations}
++          page={@policy_authorizations_page}
++          has_next={@policy_authorizations_has_next}
++          expanded_id={@policy_authorizations_expanded_id}
++        />
+       </div>
+       <.policy_sidebar
+         policy={@policy}
+@@ -836,6 +906,150 @@ defmodule PortalWeb.Policies.Components do
+     """
+   end
+ 
++  attr :account, :any, required: true
++  attr :policy, :any, required: true
++  attr :policy_authorizations, :list, default: []
++  attr :page, :integer, default: 1
++  attr :has_next, :boolean, default: false
++  attr :expanded_id, :string, default: nil
++
++  def policy_authorizations_tab(assigns) do
++    ~H"""
++    <div class="flex-1 flex flex-col overflow-hidden">
++      <div
++        :if={@policy_authorizations == []}
++        class="flex flex-col items-center justify-center h-full gap-2 text-[var(--text-tertiary)]"
++      >
++        <.icon name="ri-shield-check-line" class="w-8 h-8" />
++        <p class="text-sm">No recent authorizations</p>
++      </div>
++      <div :if={@policy_authorizations != []} class="flex-1 flex flex-col overflow-hidden">
++        <div class="flex-1 overflow-y-auto">
++          <table class="w-full text-xs">
++            <thead class="sticky top-0 bg-[var(--surface)] z-10">
++              <tr class="border-b border-[var(--border)] text-[var(--text-tertiary)]">
++                <th class="text-left px-4 py-2 font-medium">Actor</th>
++                <th class="text-left px-4 py-2 font-medium">Authorized</th>
++                <th class="text-left px-4 py-2 font-medium">Expires</th>
++                <th class="w-6"></th>
++              </tr>
++            </thead>
++            <tbody>
++              <%= for row <- @policy_authorizations do %>
++                <tr
++                  phx-click="toggle_policy_authorization_row"
++                  phx-keydown="toggle_policy_authorization_row"
++                  phx-key="Enter"
++                  phx-value-id={row.authorization.id}
++                  tabindex="0"
++                  class="border-b border-[var(--border)] hover:bg-[var(--surface-raised)] cursor-pointer focus:outline-none focus:bg-[var(--surface-raised)]"
++                >
++                  <td class="px-4 py-2 text-[var(--text-primary)]">
++                    {if row.actor, do: row.actor.name, else: "—"}
++                  </td>
++                  <td class="px-4 py-2 text-[var(--text-tertiary)]">
++                    <.relative_datetime datetime={row.authorization.inserted_at} />
++                  </td>
++                  <td class="px-4 py-2 text-[var(--text-tertiary)]">
++                    <.relative_datetime datetime={row.authorization.expires_at} />
++                  </td>
++                  <td class="px-4 py-2 text-[var(--text-tertiary)]">
++                    <.icon
++                      name={
++                        if @expanded_id == row.authorization.id,
++                          do: "ri-arrow-up-s-line",
++                          else: "ri-arrow-down-s-line"
++                      }
++                      class="w-4 h-4"
++                    />
++                  </td>
++                </tr>
++                <tr
++                  :if={@expanded_id == row.authorization.id}
++                  class="border-b border-[var(--border)] bg-[var(--surface-raised)]"
++                >
++                  <td colspan="4" class="px-4 py-3">
++                    <div class="grid grid-cols-2 gap-x-8 gap-y-2 text-xs">
++                      <div>
++                        <p class="text-[var(--text-tertiary)] font-medium mb-1">
++                          {case row.initiating_device && row.initiating_device.type do
++                            :gateway -> "Initiator (Gateway)"
++                            :client -> "Initiator (Client)"
++                            _ -> "Initiator"
++                          end}
++                        </p>
++                        <p class="text-[var(--text-primary)]">
++                          {if row.initiating_device, do: row.initiating_device.name, else: "—"}
++                        </p>
++                        <p class="text-[var(--text-tertiary)] font-mono mt-0.5">
++                          {if row.authorization.client_remote_ip,
++                            do: Portal.Types.INET.to_string(row.authorization.client_remote_ip),
++                            else: "—"}
++                        </p>
++                      </div>
++                      <div>
++                        <p class="text-[var(--text-tertiary)] font-medium mb-1">
++                          {case row.receiving_device && row.receiving_device.type do
++                            :gateway -> "Receiver (Gateway)"
++                            :client -> "Receiver (Client)"
++                            _ -> "Receiver"
++                          end}
++                        </p>
++                        <p class="text-[var(--text-primary)]">
++                          {if row.receiving_device, do: row.receiving_device.name, else: "—"}
++                        </p>
++                        <p class="text-[var(--text-tertiary)] font-mono mt-0.5">
++                          {if row.authorization.gateway_remote_ip,
++                            do: Portal.Types.INET.to_string(row.authorization.gateway_remote_ip),
++                            else: "—"}
++                        </p>
++                      </div>
++                      <div>
++                        <p class="text-[var(--text-tertiary)] font-medium mb-1">Owner</p>
++                        <p class="text-[var(--text-primary)]">
++                          {if row.actor, do: row.actor.name, else: "—"}
++                        </p>
++                      </div>
++                      <div>
++                        <p class="text-[var(--text-tertiary)] font-medium mb-1">Resource</p>
++                        <.link
++                          navigate={~p"/#{@account}/resources/#{@policy.resource_id}"}
++                          class="text-[var(--brand)] hover:underline"
++                        >
++                          {@policy.resource.name}
++                        </.link>
++                      </div>
++                    </div>
++                  </td>
++                </tr>
++              <% end %>
++            </tbody>
++          </table>
++        </div>
++        <div class="flex items-center justify-between px-4 py-2 border-t border-[var(--border)] shrink-0">
++          <button
++            phx-click="change_policy_authorizations_page"
++            phx-value-page={@page - 1}
++            disabled={@page == 1}
++            class="flex items-center gap-1 text-xs transition-colors disabled:text-[var(--text-muted)] disabled:cursor-not-allowed text-[var(--text-secondary)] hover:enabled:text-[var(--text-primary)]"
++          >
++            <.icon name="ri-arrow-left-s-line" class="w-4 h-4" /> Previous
++          </button>
++          <span class="text-xs text-[var(--text-tertiary)]">Page {@page}</span>
++          <button
++            phx-click="change_policy_authorizations_page"
++            phx-value-page={@page + 1}
++            disabled={not @has_next}
++            class="flex items-center gap-1 text-xs transition-colors disabled:text-[var(--text-muted)] disabled:cursor-not-allowed text-[var(--text-secondary)] hover:enabled:text-[var(--text-primary)]"
++          >
++            Next <.icon name="ri-arrow-right-s-line" class="w-4 h-4" />
++          </button>
++        </div>
++      </div>
++    </div>
++    """
++  end
++
+   attr :policy, :any, required: true
+   attr :confirm_disable_policy, :boolean, default: false
+   attr :confirm_delete_policy, :boolean, default: false
+diff --git a/elixir/lib/portal_web/live/resources.ex b/elixir/lib/portal_web/live/resources.ex
+index e47750cc4f..54781ee30f 100644
+--- a/elixir/lib/portal_web/live/resources.ex
++++ b/elixir/lib/portal_web/live/resources.ex
+@@ -37,7 +37,15 @@ defmodule PortalWeb.Resources do
+       socket
+       |> assign(stale: false)
+       |> assign(page_title: "Resources")
+-      |> assign(selected_resource: nil, selected_groups: [], internet_resource: nil)
++      |> assign(
++        selected_resource: nil,
++        selected_groups: [],
++        policy_authorizations: [],
++        policy_authorizations_page: 1,
++        policy_authorizations_has_next: false,
++        policy_authorizations_expanded_id: nil,
++        internet_resource: nil
++      )
+       |> assign(resource_state_assigns(socket))
+       |> assign_live_table("resources",
+         query_module: Database,
+@@ -52,16 +60,38 @@ defmodule PortalWeb.Resources do
+   end
+ 
+   def handle_params(%{"id" => id} = params, uri, %{assigns: %{live_action: :show}} = socket) do
++    tab =
++      case Map.get(params, "tab", "groups") do
++        t when t in ~w[groups authorizations] -> String.to_existing_atom(t)
++        _ -> :groups
++      end
++
++    page =
++      case Integer.parse(Map.get(params, "page", "1")) do
++        {n, ""} when n >= 1 -> n
++        _ -> 1
++      end
++
+     resource = Database.get_resource!(id, socket.assigns.subject)
+     groups = Database.list_groups_for_resource(resource, socket.assigns.subject)
+-    socket = handle_live_tables_params(socket, params, uri)
+ 
++    {policy_authorizations, has_next_page} =
++      Database.list_policy_authorizations_for_resource(resource, socket.assigns.subject, page)
++
++    socket = handle_live_tables_params(socket, params, uri)
+     filter_site = filter_site_from_params(params, socket.assigns.subject)
+ 
+     {:noreply,
+      socket
+-     |> assign(filter_site: filter_site, selected_resource: resource, selected_groups: groups)
+-     |> assign(show_resource_state_assigns(socket))}
++     |> assign(
++       filter_site: filter_site,
++       selected_resource: resource,
++       selected_groups: groups,
++       policy_authorizations: policy_authorizations,
++       policy_authorizations_page: page,
++       policy_authorizations_has_next: has_next_page
++     )
++     |> assign(show_resource_state_assigns(socket, tab))}
+   end
+ 
+   def handle_params(params, uri, %{assigns: %{live_action: :new}} = socket) do
+@@ -112,16 +142,17 @@ defmodule PortalWeb.Resources do
+      |> assign(resource_state_assigns(socket))}
+   end
+ 
+-  defp resource_state_assigns(socket) do
++  defp resource_state_assigns(socket, overrides \\ []) do
+     [
+-      resource_panel: base_resource_panel(socket),
++      resource_panel: base_resource_panel(socket, overrides),
+       resource_form: base_resource_form(nil, []),
+       resource_grant: base_resource_grant(socket),
+       resource_ui: base_resource_ui()
+     ]
+   end
+ 
+-  defp show_resource_state_assigns(socket), do: resource_state_assigns(socket)
++  defp show_resource_state_assigns(socket, tab),
++    do: resource_state_assigns(socket, tab: tab)
+ 
+   defp new_resource_state_assigns(socket, resource_form, sites) do
+     [
+@@ -152,6 +183,7 @@ defmodule PortalWeb.Resources do
+       overrides,
+       %{
+         view: :list,
++        tab: :groups,
+         timezone: Map.get(connect_params, "timezone", "UTC"),
+         client_to_client_enabled?: Database.client_to_client_enabled?(socket.assigns.account)
+       }
+@@ -518,7 +550,12 @@ defmodule PortalWeb.Resources do
+             account={@account}
+             resource={@selected_resource}
+             groups={@selected_groups}
++            policy_authorizations={@policy_authorizations}
++            policy_authorizations_page={@policy_authorizations_page}
++            policy_authorizations_has_next={@policy_authorizations_has_next}
++            policy_authorizations_expanded_id={@policy_authorizations_expanded_id}
+             panel_view={@resource_panel.view}
++            tab={@resource_panel.tab}
+             grant_state={resource_grant_panel_state(assigns)}
+             ui_state={resource_panel_ui_state(assigns)}
+           />
+@@ -566,6 +603,34 @@ defmodule PortalWeb.Resources do
+     {:noreply, push_patch(socket, to: cancel_resource_form_path(socket))}
+   end
+ 
++  def handle_event("switch_resource_tab", %{"tab" => tab}, socket) do
++    params =
++      socket.assigns.query_params
++      |> Map.put("tab", tab)
++      |> Map.delete("page")
++
++    {:noreply,
++     push_patch(socket,
++       to: ~p"/#{socket.assigns.account}/resources/#{socket.assigns.selected_resource.id}?#{params}"
++     )}
++  end
++
++  def handle_event("change_policy_authorizations_page", %{"page" => page}, socket) do
++    params = Map.put(socket.assigns.query_params, "page", page)
++
++    {:noreply,
++     push_patch(socket,
++       to: ~p"/#{socket.assigns.account}/resources/#{socket.assigns.selected_resource.id}?#{params}"
++     )}
++  end
++
++  def handle_event("toggle_policy_authorization_row", %{"id" => id}, socket) do
++    expanded =
++      if socket.assigns.policy_authorizations_expanded_id == id, do: nil, else: id
++
++    {:noreply, assign(socket, policy_authorizations_expanded_id: expanded)}
++  end
++
+   def handle_event("change_resource_form", %{"resource" => attrs} = payload, socket) do
+     address_description_changed? =
+       socket.assigns.resource_form.address_description_changed? ||
+@@ -1184,6 +1249,10 @@ defmodule PortalWeb.Resources do
+     alias Portal.Resource
+     alias Portal.StaticDevicePoolMember
+     alias Portal.Policy
++    alias Portal.PolicyAuthorization
++    alias Portal.ClientToken
++    alias Portal.Actor
++    alias Portal.Device
+     alias Portal.Site
+     alias Portal.Group
+     alias Portal.Directory
+@@ -1385,6 +1454,67 @@ defmodule PortalWeb.Resources do
+       end
+     end
+ 
++    @page_size 25
++
++    @spec list_policy_authorizations_for_resource(
++            Portal.Resource.t(),
++            Portal.Authentication.Subject.t(),
++            non_neg_integer()
++          ) :: {[map()], boolean()}
++    def list_policy_authorizations_for_resource(resource, subject, page \\ 1) do
++      offset = (page - 1) * @page_size
++
++      from(pa in PolicyAuthorization, as: :policy_authorizations)
++      |> where([policy_authorizations: pa], pa.resource_id == ^resource.id)
++      |> join(:inner, [policy_authorizations: pa], p in Policy,
++        on: p.id == pa.policy_id,
++        as: :policies
++      )
++      |> join(:left, [policies: p], g in Group,
++        on: g.id == p.group_id,
++        as: :groups
++      )
++      |> join(:inner, [policy_authorizations: pa], t in ClientToken,
++        on: t.id == pa.token_id,
++        as: :tokens
++      )
++      |> join(:left, [tokens: t], a in Actor,
++        on: a.id == t.actor_id,
++        as: :actors
++      )
++      |> join(:left, [policy_authorizations: pa], id in Device,
++        on: id.id == pa.initiating_device_id,
++        as: :initiating_devices
++      )
++      |> join(:left, [policy_authorizations: pa], rd in Device,
++        on: rd.id == pa.receiving_device_id,
++        as: :receiving_devices
++      )
++      |> select(
++        [policy_authorizations: pa, groups: g, actors: a, initiating_devices: id, receiving_devices: rd],
++        %{
++          authorization: pa,
++          group: g,
++          actor: a,
++          initiating_device: id,
++          receiving_device: rd
++        }
++      )
++      |> order_by([policy_authorizations: pa], desc: pa.inserted_at, desc: pa.id)
++      |> limit(^(@page_size + 1))
++      |> offset(^offset)
++      |> Safe.scoped(subject, :replica)
++      |> Safe.all()
++      |> case do
++        {:error, _} ->
++          {[], false}
++
++        rows ->
++          has_next = length(rows) > @page_size
++          {Enum.take(rows, @page_size), has_next}
++      end
++    end
++
+     def list_available_groups(_resource, existing_group_ids, subject) do
+       from(g in Group, as: :groups)
+       |> where([groups: g], g.id not in ^existing_group_ids)
+diff --git a/elixir/lib/portal_web/live/resources/components.ex b/elixir/lib/portal_web/live/resources/components.ex
+index 0d18a6ef52..ee1f536059 100644
+--- a/elixir/lib/portal_web/live/resources/components.ex
++++ b/elixir/lib/portal_web/live/resources/components.ex
+@@ -993,7 +993,12 @@ defmodule PortalWeb.Resources.Components do
+   attr :account, :any, required: true
+   attr :resource, :any, required: true
+   attr :groups, :list, default: []
++  attr :policy_authorizations, :list, default: []
++  attr :policy_authorizations_page, :integer, default: 1
++  attr :policy_authorizations_has_next, :boolean, default: false
++  attr :policy_authorizations_expanded_id, :string, default: nil
+   attr :panel_view, :atom, required: true
++  attr :tab, :atom, default: :groups
+   attr :grant_state, :map, required: true
+   attr :ui_state, :map, required: true
+ 
+@@ -1065,17 +1070,31 @@ defmodule PortalWeb.Resources.Components do
+       </div>
+       <div class="flex flex-1 min-h-0 divide-x divide-[var(--border)]">
+         <div class="flex-1 flex flex-col overflow-hidden">
++          <.resource_tabs
++            tab={@tab}
++            groups_count={length(@groups)}
++            panel_view={@panel_view}
++          />
+           <.resource_access_list
+-            :if={@panel_view == :list}
++            :if={@tab == :groups && @panel_view == :list}
+             account={@account}
+             groups={@groups}
+             ui_state={@ui_state}
+           />
+           <.resource_grant_form
+-            :if={@panel_view == :grant_form}
++            :if={@tab == :groups && @panel_view == :grant_form}
+             resource={@resource}
+             grant_state={@grant_state}
+           />
++          <.resource_policy_authorizations_tab
++            :if={@tab == :authorizations}
++            policy_authorizations={@policy_authorizations}
++            page={@policy_authorizations_page}
++            has_next={@policy_authorizations_has_next}
++            expanded_id={@policy_authorizations_expanded_id}
++            account={@account}
++            resource={@resource}
++          />
+         </div>
+         <.resource_sidebar
+           account={@account}
+@@ -1087,6 +1106,67 @@ defmodule PortalWeb.Resources.Components do
+     """
+   end
+ 
++  attr :tab, :atom, required: true
++  attr :groups_count, :integer, default: 0
++  attr :panel_view, :atom, required: true
++
++  def resource_tabs(assigns) do
++    ~H"""
++    <div
++      role="tablist"
++      class="flex items-end gap-0 px-5 border-b border-[var(--border)] bg-[var(--surface-raised)] shrink-0"
++    >
++      <button
++        role="tab"
++        aria-selected={@tab == :groups}
++        phx-click="switch_resource_tab"
++        phx-value-tab="groups"
++        class={[
++          "flex items-center gap-1.5 px-1 py-2.5 mr-5 text-xs font-medium border-b-2 transition-colors",
++          if(@tab == :groups,
++            do: "border-[var(--brand)] text-[var(--brand)]",
++            else: "border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
++          )
++        ]}
++      >
++        Groups
++        <span class={[
++          "tabular-nums px-1.5 py-0.5 rounded text-[10px] font-semibold",
++          if(@tab == :groups,
++            do: "bg-[var(--brand-muted)] text-[var(--brand)]",
++            else: "bg-[var(--surface-raised)] text-[var(--text-tertiary)]"
++          )
++        ]}>
++          {@groups_count}
++        </span>
++      </button>
++      <button
++        role="tab"
++        aria-selected={@tab == :authorizations}
++        phx-click="switch_resource_tab"
++        phx-value-tab="authorizations"
++        class={[
++          "flex items-center gap-1.5 px-1 py-2.5 mr-5 text-xs font-medium border-b-2 transition-colors",
++          if(@tab == :authorizations,
++            do: "border-[var(--brand)] text-[var(--brand)]",
++            else: "border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
++          )
++        ]}
++      >
++        Authorizations
++      </button>
++      <div :if={@tab == :groups && @panel_view == :list} class="ml-auto pb-2 flex items-center">
++        <button
++          phx-click="open_grant_form"
++          class="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[var(--border-strong)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--border-emphasis)] bg-[var(--surface)] transition-colors"
++        >
++          <.icon name="ri-add-line" class="w-3 h-3" /> Grant access
++        </button>
++      </div>
++    </div>
++    """
++  end
++
+   attr :account, :any, required: true
+   attr :groups, :list, default: []
+   attr :ui_state, :map, required: true
+@@ -1095,20 +1175,6 @@ defmodule PortalWeb.Resources.Components do
+     assigns = assign(assigns, assigns.ui_state)
+ 
+     ~H"""
+-    <div class="flex items-center justify-between px-5 py-2.5 border-b border-[var(--border)] bg-[var(--surface-raised)] shrink-0">
+-      <div class="flex items-center gap-2">
+-        <span class="text-xs font-semibold text-[var(--text-primary)]">
+-          Groups with access
+-        </span>
+-        <span class="text-xs text-[var(--text-tertiary)]">{length(@groups)}</span>
+-      </div>
+-      <button
+-        phx-click="open_grant_form"
+-        class="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[var(--border-strong)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--border-emphasis)] bg-[var(--surface)] transition-colors"
+-      >
+-        <.icon name="ri-add-line" class="w-3 h-3" /> Grant access
+-      </button>
+-    </div>
+     <div class="flex-1 overflow-y-auto">
+       <ul>
+         <li
+@@ -1481,6 +1547,154 @@ defmodule PortalWeb.Resources.Components do
+     """
+   end
+ 
++  attr :policy_authorizations, :list, default: []
++  attr :page, :integer, default: 1
++  attr :has_next, :boolean, default: false
++  attr :expanded_id, :string, default: nil
++  attr :account, :any, required: true
++  attr :resource, :any, required: true
++
++  def resource_policy_authorizations_tab(assigns) do
++    ~H"""
++    <div class="flex-1 flex flex-col overflow-hidden">
++      <div
++        :if={@policy_authorizations == []}
++        class="flex flex-col items-center justify-center h-full gap-2 text-[var(--text-tertiary)]"
++      >
++        <.icon name="ri-shield-check-line" class="w-8 h-8" />
++        <p class="text-sm">No recent policy authorizations</p>
++      </div>
++      <div :if={@policy_authorizations != []} class="flex-1 flex flex-col overflow-hidden">
++        <div class="flex-1 overflow-y-auto">
++          <table class="w-full text-xs">
++            <thead class="sticky top-0 bg-[var(--surface)] z-10">
++              <tr class="border-b border-[var(--border)] text-[var(--text-tertiary)]">
++                <th class="text-left px-4 py-2 font-medium">Actor</th>
++                <th class="text-left px-4 py-2 font-medium">Group</th>
++                <th class="text-left px-4 py-2 font-medium">Authorized</th>
++                <th class="text-left px-4 py-2 font-medium">Expires</th>
++                <th class="w-6"></th>
++              </tr>
++            </thead>
++            <tbody>
++              <%= for row <- @policy_authorizations do %>
++                <tr
++                  phx-click="toggle_policy_authorization_row"
++                  phx-keydown="toggle_policy_authorization_row"
++                  phx-key="Enter"
++                  phx-value-id={row.authorization.id}
++                  tabindex="0"
++                  class="border-b border-[var(--border)] hover:bg-[var(--surface-raised)] cursor-pointer focus:outline-none focus:bg-[var(--surface-raised)]"
++                >
++                  <td class="px-4 py-2 text-[var(--text-primary)]">
++                    {if row.actor, do: row.actor.name, else: "—"}
++                  </td>
++                  <td class="px-4 py-2 text-[var(--text-secondary)]">
++                    {if row.group, do: row.group.name, else: "(deleted group)"}
++                  </td>
++                  <td class="px-4 py-2 text-[var(--text-tertiary)]">
++                    <.relative_datetime datetime={row.authorization.inserted_at} />
++                  </td>
++                  <td class="px-4 py-2 text-[var(--text-tertiary)]">
++                    <.relative_datetime datetime={row.authorization.expires_at} />
++                  </td>
++                  <td class="px-4 py-2 text-[var(--text-tertiary)]">
++                    <.icon
++                      name={
++                        if @expanded_id == row.authorization.id,
++                          do: "ri-arrow-up-s-line",
++                          else: "ri-arrow-down-s-line"
++                      }
++                      class="w-4 h-4"
++                    />
++                  </td>
++                </tr>
++                <tr
++                  :if={@expanded_id == row.authorization.id}
++                  class="border-b border-[var(--border)] bg-[var(--surface-raised)]"
++                >
++                  <td colspan="5" class="px-4 py-3">
++                    <div class="grid grid-cols-2 gap-x-8 gap-y-2 text-xs">
++                      <div>
++                        <p class="text-[var(--text-tertiary)] font-medium mb-1">
++                          {case row.initiating_device && row.initiating_device.type do
++                            :gateway -> "Initiator (Gateway)"
++                            :client -> "Initiator (Client)"
++                            _ -> "Initiator"
++                          end}
++                        </p>
++                        <p class="text-[var(--text-primary)]">
++                          {if row.initiating_device, do: row.initiating_device.name, else: "—"}
++                        </p>
++                        <p class="text-[var(--text-tertiary)] font-mono mt-0.5">
++                          {if row.authorization.client_remote_ip,
++                            do: Portal.Types.INET.to_string(row.authorization.client_remote_ip),
++                            else: "—"}
++                        </p>
++                      </div>
++                      <div>
++                        <p class="text-[var(--text-tertiary)] font-medium mb-1">
++                          {case row.receiving_device && row.receiving_device.type do
++                            :gateway -> "Receiver (Gateway)"
++                            :client -> "Receiver (Client)"
++                            _ -> "Receiver"
++                          end}
++                        </p>
++                        <p class="text-[var(--text-primary)]">
++                          {if row.receiving_device, do: row.receiving_device.name, else: "—"}
++                        </p>
++                        <p class="text-[var(--text-tertiary)] font-mono mt-0.5">
++                          {if row.authorization.gateway_remote_ip,
++                            do: Portal.Types.INET.to_string(row.authorization.gateway_remote_ip),
++                            else: "—"}
++                        </p>
++                      </div>
++                      <div>
++                        <p class="text-[var(--text-tertiary)] font-medium mb-1">Owner</p>
++                        <p class="text-[var(--text-primary)]">
++                          {if row.actor, do: row.actor.name, else: "—"}
++                        </p>
++                      </div>
++                      <div>
++                        <p class="text-[var(--text-tertiary)] font-medium mb-1">Policy</p>
++                        <.link
++                          navigate={~p"/#{@account}/policies/#{row.authorization.policy_id}"}
++                          class="text-[var(--brand)] hover:underline"
++                        >
++                          {if row.group, do: row.group.name, else: "Everyone"} → {@resource.name}
++                        </.link>
++                      </div>
++                    </div>
++                  </td>
++                </tr>
++              <% end %>
++            </tbody>
++          </table>
++        </div>
++        <div class="flex items-center justify-between px-4 py-2 border-t border-[var(--border)] shrink-0">
++          <button
++            phx-click="change_policy_authorizations_page"
++            phx-value-page={@page - 1}
++            disabled={@page == 1}
++            class="flex items-center gap-1 text-xs transition-colors disabled:text-[var(--text-muted)] disabled:cursor-not-allowed text-[var(--text-secondary)] hover:enabled:text-[var(--text-primary)]"
++          >
++            <.icon name="ri-arrow-left-s-line" class="w-4 h-4" /> Previous
++          </button>
++          <span class="text-xs text-[var(--text-tertiary)]">Page {@page}</span>
++          <button
++            phx-click="change_policy_authorizations_page"
++            phx-value-page={@page + 1}
++            disabled={not @has_next}
++            class="flex items-center gap-1 text-xs transition-colors disabled:text-[var(--text-muted)] disabled:cursor-not-allowed text-[var(--text-secondary)] hover:enabled:text-[var(--text-primary)]"
++          >
++            Next <.icon name="ri-arrow-right-s-line" class="w-4 h-4" />
++          </button>
++        </div>
++      </div>
++    </div>
++    """
++  end
++
+   attr :account, :any, required: true
+   attr :resource, :any, required: true
+   attr :ui_state, :map, required: true

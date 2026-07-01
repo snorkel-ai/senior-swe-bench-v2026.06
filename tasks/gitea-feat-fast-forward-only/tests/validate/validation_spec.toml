@@ -1,0 +1,321 @@
+stack_profile = "go-integration"
+
+instructions = """
+All stories use the **go-test** driver and exercise gitea's real
+in-process integration harness. The framework injects a
+`validation_params_test.go` helper alongside your test file that exposes
+`GetValidationTestCases(t) []ValidationTestCase` (each case has
+`Name`, `Inputs map[string]interface{}`, `Expected map[string]interface{}`).
+
+Your test file(s) MUST:
+
+- Live under `tests/integration/` (the `go_package` for every story) and
+  use `package integration` so they compile next to the existing
+  `tests/integration/integration_test.go` (which already defines
+  `TestMain` and calls `tests.InitTest`). DO NOT redefine `TestMain`.
+- Wrap the body of each case in `onGiteaRun(t, func(t *testing.T, giteaURL *url.URL) { ... })`
+  so a live server is available.
+
+### The scenario every story sets up (shared recipe)
+
+The behavior under test is gitea's merge pre-check when the base branch
+**requires signed commits** and the instance has **no signing key**
+(`SIGNING_KEY = none` in the test config). In that situation gitea cannot
+produce a signed merge commit. Each story drives one merge *style* against
+a pull request whose head commit is **unverified** (gitea created it on the
+user's behalf with no key, so it is not a verified commit) and observes how
+the merge endpoint rejects it.
+
+Perform this setup inside `onGiteaRun` before every merge attempt:
+
+```go
+session := loginUser(t, "user1")
+testRepoFork(t, session, "user2", "repo1", "user1", "repo1", "")
+// Editor commit is created by gitea on behalf of user1; with no signing
+// key it is NOT verified -> the PR head is unverified.
+testEditFileToNewBranch(t, session, "user1", "repo1", "master", "update", "README.md", "Hello, signed\n")
+
+token := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+createPRReq := NewRequestWithJSON(t, http.MethodPost, "/api/v1/repos/user1/repo1/pulls",
+    &api.CreatePullRequestOption{Head: "update", Base: "master", Title: "ff-only under require-signed-commits"},
+).AddTokenAuth(token)
+session.MakeRequest(t, createPRReq, http.StatusCreated)
+
+user1 := unittest.AssertExistsAndLoadBean(t, &user_model.User{Name: "user1"})
+repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{OwnerID: user1.ID, Name: "repo1"})
+pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{
+    HeadRepoID: repo1.ID, BaseRepoID: repo1.ID, HeadBranch: "update", BaseBranch: "master",
+})
+
+// Require signed commits on master.
+require.NoError(t, git_model.UpdateProtectBranch(t.Context(), repo1, &git_model.ProtectedBranch{
+    RepoID: repo1.ID, RuleName: "master", RequireSignedCommits: true,
+}, git_model.WhitelistOptions{}))
+
+prIndex := strconv.FormatInt(pr.Index, 10)
+```
+
+### Driving the WEB merge endpoint
+
+```go
+values := map[string]string{"do": mergeStyle}      // from inputs["merge_style"]
+if forceMerge { values["force_merge"] = "true" }   // from inputs["force_merge"]
+req := NewRequestWithValues(t, http.MethodPost, "/user1/repo1/pulls/"+prIndex+"/merge", values)
+resp := session.MakeRequest(t, req, expectedStatus)            // expectedStatus from expected["http_status"]
+reason := test.ParseJSONError(resp.Body.Bytes()).ErrorMessage  // the user-facing rejection reason
+```
+
+Note `session.MakeRequest(t, req, expectedStatus)` ASSERTS the response
+status equals `expectedStatus` and fails the test otherwise — so passing
+`expected["http_status"]` there both drives and checks the status code.
+
+### Driving the API merge endpoint
+
+```go
+apiReq := NewRequestWithJSON(t, http.MethodPost,
+    "/api/v1/repos/user1/repo1/pulls/"+prIndex+"/merge",
+    &forms.MergePullRequestForm{Do: mergeStyle},
+).AddTokenAuth(token)
+resp := session.MakeRequest(t, apiReq, expectedStatus)   // expected["api_http_status"]
+apiErr := DecodeJSON(t, resp, &api.APIError{})
+reason := apiErr.Message
+```
+
+### Discover the actual merge invocation
+
+The endpoints above are driven with the pre-fix form, but the implementation
+may extend *how* a merge is invoked — e.g. an added form field or JSON
+parameter the new verified-head path expects. Before asserting, read the
+implementing agent's merge handler / form struct for any new or changed
+parameters on these endpoints and include them in your request wherever a
+scenario needs them; discover the actual invocation shape from the source
+rather than assuming the pre-fix form is fixed.
+
+### Required imports
+
+```go
+import (
+    "net/http"
+    "net/url"
+    "strconv"
+    "testing"
+
+    auth_model "code.gitea.io/gitea/models/auth"
+    git_model "code.gitea.io/gitea/models/git"
+    issues_model "code.gitea.io/gitea/models/issues"
+    repo_model "code.gitea.io/gitea/models/repo"
+    "code.gitea.io/gitea/models/unittest"
+    user_model "code.gitea.io/gitea/models/user"
+    api "code.gitea.io/gitea/modules/structs"
+    "code.gitea.io/gitea/modules/test"
+    "code.gitea.io/gitea/services/forms"
+
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/require"
+)
+```
+
+### Comparing the rejection reason (do NOT hardcode the new wording)
+
+The string `inputs["generic_signing_reason"]` (always `"wont sign: nokey"`)
+is gitea's *unchanged* "the instance cannot sign" rejection. The new
+"head commits are not verified" wording is implementation-defined (it may
+be localized or worded differently), so NEVER assert its exact text.
+Instead:
+
+- When `expected["reason_matches_generic_signing"]` is `true`, assert
+  `reason == inputs["generic_signing_reason"]`.
+- When it is `false`, assert `reason != inputs["generic_signing_reason"]`
+  AND `reason != ""` (a non-empty, different reason).
+
+### NOP baseline rule (CRITICAL)
+
+If no implementation has been applied (the pre-fix tree), the merge
+pre-check refuses EVERY style — including fast-forward-only and regular
+merge — with exactly `"wont sign: nokey"`, and the API returns 405 with
+that same message. So on the pre-fix tree the divergence stories
+(`reason_matches_generic_signing = false`) will fail, which is the correct
+nop signal. Write the test straightforwardly against the harness above;
+do NOT add fallbacks or explore the source to make the divergence stories
+pass on nop.
+"""
+
+# ---------------------------------------------------------------------------
+# Story 1: rebase / rebase-merge / squash stay refused with the generic
+# instance-cannot-sign reason (control — holds pre-fix AND post-fix).
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "rebase_styles_still_refused_with_instance_signing_error"
+driver = "go-test"
+go_module_dir = ""
+go_package = "tests/integration"
+
+description = """
+With "require signed commits" enabled on the base branch and no instance
+signing key, any merge style where gitea rewrites and re-signs the user's
+commits should be refused with the unchanged "the instance cannot sign"
+reason.
+"""
+
+procedure = """
+Run the shared setup from the instructions block, then POST the WEB merge
+endpoint with `do = inputs["merge_style"]` and no force flag.
+
+- EXPECTED: the merge is rejected with HTTP status `expected["http_status"]`
+  (pass it as the asserted status to `session.MakeRequest`).
+- EXPECTED: the parsed rejection reason equals `expected["rejection_reason"]`
+  exactly (these styles still require the instance to sign, so the reason is
+  unchanged).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+merge_style = "rebase"
+[story.test_case.expected]
+http_status = 400
+rejection_reason = "wont sign: nokey"
+
+[[story.test_case]]
+[story.test_case.inputs]
+merge_style = "rebase-merge"
+[story.test_case.expected]
+http_status = 400
+rejection_reason = "wont sign: nokey"
+
+[[story.test_case]]
+[story.test_case.inputs]
+merge_style = "squash"
+[story.test_case.expected]
+http_status = 400
+rejection_reason = "wont sign: nokey"
+
+# ---------------------------------------------------------------------------
+# Story 2: fast-forward-only no longer refused with the generic signing
+# reason; rejected for the unverified head instead (incl. admin force-merge).
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "fast_forward_only_diverges_from_instance_signing_error"
+driver = "go-test"
+go_module_dir = ""
+go_package = "tests/integration"
+
+description = "A fast-forward-only merge creates no new gitea commit (it only advances the base branch pointer), so the instance's inability to sign should not block it. But the protection should stay meaningful: with an unverified head commit the merge is still refused (otherwise the push would later be rejected by the pre-receive hook), just for a reason other than the generic \"instance cannot sign\" one."
+
+procedure = """
+Run the shared setup, then POST the WEB merge endpoint with
+`do = inputs["merge_style"]` (fast-forward-only). When
+`inputs["force_merge"]` is true, also send `force_merge=true` (user1 is a
+site admin and may force-merge).
+
+- EXPECTED: the request is rejected with HTTP status `expected["http_status"]`.
+- EXPECTED: `expected["reason_matches_generic_signing"]` is false, so assert
+  the parsed reason is non-empty AND differs from
+  `inputs["generic_signing_reason"]` — a fast-forward-only merge must not be
+  refused with the generic instance-cannot-sign reason, with or without
+  force.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+merge_style = "fast-forward-only"
+force_merge = false
+generic_signing_reason = "wont sign: nokey"
+[story.test_case.expected]
+http_status = 400
+reason_matches_generic_signing = false
+
+[[story.test_case]]
+[story.test_case.inputs]
+merge_style = "fast-forward-only"
+force_merge = true
+generic_signing_reason = "wont sign: nokey"
+[story.test_case.expected]
+http_status = 400
+reason_matches_generic_signing = false
+
+# ---------------------------------------------------------------------------
+# Story 3: regular merge also uses the head-verification path.
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "regular_merge_uses_head_verification_path"
+driver = "go-test"
+go_module_dir = ""
+go_package = "tests/integration"
+
+description = """
+A regular merge keeps the user's head commits on the branch, so when signed
+commits are required its head-commit verification fires first: with an
+unverified head it is rejected for the "head commits are not verified"
+reason rather than the generic "instance cannot sign" reason.
+"""
+
+procedure = """
+Run the shared setup, then POST the WEB merge endpoint with
+`do = inputs["merge_style"]` (merge), no force flag.
+
+- EXPECTED: the request is rejected with HTTP status `expected["http_status"]`.
+- EXPECTED: `expected["reason_matches_generic_signing"]` is false, so assert
+  the parsed reason is non-empty AND differs from
+  `inputs["generic_signing_reason"]`.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+merge_style = "merge"
+generic_signing_reason = "wont sign: nokey"
+[story.test_case.expected]
+http_status = 400
+reason_matches_generic_signing = false
+
+# ---------------------------------------------------------------------------
+# Story 4: the API surfaces the fast-forward-only unverified-head rejection
+# as 405 Method Not Allowed, with a non-generic reason.
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "api_fast_forward_only_reports_405"
+driver = "go-test"
+go_module_dir = ""
+go_package = "tests/integration"
+
+description = """
+The REST API merge endpoint surfaces the fast-forward-only unverified-head
+rejection as HTTP 405 Method Not Allowed, and the reported reason is the
+"head commits are not verified" reason rather than the generic
+"instance cannot sign" reason.
+"""
+
+procedure = """
+Run the shared setup, then POST the API merge endpoint
+(`/api/v1/repos/user1/repo1/pulls/{index}/merge`) with a write token and a
+JSON body whose `Do` is `inputs["merge_style"]` (fast-forward-only).
+
+- EXPECTED: the response status is `expected["api_http_status"]` (405).
+- EXPECTED: `expected["reason_matches_generic_signing"]` is false, so assert
+  the decoded `APIError.Message` is non-empty AND differs from
+  `inputs["generic_signing_reason"]`.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+merge_style = "fast-forward-only"
+generic_signing_reason = "wont sign: nokey"
+[story.test_case.expected]
+api_http_status = 405
+reason_matches_generic_signing = false
+
+# ---------------------------------------------------------------------------
+# Driver settings
+# ---------------------------------------------------------------------------
+
+[settings]
+# Four stories, each requiring a full fork/edit/PR/branch-protection setup
+# against a live in-process server — give the validation agent ample turns.
+va_max_turns = 200
+
+[settings.go]
+build_tags = ["sqlite", "sqlite_unlock_notify"]
+env = { CGO_ENABLED = "1", GOEXPERIMENT = "jsonv2", GOTOOLCHAIN = "local", GITEA_TEST_CONF = "tests/sqlite.ini" }

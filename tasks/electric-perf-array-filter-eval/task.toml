@@ -1,0 +1,239 @@
+version = "1.0"
+
+[environment]
+base_image = "electric-perf-array-filter-eval:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "electric"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "electric"
+
+[metadata]
+family = "electric-perf-array-filter-eval"
+variant = "hard"
+segment = "investigate"
+repo = "electric"
+tags = ["electric", "elixir"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """On production stacks the sync engine takes hundreds of milliseconds
+to seconds per committed transaction once a tenant has a few hundred
+shapes whose WHERE clauses use `= ANY(array_field)` or
+`IN (const_list)` predicates. p50 fanout latency at 1000 shapes is
+roughly 6× worse for ANY clauses and 15× worse for IN compared to
+shapes whose WHERE clauses use plain equality or array containment.
+At 100 shapes nobody notices; the regression starts mattering once
+shape count grows. Reproduce locally with the existing
+reductions-bounded performance tests in the shape filter suite —
+adding ANY-style and IN-style tests to that suite at the same shape
+count blows past the reduction budget by a wide margin.
+"""
+context = """The sync engine fans changes out to per-shape consumers via the
+`Electric.Shapes.Filter` module under
+`packages/sync-service/lib/electric/shapes/`. `Filter.affected_shapes/2`
+is the per-record hot path: for every record in every committed
+transaction, it must enumerate every shape whose WHERE clause
+matches that record. The filter already has an indexed fast-path for
+`field = const` (via `EqualityIndex`) and `array_field @>
+const_array` (via `InclusionIndex`), built up at shape registration
+time by `WhereCondition.optimise_where/1` walking the parsed WHERE
+expression tree. Anything `optimise_where/1` returns
+`:not_optimised` for falls into a per-table `other_shapes` map and
+is evaluated via `WhereClause.includes_record?` once per record per
+shape — linear in shape count.
+
+`= ANY(array_field)` and `IN (c1, c2, …)` predicates currently fall
+through to that linear scan. The expression parser
+(`Electric.Replication.Eval.Parser`) produces:
+
+  - For `const = ANY(array_field)`: a `%Func{name: "any", args:
+    [%Func{name: ~s("="), map_over_array_in_pos: 1, args: [const,
+    array_ref]}]}` AST node.
+  - For `field IN (c1, c2, …)`: an OR-chain — `field = c1 OR field =
+    c2 OR …` — built by `handle_in/2` calling `build_bool_chain/3`
+    with `name: "or"`. (NOT IN negates the result.)
+
+Both shapes are observable in the existing parser tests and in the
+debug output of `Shape.new!/2`. Both shapes can in principle be
+reduced to one of the existing indexes — ANY decomposes into
+`array_ref @> [const]` (single-element array containment),
+single-field same-type IN decomposes into N equality registrations
+that share the same EqualityIndex.
+
+Files involved (all in `packages/sync-service`):
+
+- `lib/electric/shapes/filter.ex` — the public `Filter` module.
+  Public surface: `new/0`, `add_shape/3`, `remove_shape/2`,
+  `affected_shapes/2`. Drives the per-table `WhereCondition`.
+- `lib/electric/shapes/filter/where_condition.ex` —
+  `optimise_where/1` lives here; this is the central dispatch that
+  decides whether a shape lands in an index or in `other_shapes`.
+  Returns `%{operation: …, field, type, value, and_where}` for
+  optimisable WHEREs and `:not_optimised` for the rest.
+- `lib/electric/shapes/filter/index.ex` — thin dispatcher that
+  selects an index module based on `optimisation.operation`. Has
+  clauses for `"="` → `EqualityIndex` and `"@>"` → `InclusionIndex`.
+- `lib/electric/shapes/filter/indexes/equality_index.ex` and
+  `inclusion_index.ex` — the actual ETS-backed indexes.
+- `test/electric/shapes/filter_test.exs` — the sync-service's
+  in-tree filter test suite. Contains the `optimisations` describe
+  block with reductions-bounded performance tests for `=` and
+  `@>` patterns; the `affected_shapes/2` describe block with
+  parameterised correctness tests; and a `Filter.remove_shape/2`
+  round-trip integration test.
+
+The PR adds two new performance tests in the `optimisations`
+describe — one for ANY and one for IN — at the same shape count
+and reduction budget as the existing `=` test, plus a wider budget
+for the ANY case (deeper AST pattern-match cost). Pre-fix both
+tests fail by overshooting the reduction budget; post-fix both
+pass.
+
+Performance numbers (from the PR body, p50 latency, 1000 shapes,
+3 runs each):
+
+  - `= ANY(tags)`: 5772 ms → 895 ms (6.4× speedup)
+  - `IN (uuid_list)`: 12015 ms → 823 ms (14.6× speedup)
+
+Smaller speedups at lower shape counts; the linear-scan growth of
+the unoptimised path is the cause.
+"""
+solution = """The reference fix reduces both ANY and IN predicates to existing
+index machinery during `WhereCondition.optimise_where/1`:
+
+  1. `const = ANY(array_ref)` is pattern-matched through the parsed
+     expression tree (`%Func{name: "any", args: [%Func{name: \\"=\\",
+     map_over_array_in_pos: 1, args: [%Const, %Ref]}]}`) and
+     reduced to `%{operation: "@>", field, type, value: [const],
+     and_where: nil}` — i.e. a single-element array containment.
+     This is registered into the existing `InclusionIndex` (same
+     ETS table, same prefix-tree walk used for explicit `@>`
+     clauses). Both argument orderings of `=` are handled.
+
+  2. `field IN (c1, c2, …)` is detected by walking an OR chain —
+     `%Func{name: "or", args: [left, right]}` — and validating that
+     every leaf is a same-field, same-type equality. The helper
+     `flatten_or_equalities/1` collects `{field, type, value}`
+     triples and rejects mixed-field or mixed-type chains. Valid
+     chains reduce to `%{operation: "in", field, type, values:
+     [v1, v2, …], and_where: nil}`. `Index.add_shape/4` for
+     `operation: "in"` registers the shape once per value via
+     `EqualityIndex.add_shape` with a per-value optimisation map
+     (`Map.put(eq_base, :value, v)`).
+
+  3. The WhereCondition's `index_keys` MapSet stores keys of the
+     form `{field, operation_alias}`. A new `index_key/1` helper
+     aliases `"in"` → `"="` so that `affected_shapes` iterating
+     `index_keys` calls `EqualityIndex.affected_shapes/4` (via
+     `Filter.Index.affected_shapes/5`) regardless of whether the
+     shape was registered via plain `=` or via `IN`. Without this
+     alias the lookup either crashes (no `module_for("in")` clause)
+     or stores keys that never get queried.
+
+  4. `Index.remove_shape/4` for `operation: "in"` iterates the
+     registered values, calls `EqualityIndex.remove_shape` per
+     value, and aggregates: returns `:deleted` iff any per-value
+     removal cascaded into deleting the last shape on its
+     EqualityIndex entry, else `:ok`.
+
+  5. The AND combinator clause in `optimise_where/1` is broadened.
+     Pre-fix only `operation: "="` qualified as the indexable side
+     that picks up the other branch as an `and_where` residual.
+     Post-fix the guard accepts `operation in ["=", "@>", "in"]`,
+     so `id IN (1,2) AND status = 'active'` reduces to an `in`
+     optimisation on `id` with `status = 'active'` as the residual
+     `and_where` evaluated by `WhereClause.includes_record?` after
+     the indexed lookup narrows the candidate set.
+
+The 6 new parameterised correctness scenarios in
+`filter_test.exs` exercise: bare `1 = ANY(an_array)`,
+`1 = ANY(an_array) AND id = 7` (both AND orderings),
+`id IN (1, 2, 3)`, `id IN (1, 2) AND number > 5` (both AND
+orderings). Records vary `an_array` (`{1}`, `{1,2}`, `{3,2,1}`,
+`{2}`, `nil`, …) and `id` to confirm match / no-match in each
+case. The 6 new shapes added to the round-trip
+`Filter.remove_shape/2` integration test exercise the per-value
+add+remove path under shuffled order so that interleaved IN /
+plain-= shapes against the same field don't leak ETS state.
+
+Acceptable alternative implementations:
+
+  - Dedicated `AnyIndex` / `InIndex` modules instead of reusing
+    InclusionIndex / EqualityIndex. Same observable behaviour
+    through `Filter.affected_shapes/2`, different internal layout.
+  - A single `MultiValueEqualityIndex` covering both ANY (one-value
+    list) and IN (N-value list).
+  - A different OR-chain detection algorithm — e.g. accumulating
+    via `Enum.reduce_while` over a flattened tree.
+  - Decomposing IN at the parser level (`handle_in/2` returns a
+    different intermediate shape) instead of at filter time.
+  - Non-English identifiers throughout. The reward agent never
+    greps for any specific name; assertions only go through
+    `Electric.Shapes.Filter.{add_shape, remove_shape,
+    affected_shapes}`.
+
+Non-optimal "fixes" the verifier rejects:
+
+  - A naive cache around `WhereCondition.other_shapes_affected/4`.
+    Per-record hits a cold cache for distinct records; the
+    reduction budget for `affected_shapes` still scales linearly.
+    Both perf tests fail.
+  - Optimising only ANY but not IN, or vice versa. The unoptimised
+    perf test fails by a wide margin.
+  - Treating an OR chain with mixed fields as IN. Either crashes
+    or returns wrong results for `id = 1 OR number = 2`-style
+    records — caught by the correctness tests.
+  - Forgetting the per-value remove path for `"in"`. The
+    `remove_shape` round-trip test fails or crashes.
+  - Forgetting to alias `"in"` → `"="` in the index_key MapSet.
+    `affected_shapes` no longer finds shapes registered via IN
+    (or crashes on lookup) — caught by the correctness tests.
+"""
+
+[metadata.taxonomy]
+task_type = "performance"
+stack = ["elixir"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "performance-measurement", "performance-optimization", "framework-fluency", "logic-fix", "query-optimization", "data-model-design"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 189
+files = 3
+hunks = 8
+scope = "broad"
+
+[metadata.origin]
+repo = "electric-sql/electric"
+pr_numbers = [3963]
+base_commit = "24949f202912f70dcde11e3096dba22e261b7fff"
+base_commit_date = "2026-03-05"
+merged_at = "2026-03-06"
+
+
+
+

@@ -1,0 +1,303 @@
+stack_profile = "go-library"
+
+instructions = """
+All stories in this task use the **go-test** driver, and all are driven end
+to end through the `usersv1` gRPC `ListUsers` endpoint. The framework
+generates a `validation_params_test.go` helper alongside each test file that
+exposes `GetValidationTestCases(t) []ValidationTestCase`. Every test file
+MUST:
+
+- Live in package `usersv1_test` (external test package). Files are injected
+  into `/repo/teleport/lib/auth/users/usersv1/`, so they are compiled
+  TOGETHER with the existing `service_test.go` in that package. REUSE the
+  helpers already defined there — do NOT redefine them (redefining causes a
+  duplicate-symbol compile error):
+    * `newTestEnv(opts ...serviceOpt) (*env, error)`
+    * `withAuthorizer(authz.Authorizer) serviceOpt` and
+      `withEmitter(apievents.Emitter) serviceOpt`
+    * `fakeAuthorizer{...}` and the `env` type (whose embedded
+      `*usersv1.Service` exposes `CreateUser` and `ListUsers`).
+- Read `tc.Inputs[...]` / `tc.Expected[...]` as `map[string]interface{}`
+  values. JSON unmarshalling delivers strings as `string` and lists as
+  `[]interface{}`; type-assert each element to `string` when building a
+  `[]string`.
+
+### Discover the interface before you drive it
+
+Before writing assertions, read the applied implementation (the agent's patch
+at `/logs/verifier/agent.patch` plus the `api/types` user model) to confirm
+HOW user listing and trait/search matching are invoked and HOW match results
+are read back. In this codebase that is almost certainly the pre-existing
+`usersv1` `ListUsers` endpoint, driven with a `*types.UserFilter` carrying
+`Traits map[string][]string` and `SearchKeywords []string`, with results read
+as the returned user names — but confirm against the actual code rather than
+assuming, and drive ONLY through whatever pre-existing listing surface the
+implementation routes through. Never drive through a method or helper the
+implementation may have added (e.g. a traits-matcher method or a slice
+helper); those are implementation choices and asserting on them would couple
+the score to one structure.
+
+### Shared bootstrap (use in every story)
+
+Build a fresh service env per case (a fresh in-memory backend per case keeps
+cases isolated, so the same user names may be reused across cases/stories).
+This mirrors the existing `TestListUsers`:
+
+```go
+import (
+    "context"
+    "testing"
+
+    "github.com/stretchr/testify/require"
+
+    userspb "github.com/gravitational/teleport/api/gen/proto/go/teleport/users/v1"
+    "github.com/gravitational/teleport/api/types"
+    "github.com/gravitational/teleport/lib/authz"
+    "github.com/gravitational/teleport/lib/events"
+)
+
+func newListEnv(t *testing.T) (*env, context.Context) {
+    t.Helper()
+    authzContext, err := authz.ContextForBuiltinRole(authz.BuiltinRole{
+        Role:     types.RoleAdmin,
+        Username: string(types.RoleAdmin),
+    }, &types.SessionRecordingConfigV2{})
+    require.NoError(t, err)
+    e, err := newTestEnv(
+        withAuthorizer(fakeAuthorizer{authzContext: authzContext}),
+        withEmitter(&events.DiscardEmitter{}),
+    )
+    require.NoError(t, err)
+    return e, context.Background()
+}
+```
+
+NOTE: name your local helper differently per file (e.g. `newListEnvFilter`,
+`newListEnvSearch`) so two injected files never collide on a top-level
+identifier. Create users with ONLY trait data and NO roles (roles would
+trigger a role-existence check on create):
+
+```go
+u, err := types.NewUser(name)
+require.NoError(t, err)
+v2 := u.(*types.UserV2)
+v2.SetTraits(traits) // traits is map[string][]string; omit the call for a no-trait user
+_, err = e.CreateUser(ctx, &userspb.CreateUserRequest{User: v2})
+require.NoError(t, err)
+```
+
+To list and collect names:
+
+```go
+resp, err := e.ListUsers(ctx, &userspb.ListUsersRequest{PageSize: 50, Filter: filter})
+require.NoError(t, err)
+var got []string
+for _, usr := range resp.Users {
+    got = append(got, usr.GetName())
+}
+// Convert tc.Expected["matched_names"].([]interface{}) to []string `want`.
+require.ElementsMatch(t, want, got)
+```
+
+The snippets below use a `toStrings([]interface{}) []string` converter. Define
+one in each file, but give it a FILE-UNIQUE name (e.g. `toStringsFilter`,
+`toStringsSearch`) — both injected files compile into the same package, so a
+shared name like `toStrings` is a duplicate-symbol error:
+
+```go
+func toStringsFilter(in []interface{}) []string {
+    out := make([]string, 0, len(in))
+    for _, v := range in {
+        out = append(out, v.(string))
+    }
+    return out
+}
+```
+"""
+
+# ============================================================
+# Story 1 — a required-traits filter gates ListUsers: conjunctive across
+#           VALUES (subset-of-user) and across KEYS, a no-trait user never
+#           matches a non-empty filter, and an empty filter matches everyone.
+# ============================================================
+
+[[story]]
+id = "list_users_traits_filter"
+driver = "go-test"
+go_module_dir = ""
+go_package = "lib/auth/users/usersv1"
+
+description = "When a user lists users with a required-traits filter, they get back exactly the users whose traits match it. When a key lists several values, only users whose values include EVERY requested value match."
+
+procedure = """
+Package `usersv1_test`. Use the shared bootstrap (name the env helper
+`newListEnvFilter`). For EACH case, create these four users with ONLY the
+traits shown and NO roles:
+  - `dave`  → `{"logins": ["root", "admin"], "groups": ["admins", "devs"]}`
+  - `erin`  → `{"logins": ["root"]}`
+  - `frank` → `{"logins": ["admin"]}`
+  - `grace` → (no traits at all — do not call SetTraits)
+
+Read the requested traits from the case inputs and build the filter
+CONDITIONALLY so single-key and multi-key cases share one story:
+```go
+traits := map[string][]string{}
+if lq, ok := tc.Inputs["login_query"].([]interface{}); ok && len(lq) > 0 {
+    traits["logins"] = toStringsFilter(lq)
+}
+if gq, ok := tc.Inputs["group_query"].([]interface{}); ok && len(gq) > 0 {
+    traits["groups"] = toStringsFilter(gq)
+}
+var filter *types.UserFilter
+if len(traits) > 0 {
+    filter = &types.UserFilter{Traits: traits}
+} else {
+    filter = &types.UserFilter{} // empty filter — matches everyone
+}
+```
+Call `ListUsers` with that filter and collect the returned names.
+EXPECTED: `require.ElementsMatch(t, want, got)`, where `want` is
+`tc.Expected["matched_names"]` converted to `[]string`.
+
+Discriminating cases: requesting logins `["root","admin"]` must return only
+`dave` (subset, not intersection — `erin`/`frank` carry only one value); a
+filter requiring BOTH a `logins` value and a `groups` value must return only
+users satisfying both keys (`erin`/`frank` have no `groups` key, so they drop
+out even when their `logins` matches).
+"""
+
+# subset across values (single key)
+[[story.test_case]]
+[story.test_case.inputs]
+login_query = ["root"]
+[story.test_case.expected]
+matched_names = ["dave", "erin"]
+
+[[story.test_case]]
+[story.test_case.inputs]
+login_query = ["root", "admin"]
+[story.test_case.expected]
+matched_names = ["dave"]
+
+[[story.test_case]]
+[story.test_case.inputs]
+login_query = ["admin"]
+[story.test_case.expected]
+matched_names = ["dave", "frank"]
+
+[[story.test_case]]
+[story.test_case.inputs]
+login_query = ["no-such-login"]
+[story.test_case.expected]
+matched_names = []
+
+# conjunctive across keys (logins AND groups)
+[[story.test_case]]
+[story.test_case.inputs]
+login_query = ["root"]
+group_query = ["admins"]
+[story.test_case.expected]
+# dave: logins⊇[root] AND groups⊇[admins] → match. erin/frank: no groups key.
+# grace: no traits. → only dave
+matched_names = ["dave"]
+
+[[story.test_case]]
+[story.test_case.inputs]
+login_query = ["root"]
+group_query = ["nonexistent"]
+[story.test_case.expected]
+# no user has a groups value "nonexistent"
+matched_names = []
+
+# empty filter matches everyone (including the no-trait user)
+[[story.test_case]]
+[story.test_case.inputs]
+login_query = []
+[story.test_case.expected]
+matched_names = ["dave", "erin", "frank", "grace"]
+
+# ============================================================
+# Story 2 — ListUsers free-text search is widened to trait keys and trait
+#           values, case-insensitively and by substring, in addition to the
+#           pre-existing fields.
+# ============================================================
+
+[[story]]
+id = "list_users_search_widened"
+driver = "go-test"
+go_module_dir = ""
+go_package = "lib/auth/users/usersv1"
+
+description = "When a user lists users with a free-text keyword search, they get back results from matches in trait data (keys and values) in addition to the fields the search already covered. A keyword that matches no user returns nobody."
+
+procedure = """
+Package `usersv1_test`. Use the shared bootstrap (name the env helper
+`newListEnvSearch`). For EACH case, create these two users with ONLY the
+traits shown and NO roles:
+  - `alice` → `{"logins": ["octocat"]}`
+  - `bob`   → `{"groups": ["devs"]}`
+
+Read `query := tc.Inputs["query"].([]interface{})` (convert to `[]string`),
+build `filter := &types.UserFilter{SearchKeywords: query}`, call `ListUsers`
+with that filter, and collect the returned names.
+EXPECTED: `require.ElementsMatch(t, want, got)`, where `want` is
+`tc.Expected["matched_names"]` converted to `[]string`.
+
+Discriminating cases: a keyword equal to a trait KEY (`logins`) must return
+only the users carrying that key (`alice`), and a keyword that is a
+differently-cased substring of a trait value (`OCTO` for `octocat`) or trait
+key (`LOG` for `logins`) must still match — an implementation that searches
+trait values only, or matches exactly/case-sensitively, returns the wrong set.
+"""
+
+# trait value (exact)
+[[story.test_case]]
+[story.test_case.inputs]
+query = ["octocat"]
+[story.test_case.expected]
+matched_names = ["alice"]
+
+# trait value (differently-cased substring)
+[[story.test_case]]
+[story.test_case.inputs]
+query = ["OCTO"]
+[story.test_case.expected]
+matched_names = ["alice"]
+
+# trait key (exact) — only users carrying that key
+[[story.test_case]]
+[story.test_case.inputs]
+query = ["logins"]
+[story.test_case.expected]
+matched_names = ["alice"]
+
+# trait key (differently-cased substring)
+[[story.test_case]]
+[story.test_case.inputs]
+query = ["LOG"]
+[story.test_case.expected]
+matched_names = ["alice"]
+
+# the other user's trait value
+[[story.test_case]]
+[story.test_case.inputs]
+query = ["devs"]
+[story.test_case.expected]
+matched_names = ["bob"]
+
+# matches nobody
+[[story.test_case]]
+[story.test_case.inputs]
+query = ["absent-keyword"]
+[story.test_case.expected]
+matched_names = []
+
+# ============================================================
+# Driver settings
+# ============================================================
+
+[settings]
+va_max_turns = 200
+
+[settings.go]
+env = { GOFLAGS = "-mod=mod", CGO_ENABLED = "1", GOTOOLCHAIN = "local" }

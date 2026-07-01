@@ -1,0 +1,174 @@
+version = "1.0"
+
+[environment]
+base_image = "electric-fix-classify-admission-control:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 900.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "electric"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "electric"
+
+[metadata]
+family = "electric-fix-classify-admission-control"
+variant = "hard"
+segment = "investigate"
+repo = "electric"
+tags = ["electric", "elixir"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Operators of Electric's sync-service report two related production
+incidents around its request-admission throttling. (1) After a redeploy
+or restart, a wave of clients reconnecting to shapes that still exist all
+start getting spurious `503 concurrent_request_limit_exceeded` responses,
+as if every one of them were trying to create a brand-new shape — even
+though those shapes already exist and reconnecting to them is supposed to
+be cheap. (2) Separately, the protective throttle that is meant to cap how
+many *new-shape-creating* requests run at once can be bypassed: some
+requests that do trigger shape creation are not counted against it. The
+engineer must investigate the admission-control path and fix the
+classification so requests are throttled according to whether they
+actually create a new shape.
+"""
+context = """The bug lives in `packages/sync-service/lib/electric/plug/serve_shape_plug.ex`.
+
+Electric serves shape requests at `GET /v1/shape` through
+`Electric.Plug.ServeShapePlug`, a `Plug.Builder` pipeline. Admission
+control runs as the `check_admission` plug and draws permits from two
+separate concurrency pools held by `Electric.AdmissionControl`:
+
+  - `:initial` — a small limit, meant to protect the system from
+    shape-creation storms (creating a shape is expensive).
+  - `:existing` — a large limit, for requests against shapes that already
+    exist (reconnecting clients, live tailing — cheap).
+
+Pre-fix, the pool is chosen purely from the request's URL offset value:
+
+    defp admission_kind(conn) do
+      if conn.query_params["offset"] == "-1", do: :initial, else: :existing
+    end
+
+`offset=-1` means "give me the initial snapshot", which the code treats
+as synonymous with "this creates a new shape". That assumption is false
+in both directions:
+
+  - A client that already has a shape and reconnects with `offset=-1`
+    (e.g. after a redeploy) is NOT creating a new shape — the shape still
+    exists — yet it is charged against the tiny `:initial` pool. Under a
+    reconnection wave this self-inflicts a thundering-herd of 503s.
+  - A request carrying a stale/dead `handle` for a shape that has been
+    cleaned uses an `offset != "-1"`, so it is charged against the
+    generous `:existing` pool — but serving it actually re-creates the
+    shape, so it should have consumed the protective `:initial` pool.
+    This lets shape-creating work slip past the storm guard.
+
+The correct signal is whether the requested shape ALREADY EXISTS, not the
+offset. The shape subsystem can answer this:
+`Electric.Shapes.fetch_handle_by_shape/2` returns `{:ok, handle}` if a
+shape matching the request's definition is registered, `:error` otherwise.
+
+Red herrings that show up during triage but are NOT the cause:
+
+  - The permit-release machinery. The PR that fixed this also rewrote how
+    the admission permit is released (moving off `register_before_send`).
+    That refactor is about streaming/exception correctness; it does not
+    change which pool a request is charged to and is not the root cause of
+    the two reported symptoms. An engineer can sink the whole budget into
+    the release mechanism and never address the misclassification.
+  - `calculate_retry_after` / the 503 retry-after jitter — this only
+    affects how long a *rejected* client waits, not who gets rejected.
+  - The `:existing`/`:initial` limit values themselves — tuning the
+    numbers cannot fix a request that is counted in the wrong pool.
+"""
+solution = """Canonical fix (the merged PR): classify by actual shape existence rather
+than by offset.
+
+  1. Add a `resolve_existing_shape` plug that runs after `validate_request`
+     and before `check_admission`. It looks the shape up via
+     `Electric.Shapes.fetch_handle_by_shape(stack_id,
+     request.params.shape_definition)` and stashes the result as a boolean
+     in `conn.private[:shape_exists?]` (`{:ok, _} -> true`, `:error ->
+     false`).
+  2. Rewrite `admission_kind/1` to read that flag:
+     `if conn.private[:shape_exists?], do: :existing, else: :initial`.
+
+Two senior nuances the merged PR is careful about:
+
+  - It records existence in `conn.private` and does NOT overwrite
+    `request.params.handle`. Mutating the handle would flip `load_shape`
+    from the no-handle `get_or_create_shape_handle` path to the
+    strict-match `resolve_shape_handle` path; if the shape were cleaned
+    between the two steps the client would get a spurious 409 refetch for a
+    handle it never sent (a time-of-check/time-of-use hazard).
+  - The lookup `rescue`s `ArgumentError` and defaults to `:initial`. During
+    the startup race where the shape cache's ETS tables don't exist yet,
+    ETS operations raise `ArgumentError`; treating the shape as new
+    (`:initial`) is the safe direction and avoids crashing the request.
+
+Equally valid alternative implementations the reward stack must accept
+(all observable identically through HTTP status codes):
+
+  - Inline the existence lookup inside `check_admission` instead of a
+    separate plug; store the flag under any private key or request assign.
+  - Keep the pre-existing `register_before_send` permit-release mechanism
+    untouched and change ONLY the classification — the permit-release
+    rewrite in the merged PR is orthogonal and not required to fix the bug.
+  - Use `fetch_handle_by_shape_critical/2` or any equivalent existence
+    probe.
+
+Wrong / non-optimal fixes the reward stack must reject:
+
+  - Leaving classification keyed on `offset == "-1"` (the bug) — fails
+    both discriminating router tests.
+  - Mutating `request.params.handle` to carry the classification — risks
+    the 409 TOCTOU regression.
+  - Only fixing the permit-release path while leaving misclassification in
+    place — symptoms persist.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["elixir"]
+runtime_dependence = "runtime-essential"
+skills = ["codebase-exploration", "fault-localization", "red-herring-navigation", "concurrency-reasoning", "framework-fluency", "logic-fix", "local-deployment", "test-execution"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 264
+files = 1
+hunks = 9
+scope = "extensive"
+
+[metadata.origin]
+repo = "electric-sql/electric"
+pr_numbers = [4131]
+base_commit = "b32d2128ee0bd56e57ab919bb68e3a78b88bf7d4"
+base_commit_date = "2026-04-21"
+merged_at = "2026-04-21"
+
+
+
+

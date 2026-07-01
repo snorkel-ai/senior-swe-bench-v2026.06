@@ -1,0 +1,193 @@
+version = "1.0"
+
+[environment]
+base_image = "paperless-ngx-perf-workflow-queries:latest"
+build_timeout_sec = 1800.0
+cpus = 2
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "paperless-ngx"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "paperless-ngx"
+
+[metadata]
+family = "paperless-ngx-perf-workflow-queries"
+variant = "hard"
+segment = "investigate"
+repo = "paperless-ngx"
+tags = ["paperless-ngx", "python-service", "sql-database"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Paperless-ngx exposes a workflow REST surface (/api/workflows/) where
+each Workflow owns a set of triggers and actions, and every trigger and
+action in turn carries many ManyToMany "filter_*" / "assign_*" /
+"remove_*" relations. As the number of workflows (and the M2M data
+hanging off their triggers and actions) grows, GET /api/workflows/
+issues a number of SQL queries that scales with that data — the list
+viewset prefetches the triggers and actions relations but not the
+nested M2M relations underneath them, so serializing each nested field
+re-queries the database. Separately, saving a workflow
+(PATCH /api/workflows/{id}/) runs an orphan-cleanup pass that loops over
+every trigger and every action in the database and issues a count query
+per object. The data returned to the client is correct; the endpoints
+are just far slower than they should be. We need to re-shape both query
+paths so the workflow surface stays fast as the dataset grows, without
+changing anything a caller sees.
+"""
+context = """Touchpoints: src/documents/views.py (WorkflowViewSet.get_queryset — the
+list queryset that prefetches "triggers" and "actions") and
+src/documents/serialisers.py (WorkflowSerializer.prune_triggers_and_actions
+— the orphan cleanup run from WorkflowSerializer.update, and
+WorkflowSerializer.to_representation — a per-record override that
+re-fetches and re-orders the actions).
+
+Data model (src/documents/models.py):
+- WorkflowTrigger has nine ManyToMany filter fields: filter_has_tags,
+  filter_has_all_tags, filter_has_not_tags, filter_has_any_correspondents,
+  filter_has_not_correspondents, filter_has_any_document_types,
+  filter_has_not_document_types, filter_has_any_storage_paths,
+  filter_has_not_storage_paths.
+- WorkflowAction has sixteen ManyToMany fields (assign_tags,
+  assign_view_users, assign_view_groups, assign_change_users,
+  assign_change_groups, assign_custom_fields, remove_tags,
+  remove_correspondents, remove_document_types, remove_storage_paths,
+  remove_custom_fields, remove_owners, remove_view_users,
+  remove_view_groups, remove_change_users, remove_change_groups) and an
+  integer "order" field. Crucially, WorkflowAction has NO Meta.ordering.
+- Workflow.triggers and Workflow.actions are the reverse M2M relations.
+
+Why it is slow:
+- WorkflowViewSet.get_queryset does
+  prefetch_related("triggers", "actions"). That batches the two reverse
+  relations, but every nested M2M field on each trigger and action is
+  still lazy-loaded at serialization time — an N+1 storm whose query
+  count grows with the number of workflows and the M2M rows underneath.
+- WorkflowSerializer.to_representation runs
+  instance.actions.order_by("order", "pk") and re-serializes the actions
+  for every Workflow in the response. That both re-queries (defeating any
+  prefetch) and is the only thing currently guaranteeing action order,
+  because WorkflowAction has no model-level ordering.
+- WorkflowSerializer.prune_triggers_and_actions (called from update)
+  iterates WorkflowTrigger.objects.all() and WorkflowAction.objects.all()
+  and runs trigger.workflows.all().count() per object before deleting
+  orphans — O(N) queries on every PATCH/PUT.
+
+Senior decisions and likely traps:
+- Prefetching the nested M2M relations (not just "triggers"/"actions")
+  is the core insight; a partial fix that only keeps the bare prefetch
+  leaves most of the N+1 in place.
+- Removing the to_representation re-query is correct ONLY if action
+  ordering is re-established elsewhere (e.g. by pinning order on the
+  prefetched action queryset, by ordering an already-loaded list in
+  Python, or by adding Meta.ordering to WorkflowAction). Because
+  WorkflowAction has no Meta.ordering, naively deleting to_representation
+  without re-establishing order yields a fast but WRONG response with
+  actions in arbitrary (pk) order.
+- The prune path is a second, independent hot spot. Optimizing only the
+  GET list and leaving the per-object prune loop in place still leaves
+  PATCH slow at scale.
+
+Performance signal (the PR's own profiling, query counts):
+- Orphan prune loop -> bulk aggregate delete: 248 -> 82 queries.
+- List nested-M2M prefetch: 590 -> 29 queries.
+Inside the benchmark image (SQLite, query counts via
+CaptureQueriesContext): GET /api/workflows/ over 8 workflows with
+trigger+action M2M data runs ~340 queries pre-fix vs ~29 post-fix; a
+PATCH with 40 orphan triggers + 40 orphan actions runs ~1253 queries
+pre-fix vs ~41 post-fix.
+"""
+solution = """Canonical fix follows the reference example (two files, three coordinated changes):
+
+1. src/documents/views.py — WorkflowViewSet.get_queryset: replace
+   prefetch_related("triggers", "actions") with two Prefetch objects.
+   The "triggers" Prefetch uses a WorkflowTrigger queryset that
+   prefetch_related's all nine filter_* M2M fields. The "actions"
+   Prefetch uses a WorkflowAction queryset that .order_by("order", "pk")
+   and prefetch_related's all sixteen assign_*/remove_* M2M fields.
+   (Count and Prefetch are already imported in views.py.)
+
+2. src/documents/serialisers.py — WorkflowSerializer.prune_triggers_and_actions:
+   replace each per-object loop with a single set-based statement:
+   WorkflowTrigger.objects.annotate(workflow_count=Count("workflows"))
+     .filter(workflow_count=0).delete()
+   and the analogous statement for WorkflowAction. (Count is already
+   imported in serialisers.py.)
+
+3. src/documents/serialisers.py — delete WorkflowSerializer.to_representation
+   entirely. Action ordering is now guaranteed by the order_by("order",
+   "pk") baked into the action Prefetch in step 1, and the nested
+   actions = WorkflowActionSerializer(many=True) field serializes the
+   already-ordered, already-prefetched instance.actions.all().
+
+Acceptable alternative implementations (verifier and rubric must accept):
+- prefetch_related with double-underscore spans
+  ("triggers__filter_has_tags", ..., "actions__assign_tags", ...)
+  instead of explicit Prefetch objects, combined with any mechanism that
+  re-establishes action ordering (Meta.ordering on WorkflowAction, a
+  Python-side sort of the prefetched list, or a slim to_representation
+  that orders without re-querying).
+- Adding Meta.ordering = ["order", "pk"] to WorkflowAction and deleting
+  to_representation, relying on default ordering.
+- Keeping a to_representation that orders an already-prefetched list in
+  Python (no DB hit) rather than removing it.
+- Any equivalent bulk-delete idiom for prune (e.g. filtering on a
+  subquery / Exists) instead of annotate(Count).filter(=0).
+- Different variable / helper / field-alias names, including non-English
+  names. Naming choices do not affect any check.
+
+Common shortcuts that should NOT pass:
+- Keeping the bare prefetch_related("triggers", "actions") (or otherwise
+  not prefetching the nested M2M relations): GET stays N+1 — verifier
+  list query-count check fails.
+- Deleting to_representation to kill the re-query but NOT re-establishing
+  action ordering: fast but actions come back in pk order — verifier
+  ordering check fails.
+- Optimizing only the GET list and leaving the per-object prune loop:
+  PATCH stays O(N) queries — verifier prune query-count check fails.
+"""
+
+[metadata.taxonomy]
+task_type = "performance"
+stack = ["python-service", "sql-database"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "framework-fluency", "query-optimization", "performance-measurement", "data-population"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 61
+files = 2
+hunks = 3
+scope = "broad"
+
+[metadata.origin]
+repo = "paperless-ngx/paperless-ngx"
+pr_numbers = [12618]
+base_commit = "c669c3416e511ace8beaee3a990e1b32d55da6a8"
+base_commit_date = "2026-04-21"
+merged_at = "2026-04-21"
+
+
+
+

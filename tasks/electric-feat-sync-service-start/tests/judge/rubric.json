@@ -1,0 +1,23 @@
+{
+  "files": [
+    "packages/sync-service/lib/electric/connection/manager.ex",
+    "packages/sync-service/lib/electric/postgres/lock_breaker_connection.ex",
+    "packages/sync-service/lib/electric/stack_supervisor.ex"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "lock_breaker_uses_admin_pool_no_dedicated_process",
+      "description": "The abandoned-lock recovery path executes its termination query through the existing admin connection pool's regular Postgrex.query/3 (or equivalent) interface. There is no dedicated long-lived OTP process whose sole purpose is to run the lock-breaker SQL — the previous Electric.Postgres.LockBreakerConnection module (a Postgrex.SimpleConnection that opened its own connection just to run the breaker query) is removed and not replaced by a similar dedicated process. The lock-breaker SQL itself remains semantically equivalent: find inactive replication slots matching the lock name, find advisory-lock holders by hashtext(slot_name), terminate matching backends excluding the replication client's own backend pid. Implementations may keep the SQL inline as a private helper or expose it as a documented function — what matters is that the query runs through the admin pool, not through a bespoke process."
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "admin_pool_uses_replication_credentials",
+      "description": "The admin connection pool is opened using the replication-side connection options (the same credentials the replication client uses), NOT the pooled-side connection options. This ensures the pool's privileged maintenance queries — ALTER PUBLICATION, pg_drop_replication_slot, pg_terminate_backend — succeed on deployments where the pooled user is lower-privilege (e.g. PgBouncer-fronted deployments where a superuser cannot connect through the pooler). The snapshot pool, by contrast, continues to use the pooled-side connection options. The two pools' credential choices are clearly distinguishable in the code that starts each pool."
+    },
+    {
+      "name": "snapshot_pool_starts_after_replication_client_configured",
+      "description": "The (separate) snapshot connection pool that serves bulk shape-snapshot reads still starts AFTER the replication client has finished configuring its connection (lock acquired, slot created/verified). Tasks that depend on the snapshot pool — initial shape snapshots, bulk reads — see no change in startup ordering for that pool. The snapshot pool also keeps its existing queue tuning (queue_target / queue_interval values that are tuned for long-running snapshot queries); the admin pool does not adopt that tuning."
+    }
+  ]
+}

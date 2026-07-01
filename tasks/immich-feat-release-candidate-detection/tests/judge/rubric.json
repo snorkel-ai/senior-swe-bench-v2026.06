@@ -1,0 +1,16 @@
+{
+  "files": [
+    "server/src/dtos/server.dto.ts",
+    "server/src/decorators.ts",
+    "server/src/dtos/sync.dto.ts",
+    "server/src/services/version.service.ts",
+    "server/src/repositories/server-info.repository.ts"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "release_event_dto_openapi",
+      "description": "The new-release notification payload (the object broadcast over the `on_new_release` websocket event) is modelled as a proper DTO/schema rather than a bare in-process interface, and that DTO carries a field describing the KIND of release found (a release-type descriptor, e.g. a `type` field whose values cover major/minor/patch and their pre-release variants). Crucially, even though NO controller references this DTO directly (it is only ever pushed over the websocket), it is registered so the OpenAPI / client-SDK generation still emits it — in the reference this is done by decorating it with the shared extra-models registration mechanism (the `ExtraModel` registry, factored out so it is reusable, e.g. moved from sync.dto.ts into decorators.ts). Accept any equivalent registration that keeps the websocket-only DTO discoverable to the API tooling; what matters is (a) the payload is a registered DTO/schema, (b) it has a release-type field, and (c) it is wired into the extra-models/OpenAPI emission path. A solution that leaves the payload as a plain TypeScript interface with no release-type field and no extra-model registration FAILS."
+    }
+  ],
+  "pass_to_pass": []
+}

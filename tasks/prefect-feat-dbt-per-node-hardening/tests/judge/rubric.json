@@ -1,0 +1,14 @@
+{
+  "files": [
+    "src/integrations/prefect-dbt/prefect_dbt/core/_manifest.py",
+    "src/integrations/prefect-dbt/prefect_dbt/core/_freshness.py",
+    "src/integrations/prefect-dbt/prefect_dbt/core/_orchestrator.py"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "silence_preserves_error_visibility",
+      "description": "Beyond re-surfacing a no-match selector warning (which is gated behaviorally by the preview validation story), silencing dbt's console logger during the preview's internal invocations (selector resolution via `dbt ls`, and source freshness) preserves the rest of observability. File-level logging continues to follow the user's configured log level — the console is silenced WITHOUT also blanket-silencing dbt's log file — so the detail stays recoverable from dbt's log file when debugging. The hard-failure paths remain observable to the caller: a failed list invocation still raises, a missing freshness output file is still reported, and a per-source runtime error or partial-failure freshness run is still flagged (re-emitted to the Python logger, propagated through the result's exception, or raised) rather than dropped along with the console output. A blanket suppression that hides all dbt output — including the log file, warnings, and errors — does not satisfy this criterion."
+    }
+  ],
+  "pass_to_pass": []
+}

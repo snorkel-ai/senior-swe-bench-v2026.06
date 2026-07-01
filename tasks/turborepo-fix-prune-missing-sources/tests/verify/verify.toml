@@ -1,0 +1,9 @@
+# The verifier exercises the public `turborepo_fs::recursive_copy` API directly,
+# avoiding the ~10-min build of the full `turbo` binary and the corepack/pnpm
+# fixture machinery the CLI path needs. tests/test-setup.sh adds turbopath to
+# turborepo-fs's [dev-dependencies] and pre-warms the crate build. The cold
+# compile of turborepo-fs + its deps + the new test binary is a few minutes;
+# 900s leaves margin for slow CI hosts.
+[rust]
+crate = "crates/turborepo-fs"
+timeout = 900

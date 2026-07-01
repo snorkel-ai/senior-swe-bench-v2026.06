@@ -1,0 +1,161 @@
+version = "1.0"
+
+[environment]
+base_image = "harbor-add-windows-tasks-support:latest"
+build_timeout_sec = 1800.0
+cpus = 2
+memory = "4G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 2400.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "harbor"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "harbor"
+
+[metadata]
+family = "harbor-add-windows-tasks-support"
+variant = "hard"
+segment = "design"
+repo = "harbor"
+tags = ["harbor", "python-lib", "infrastructure"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Harbor is an evaluation framework that runs coding-agent "tasks" inside
+containers. Every task today is assumed to be Linux: scripts are shell
+scripts (`solve.sh` / `test.sh`), the in-container mount points are POSIX
+paths (`/logs`, `/tests`, `/solution`), and the Docker plumbing speaks
+`bash -c`. There is no way for a task to declare that it targets Windows,
+and nothing in the framework would do the right thing if it did.
+
+Add first-class support for Windows tasks. A task must be able to declare
+its target OS in `task.toml`; the framework must discover and run the
+correct script flavor (`.bat` on Windows, `.sh` on Linux), use
+Windows-appropriate container paths, and refuse — clearly and early — to
+run a Windows task with an agent that does not support Windows. None of
+this may break the existing Linux tasks, which carry no OS declaration at
+all.
+"""
+context = """The OS distinction has to be threaded consistently through several
+framework surfaces that all currently hard-code Linux assumptions:
+
+  - The task config model (src/harbor/models/task/config.py) parses
+    task.toml's [environment] table. It has no OS concept today.
+  - Script location is implicit: the framework looks for solve.sh /
+    test.sh by fixed name. There is no discovery layer and no notion of
+    a Windows .bat equivalent (src/harbor/models/task/paths.py,
+    src/harbor/utils/scripts.py — the latter does not exist pre-change).
+  - In-container mount points are POSIX-only constants
+    (src/harbor/models/trial/paths.py: EnvironmentPaths).
+  - Agents (src/harbor/agents/*) have no capability flag, and the trial
+    setup (src/harbor/trial/trial.py) has no preflight to catch an
+    incompatible agent/OS pairing.
+  - The Docker environment (src/harbor/environments/docker/*) executes
+    everything through a single Linux code path, and the verifier,
+    oracle, and terminal-bench mapper all assume `.sh` + POSIX paths.
+
+The genuinely deep part is the Docker execution layer for Windows
+containers: Windows containers under Hyper-V isolation reject `docker cp`,
+forcing a tar-stream-over-exec file-transfer strategy; the shell is
+`cmd /S /C`, not `bash -c`; long-form YAML volume syntax is required so a
+Windows drive letter (`C:`) is not mis-parsed as a host:container
+separator; and the daemon's OS must be validated before a Windows task is
+launched. That layer can only be exercised against a real Windows daemon.
+
+Test infrastructure to lean on (all Linux, no Windows daemon needed): the
+`harbor` package installs editable with `uv pip install -e .` and every
+config/script/path/agent surface is importable and unit-testable directly.
+The framework's own pydantic models (TaskConfig, TaskPaths), the trial
+paths dataclass (EnvironmentPaths), and the agents expose the OS behavior
+without any container at all. `Trial._setup_agent`'s preflight is
+testable by constructing a Trial via `Trial.__new__` with MagicMock'd
+agent + environment (the guard runs before any real setup).
+"""
+solution = """The reference implementation (PR #1100) introduces an OS abstraction:
+
+  1. A `TaskOS` string-enum (linux/windows) plus an `os` field on the
+     [environment] config, normalized case-insensitively, defaulting to
+     linux; the task config schema_version is bumped while old configs
+     (no os field) still load.
+  2. A new script utility module exposing supported extensions
+     (.sh, .bat), OS-filtered discovery (linux -> .sh only,
+     windows -> .bat only, .sh-first legacy priority when OS is unknown),
+     a chmod-needed check, and an execution-command builder (.sh
+     passthrough, .bat -> `cmd /c`, optional stdout/stderr redirect,
+     separator-agnostic extension parsing for C:/ and C:\\ paths).
+  3. TaskPaths gains discovered-script properties + OS-filtered variants;
+     .ps1/.cmd are dropped as valid entrypoints.
+  4. EnvironmentPaths gains C:-drive-rooted (forward-slash) Windows
+     variants via an OS factory.
+  5. A SUPPORTS_WINDOWS flag on agents (default False; nop & oracle True)
+     and a preflight in Trial._setup_agent that raises a clear
+     RuntimeError before agent setup when a Windows task meets an
+     unsupported agent.
+  6. A Windows Docker code path (tar-over-exec transfer, cmd shell args,
+     long-form compose volumes, daemon/image OS validation) split from
+     the Unix path behind a common interface, with the verifier, oracle,
+     and terminal-bench mapper updated to be OS-aware.
+
+Equally valid alternatives we accept:
+  - Different internal structure for the helpers (inline extension logic,
+    no _with_root factory, resolving discovery without a separate module
+    function) — only the public results matter.
+  - Different internal/local variable names, including non-English names.
+  - Any Windows file-transfer/exec arrangement that actually works under
+    Hyper-V isolation, not necessarily the exact tar-over-exec form.
+
+What naive implementations get wrong:
+  - Bolting the OS field onto the config but leaving script discovery,
+    env paths, agent gating, or the docker/verifier/oracle paths still
+    Linux-only (broken-windows: one layer migrated, the rest not).
+  - Breaking back-compat: existing tasks with no [environment].os field,
+    or old schema_version, must still load and behave as Linux.
+  - Using `docker cp` for Windows containers (fails under Hyper-V) or
+    `bash -c` as the Windows shell.
+  - Naive volume mounting that mis-parses the `C:` drive-letter colon.
+  - No preflight: letting a Linux-only agent reach a Windows task and
+    crash deep in the stack instead of failing fast with a clear message.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-lib", "infrastructure"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "interface-design", "framework-fluency", "cross-service-reasoning", "build-tooling", "config-tuning", "architectural-refactoring", "data-model-design"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 705
+files = 19
+hunks = 60
+scope = "extensive"
+
+[metadata.origin]
+repo = "harbor-framework/harbor"
+pr_numbers = [1100]
+base_commit = "c2be7c6de9ceb4b98c5100915d13ce043957353c"
+base_commit_date = "2026-03-11"
+merged_at = "2026-04-23"
+
+
+
+

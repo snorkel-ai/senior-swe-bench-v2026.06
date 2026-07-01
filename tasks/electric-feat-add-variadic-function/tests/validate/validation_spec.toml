@@ -1,0 +1,345 @@
+instructions = """
+ExUnit tests run from `packages/sync-service` (the mix app). The
+project's `elixirc_paths(:test)` setting compiles everything under
+`packages/sync-service/test/support/` into the test environment, so
+you can use `Support.ComponentSetup` and `Support.TestUtils` from
+your test files (none are needed for these stories — the eval engine
+is pure and has no service dependencies).
+
+Use `async: true` — the eval engine is pure and does not touch the
+database, the global registry, or any singletons.
+
+These three stories all drive the public `Parser` and `Runner`
+surface that already exists in the pre-fix codebase:
+
+    alias Electric.Replication.Eval.{Parser, Runner, Env, Expr}
+    alias Electric.Replication.Eval.Parser.{Const, Func}
+
+`Parser.parse_and_validate_expression(query, opts)` takes a SQL
+expression string and returns `{:ok, %Expr{}}` or `{:error, message}`.
+`Runner.execute(expr, ref_values)` evaluates the parsed expression
+against per-row reference values and returns `{:ok, value}` or
+`{:error, term()}`.
+
+These stories are self-contained; the procedure patterns shown are
+complete for driving the public `Parser` and `Runner` surface.
+
+Inspect the submitted patch in full first, then tailor your test code to any implementation-specific details, keeping within the contract the procedures below specify.
+"""
+
+[settings]
+script_timeout_sec = 600
+
+# ---------------------------------------------------------------------
+# Story 1: coalesce returns first non-null and short-circuits
+# ---------------------------------------------------------------------
+[[story]]
+id = "coalesce_returns_first_non_null_and_short_circuits"
+driver = "mix-test"
+mix_app = "packages/sync-service"
+description = """
+The WHERE-clause expression engine supports `coalesce(...)`, which
+accepts any number of arguments and returns the first non-null
+argument. When every argument is null, it should return null.
+`coalesce(...)` should short-circuit and return the first non-null
+argument.
+"""
+procedure = """
+The story drives `Parser.parse_and_validate_expression` plus
+`Runner.execute` on different SQL strings and reference values.
+Aliases at the top of the test module:
+
+    alias Electric.Replication.Eval.{Parser, Runner, Expr}
+
+For each test case:
+
+1. Take `inputs["expression"]` (a SQL string) and parse it with
+   `Parser.parse_and_validate_expression(inputs["expression"], refs:
+   %{["value"] => :int4, ["divisor"] => :int4, ["text_value"] => :text})`.
+   The refs map is constant for the whole story; an unused entry
+   doesn't hurt. Pattern-match `{:ok, %Expr{} = parsed}`.
+
+2. Take `inputs["ref_values"]` — a JSON-style map keyed by
+   single-element string lists. Parse it back into Elixir map form
+   for `Runner.execute`. The helper `validation_params.exs` already
+   gives you each test case's `inputs` as decoded JSON, so
+   `inputs["ref_values"]` is already a map. Convert its string keys
+   to list-of-string keys, decoding each value based on its type
+   (the refs map uses `:int4` for "value" and "divisor", `:text`
+   for "text_value"):
+
+       @ref_types %{"value" => :int4, "divisor" => :int4, "text_value" => :text}
+
+       defp convert_ref(nil, _type), do: nil
+       defp convert_ref(v, :int4), do: String.to_integer(v)
+       defp convert_ref(v, _type), do: v
+
+       refs =
+         Enum.into(inputs["ref_values"], %{}, fn {k, v} ->
+           {[k], convert_ref(v, Map.get(@ref_types, k, :text))}
+         end)
+
+   Note: null values in `ref_values` arrive as Elixir `nil` (the
+   JSON serializer converts the `"__null__"` sentinel to actual
+   JSON null before the test receives it). The `convert_ref(nil,
+   _type)` clause above handles this.
+
+3. Call `Runner.execute(parsed, refs)`. Capture the result.
+
+4. Compare against the three expected fields:
+
+   - EXPECTED: `expected["expected_kind"]` is "ok" → result is `{:ok, _}`; "error" → result is `{:error, _}`.
+   - EXPECTED: when "ok", the unwrapped value equals `expected["expected_value"]` after decoding.
+   - EXPECTED: `expected["value_type"]` selects the decoder for `expected["expected_value"]` ("int" → integer; "string" → as-is; "nil" → `nil`).
+
+   So a single assertion shape:
+
+       case {expected["expected_kind"], result} do
+         {"ok", {:ok, value}} ->
+           expected_value = decode(expected["expected_value"], expected["value_type"])
+           assert value == expected_value, "expected #{inspect(expected_value)}, got #{inspect(value)}"
+         {"error", {:error, _}} ->
+           :ok
+         _ ->
+           flunk("expected kind #{expected["expected_kind"]}, got #{inspect(result)}")
+       end
+
+   Define `decode(s, "int") -> String.to_integer(s)`, `decode(_, "nil")
+   -> nil`, `decode(s, _) -> s`.
+
+The first three cases drive plain coalesce semantics; the fourth
+exercises runtime short-circuit (the divide-by-zero in the second
+argument must not be evaluated when the first argument is non-nil);
+the fifth confirms the runner DOES surface errors when no earlier
+argument settled the result.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = '''coalesce("text_value", 'fallback', 'unused')'''
+ref_values = { text_value = "__null__" }
+[story.test_case.expected]
+expected_kind = "ok"
+expected_value = "fallback"
+value_type = "string"
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = '''coalesce("text_value", 'fallback', 'unused')'''
+ref_values = { text_value = "present" }
+[story.test_case.expected]
+expected_kind = "ok"
+expected_value = "present"
+value_type = "string"
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = "coalesce(NULL::int4, NULL::int4)"
+ref_values = {}
+[story.test_case.expected]
+expected_kind = "ok"
+expected_value = "ignored"
+value_type = "nil"
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = '''coalesce("value", 1 / "divisor")'''
+ref_values = { value = "10", divisor = "0" }
+[story.test_case.expected]
+expected_kind = "ok"
+expected_value = "10"
+value_type = "int"
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = '''coalesce("value", 1 / "divisor")'''
+ref_values = { value = "__null__", divisor = "0" }
+[story.test_case.expected]
+expected_kind = "error"
+expected_value = "ignored"
+value_type = "nil"
+
+# ---------------------------------------------------------------------
+# Story 2: greatest and least skip nulls and use calendar-aware ordering
+# ---------------------------------------------------------------------
+[[story]]
+id = "greatest_least_skip_nulls_calendar_aware"
+driver = "mix-test"
+mix_app = "packages/sync-service"
+description = """
+The expression engine supports `greatest(...)` and `least(...)` with
+an arbitrary number of arguments. Both `greatest(...)` and
+`least(...)` skip nulls and return the largest or smallest non-null
+argument respectively.
+"""
+procedure = """
+The story drives `Parser.parse_and_validate_expression` plus
+`Runner.execute` on different SQL strings and reference values.
+Aliases at the top of the test module:
+
+    alias Electric.Replication.Eval.{Parser, Runner, Expr}
+
+For each test case:
+
+1. Parse `inputs["expression"]` via
+   `Parser.parse_and_validate_expression(inputs["expression"], refs:
+   refs)`. The `refs` keyword depends on `inputs["refs_type"]`:
+   - "int4"  → `[refs: %{["value"] => :int4}]`
+   - "date"  → `[refs: %{["value"] => :date}]`
+   - "none"  → `[]`
+
+2. Build the runtime ref values from `inputs["ref_value"]` and
+   `inputs["refs_type"]`:
+   - "int4"  → `%{["value"] => decode_int_or_nil(inputs["ref_value"])}`
+   - "date"  → `%{["value"] => decode_date_or_nil(inputs["ref_value"])}`
+   - "none"  → `%{}`
+
+   Helpers: `decode_int_or_nil(nil) -> nil`;
+   `decode_int_or_nil(s) -> String.to_integer(s)`.
+   `decode_date_or_nil(nil) -> nil`;
+   `decode_date_or_nil(s) -> Date.from_iso8601!(s)`.
+
+   Note: null values in `ref_value` arrive as Elixir `nil` (the
+   JSON serializer converts `"__null__"` to actual JSON null
+   before the test receives it). Use `nil` as the guard, not the
+   string `"__null__"`.
+
+3. Call `Runner.execute(parsed, refs)`.
+
+   - EXPECTED: the result is `{:ok, value}` and `value` equals `expected["expected_value"]` after decoding it according to the value type.
+   - EXPECTED: `expected["value_type"]` picks the decoder for `expected["expected_value"]` ("int" → `String.to_integer/1`; "date" → `Date.from_iso8601!/1`; "nil" → `nil`).
+
+The cases sweep:
+- greatest(1,2,3) and least(2,1,3) — basic numeric ordering.
+- greatest with one nil ref + nil literal — confirms nulls are
+  skipped and a non-null answer is returned.
+- greatest with all-null arguments — confirms the function returns
+  nil.
+- least over a date column + a date constant + a NULL date — confirms
+  calendar-aware comparison (2023-12-31 is earlier than 2024-01-02; a
+  day-first structural compare would wrongly pick 2024-01-02).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = "greatest(1, 2, 3)"
+refs_type = "none"
+ref_value = "ignored"
+[story.test_case.expected]
+expected_value = "3"
+value_type = "int"
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = "least(2, 1, 3)"
+refs_type = "none"
+ref_value = "ignored"
+[story.test_case.expected]
+expected_value = "1"
+value_type = "int"
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = '''greatest("value", 2, 3, NULL::int4)'''
+refs_type = "int4"
+ref_value = "__null__"
+[story.test_case.expected]
+expected_value = "3"
+value_type = "int"
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = '''greatest("value", 2, 3, NULL::int4)'''
+refs_type = "int4"
+ref_value = "10"
+[story.test_case.expected]
+expected_value = "10"
+value_type = "int"
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = "greatest(NULL::int4, NULL::int4)"
+refs_type = "none"
+ref_value = "ignored"
+[story.test_case.expected]
+expected_value = "ignored"
+value_type = "nil"
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = '''least("value", date '2024-01-02', NULL::date)'''
+refs_type = "date"
+ref_value = "__null__"
+[story.test_case.expected]
+expected_value = "2024-01-02"
+value_type = "date"
+
+[[story.test_case]]
+# Cross-year pair: %Date{} structural term order compares day-first, so a
+# struct comparison would wrongly pick 2024-01-02; only calendar-aware
+# ordering returns 2023-12-31.
+[story.test_case.inputs]
+expression = '''least("value", date '2024-01-02', NULL::date)'''
+refs_type = "date"
+ref_value = "2023-12-31"
+[story.test_case.expected]
+expected_value = "2023-12-31"
+value_type = "date"
+
+# ---------------------------------------------------------------------
+# Story 3: explicit VARIADIC user calls produce a clear error
+# ---------------------------------------------------------------------
+[[story]]
+id = "explicit_variadic_user_call_rejected"
+driver = "mix-test"
+mix_app = "packages/sync-service"
+description = """
+If someone writes a caller passing an array via
+`func(VARIADIC ARRAY[...])` Postgres syntax, they should get a clear
+error that mentions VARIADIC.
+"""
+procedure = """
+For each test case, parse `inputs["expression"]` via
+`Parser.parse_and_validate_expression(inputs["expression"])`.
+
+   - EXPECTED: `expected["should_parse"]` is "ok" → result is `{:ok, _}`; "error" → result is `{:error, message}`.
+   - EXPECTED: when the parser returns an error AND `expected["error_substring"]` is not `"__none__"`, the uppercased message contains `expected["error_substring"]` uppercased.
+
+Suggested assertion sketch:
+
+    case {expected["should_parse"], result} do
+      {"ok", {:ok, _}} ->
+        :ok
+      {"error", {:error, message}} ->
+        if expected["error_substring"] != "__none__" do
+          assert is_binary(message)
+          assert String.contains?(String.upcase(message),
+                                  String.upcase(expected["error_substring"])),
+                 "expected error message to contain " <>
+                 inspect(expected["error_substring"]) <>
+                 ", got: " <> inspect(message)
+        end
+      _ ->
+        flunk("expected " <> expected["should_parse"] <>
+              ", got: " <> inspect(result))
+    end
+
+The first case exercises the rejection path. The second is a
+positive control: a non-VARIADIC `coalesce(1, 2)` continues to parse
+successfully, so the rejection is targeted (not a blanket "anything
+mentioning VARIADIC fails").
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = "array_cat(VARIADIC ARRAY[ARRAY[1], ARRAY[2]])"
+[story.test_case.expected]
+should_parse = "error"
+error_substring = "VARIADIC"
+
+[[story.test_case]]
+[story.test_case.inputs]
+expression = "coalesce(1, 2)"
+[story.test_case.expected]
+should_parse = "ok"
+error_substring = "__none__"

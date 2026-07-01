@@ -1,0 +1,12 @@
+{
+  "files": [
+    "services/pull/comment.go",
+    "services/agit/agit.go",
+    "services/pull/pull.go",
+    "modules/git/repo_commit.go",
+    "modules/gitrepo/compare.go",
+    "models/issues/comment.go"
+  ],
+  "fail_to_pass": [],
+  "pass_to_pass": []
+}

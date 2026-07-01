@@ -1,0 +1,426 @@
+stack_profile = "python-library"
+
+instructions = """
+General environment for every story in this task.
+
+ENVIRONMENT
+- The harbor repo is at /repo/harbor with a uv-managed venv at
+  /repo/harbor/.venv. validation-setup.sh has already run `uv sync` so the
+  harbor package is installed editable with its full dependency tree plus
+  pytest. Tests can `import harbor...` directly.
+- Run scripts with the repo interpreter `/repo/harbor/.venv/bin/python`
+  (the [settings.pytest].python below already points there).
+
+THE HELPER (test_harness.py — `from test_harness import write_task_scaffold, run_trial`)
+- The harness does NOT author task.toml. It drives the multi-step engine against
+  a task directory YOU materialise, and reads results back through the shape YOU
+  discover. It exposes:
+    * `write_task_scaffold(task_dir, step_names)` — writes the contract-fixed,
+      non-structural on-disk scaffold: `environment/Dockerfile` and, for each
+      step name, `steps/{name}/instruction.md` (containing the step name) +
+      `steps/{name}/tests/test.sh`. This mirrors the single-task on-disk
+      `instruction.md` + `tests/` layout; the engine reads each step's
+      instruction from `steps/{name}/instruction.md` and its tests from
+      `steps/{name}/tests/`.
+    * `run_trial(task_dir, *, runtime, result_shape, is_mounted=True,
+      verifier_disabled=False) -> dict` — runs `Trial.create()` + `Trial.run()`
+      against your `task_dir` with a mocked environment + mock agent (the only
+      mocked seams are the two pre-existing factory functions that would
+      otherwise start Docker and a real agent), and returns the observable
+      outcomes:
+        * `step_names`        — ordered list of executed step names.
+        * `n_executed`        — number of steps that actually ran.
+        * `step_rewards`      — per-step reward dict (or None) in order.
+        * `trial_rewards`     — the aggregated trial-level reward dict (or None).
+        * `exceptions`        — per-step bool: did the step record an exception.
+        * `agent_instructions`— the instruction string the agent was driven with
+                                per step, in order.
+        * `agent_users`       — the effective environment user at each step's
+                                agent run, in order.
+        * `artifact_downloads`— list of `[source, step_name]` pairs the engine
+                                downloaded (non-mounted runs only).
+        * `trial_dir`         — the trial output root (path string). Inspect it
+                                yourself (with `pathlib`) to check the on-disk
+                                layout the implementation produced: the per-step
+                                output dirs under the container you discover, and
+                                whether the trial root was cleaned up. The
+                                harness pins no directory name.
+  `runtime` is the per-step RUNTIME behaviour the mocks simulate, ONE dict per
+  declared step in the SAME ORDER you declared the steps in task.toml:
+  `{"rewards": <dict or None>, "agent_raises": <bool>}`. These are scenario
+  inputs, not config — they are not part of the config shape under test.
+
+YOU AUTHOR task.toml — MIRROR THE EXISTING STRUCTURE (the guard rails)
+- The multi-step config SHAPE is the thing under test, so you write task.toml
+  yourself by MIRRORING the pre-existing single-task config. Read
+  `src/harbor/models/task/config.py` (and the diff under `src/harbor/`) and the
+  existing single-task task.toml layout IN FULL before writing, then reproduce
+  the structure THIS implementation expects — adapting BOTH the field names AND
+  the structural details (the nesting, where the per-step sub-config sits, how
+  the steps collection is declared) to what you actually find in the source.
+  Discovery here is STRUCTURAL, not just a name substitution into a fixed
+  template.
+- What "mirroring the existing structure" means — this is the leash; stay inside
+  it, and adapt freely within it:
+  * The ordered steps are declared with the codebase's EXISTING convention for
+    repeated config (its `list[...]` array-of-tables fields), under whatever
+    field name the implementation uses.
+  * Each step carries its OWN per-step sub-config that REUSES the existing
+    single-task config shapes — the per-step `agent` / `verifier` are the SAME
+    config models as the top-level single-task `[agent]` / `[verifier]`, and the
+    per-step threshold / artifacts mirror their single-task analogs — nested
+    UNDER the step (isolation), not flattened into a bespoke top-level namespace.
+  * Per-step inputs/outputs stay isolated per step: instruction + tests on disk
+    under `steps/{name}/` (which `write_task_scaffold` writes for you).
+- The skeleton below is ONE example of a sufficiently-mirrored task.toml (the
+  shape the reference example happens to use). The <PLACEHOLDER> names are
+  discovered, NOT assumed — AND the shape itself is illustrative: if the
+  implementation you are given mirrors the existing structure in a different but
+  still-conforming way (e.g. the per-step sub-config nests differently, the steps
+  field is declared differently), ADAPT your task.toml to match it. Do not treat
+  the skeleton as the only acceptable layout.
+
+    <REWARD_STRATEGY_KEY> = "mean"          # only when a strategy is exercised
+
+    [environment]
+    build_timeout_sec = 60.0
+
+    [agent]                                  # task-level defaults, mirrors the
+    user = "task-agent"                      # single-task [agent]; only if needed
+
+    [[<STEPS_FIELD>]]                        # one element per step, in order
+    name = "step-one"
+    <MIN_REWARD_KEY> = 0.5                   # only when this step sets a threshold
+    agent = { timeout_sec = 10.0, user = "step-agent" }   # mirrors [agent]
+    verifier = { timeout_sec = 10.0 }                     # mirrors [verifier]
+
+    [[<STEPS_FIELD>]]
+    name = "step-two"
+    agent = { timeout_sec = 10.0 }
+    verifier = { timeout_sec = 10.0 }
+
+  TOML MECHANIC (applies whenever a step carries a sub-table inline, as shown):
+  attach each step's `agent` / `verifier` as an INLINE table on the step element
+  (`agent = { ... }`). Do NOT write a `[<STEPS_FIELD>.agent]` header — under an
+  array-of-tables that does not attach to the current element and the per-step
+  override is silently dropped. A per-step dict threshold is an inline table
+  (`<MIN_REWARD_KEY> = { correctness = 0.8 }`).
+
+- ORGANIC FAIL — do not work around the implementation. Mirror the existing
+  structure (names AND shape) as you find it and let the engine run it. If an
+  implementation only accepts a config that does NOT mirror the existing
+  single-task structure — a bespoke steps shape, per-step config flattened
+  outside the step, no per-step isolation — let `Trial.create()` / `run_trial`
+  fail; that failure IS the defect under test. Conversely, never fail an
+  implementation merely because its (still-mirroring) layout differs from the
+  skeleton above: adapt to it.
+
+CANONICAL CONSTRUCTION (a worked starting point — adapt names AND shape to what you discover)
+- This builds the reference example's shape. It is the common case, NOT a fixed
+  template: if your discovery shows the implementation mirrors the structure
+  differently (see the leash above), adjust the construction to match. Fill
+  STEPS_FIELD / KEY / MIN_KEY / SHAPE from your discovery (see the discovery
+  sections below), then:
+
+    import json, tempfile
+    from pathlib import Path
+    from test_harness import write_task_scaffold, run_trial
+
+    steps = json.loads(inputs["steps_json"])
+
+    def _scalar(v):
+        if isinstance(v, bool): return "true" if v else "false"
+        if isinstance(v, (int, float)): return repr(v)
+        return '"%s"' % v
+
+    def _threshold(mr):
+        if isinstance(mr, dict):
+            return "{ " + ", ".join("%s = %s" % (k, _scalar(v)) for k, v in mr.items()) + " }"
+        return _scalar(mr)
+
+    lines = []
+    if inputs.get("reward_strategy"):
+        lines.append('%s = "%s"' % (KEY, inputs["reward_strategy"]))
+    lines.append("\\n[environment]\\nbuild_timeout_sec = 60.0\\n")
+    if inputs.get("task_agent_user"):
+        lines.append('\\n[agent]\\nuser = "%s"\\n' % inputs["task_agent_user"])
+    for s in steps:
+        lines.append("\\n[[%s]]" % STEPS_FIELD)
+        lines.append('name = "%s"' % s["name"])
+        if s.get("min_reward") is not None:
+            lines.append("%s = %s" % (MIN_KEY, _threshold(s["min_reward"])))
+        agent_inner = "timeout_sec = 10.0"
+        if s.get("agent_user"):
+            agent_inner += ', user = "%s"' % s["agent_user"]
+        lines.append("agent = { %s }" % agent_inner)
+        lines.append("verifier = { timeout_sec = 10.0 }")
+
+    task_dir = Path(tempfile.mkdtemp()) / "task"
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.toml").write_text("\\n".join(lines) + "\\n")
+    write_task_scaffold(task_dir, [s["name"] for s in steps])
+
+    runtime = [{"rewards": s.get("rewards"), "agent_raises": bool(s.get("agent_raises"))} for s in steps]
+    result = run_trial(task_dir, runtime=runtime, result_shape=SHAPE,
+                       is_mounted=False, verifier_disabled=inputs.get("verifier_disabled", False))
+
+DISCOVERING THE STEPS FIELD (do this in EVERY story)
+- The task-config array-of-tables field that declares the ordered steps is an
+  implementation choice (a valid alternative may name it `steps`, `task_steps`,
+  etc., mirroring how the codebase already declares repeated config such as the
+  pre-existing `list[...]` array-of-tables fields). Read the implementing source
+  (`src/harbor/models/task/config.py`, and the diff under `src/harbor/`) to find
+  the field on the task config that holds the ordered list of steps, and use its
+  name as STEPS_FIELD. Do NOT guess or hardcode it.
+
+DISCOVERING THE PER-STEP THRESHOLD FIELD (before any story that sets a min_reward)
+- The per-step config field that carries the abort-threshold is an
+  implementation choice. Read the implementing source to find the per-step field
+  that gates remaining steps on a minimum reward (scalar or per-key), and use its
+  name as MIN_KEY.
+
+DISCOVERING THE RESULT-MODEL SHAPE (do this in EVERY story)
+- The multi-step result model's attribute names are an implementation choice
+  (the per-step name attribute may be `step_name` or just `name`, etc.). Read
+  the implementing source (`src/harbor/models/trial/result.py`, and the diff
+  under `src/harbor/`) to find, on the `TrialResult` the engine returns:
+    * the attribute holding the ORDERED per-step results (one per executed step),
+    * on each per-step result, the attribute carrying that step's NAME,
+    * the dotted path on each per-step result to that step's REWARD dict (None
+      when the step has no verifier result), e.g. `verifier_result.rewards`,
+    * the attribute on each per-step result that is non-None when the step
+      recorded an EXCEPTION.
+  Pass them as SHAPE = {"step_results_attr": ..., "step_name_attr": ...,
+  "step_rewards_path": ..., "step_exception_attr": ...}. Do NOT guess or hardcode
+  names. `run_trial` raises if `result_shape` is missing or incomplete. (The
+  trial-level aggregated reward is read through the pre-existing
+  `TrialResult.verifier_result`, so it is NOT part of SHAPE.)
+
+DISCOVERING THE PER-STEP OUTPUT CONTAINER (do this in the ordered-run story)
+- base.md requires each step to get its own subdirectory for its outputs, but
+  the container directory (under the trial root) that holds those per-step
+  subdirectories, and the per-step naming scheme inside it, are an
+  implementation choice (e.g. `trial_dir/steps/{name}` or
+  `trial_dir/steps/{NN}-{name}`). Read the implementing source
+  (`src/harbor/models/trial/paths.py`, and the diff under `src/harbor/`) to find
+  the directory under the trial root that holds the per-step output
+  subdirectories, and use its name as CONTAINER. Then inspect
+  `result["trial_dir"]` yourself to assert the isolation PROPERTY (one non-empty
+  output dir per executed step under CONTAINER) without pinning the per-step
+  naming scheme. Do NOT guess or hardcode the per-step naming scheme.
+
+DISCOVERING THE REWARD-STRATEGY FIELD (before any story that sets a strategy)
+- A story selects the trial-level roll-up via `inputs["reward_strategy"]` ("mean"
+  or "final"). The task-config FIELD that carries this strategy is an
+  implementation choice. Read the implementing source
+  (`src/harbor/models/task/config.py`) to find the field that accepts
+  "mean"/"final", and use its name as KEY.
+
+INPUT USAGE
+- Each story's `inputs` provides a `steps_json` string (and sometimes a
+  `reward_strategy`, `task_agent_user`, or `verifier_disabled` value). Parse the
+  JSON strings with `json.loads`. Each step dict's CONFIG fields (`name`,
+  `min_reward`, `agent_user`) go into the task.toml you author; its RUNTIME
+  fields (`rewards`, `agent_raises`) go into the `runtime` list you pass to
+  `run_trial`. These are fixed harness input schemas, not something to discover.
+  (STEPS_FIELD, MIN_KEY, KEY, and SHAPE, by contrast, are NOT inputs — you
+  discover them from source.)
+
+TEST AUTHORING CONVENTION
+- `run_trial` is synchronous (it drives the async engine internally); call it
+  directly — no `await`, no asyncio marker needed.
+"""
+
+[settings]
+va_max_turns = 60
+va_timeout_sec = 1500
+script_timeout_sec = 600
+
+[settings.pytest]
+python = "/repo/harbor/.venv/bin/python"
+
+
+[[story]]
+id = "multi_step_runs_in_order_and_aggregates"
+driver = "pytest"
+description = """
+A task can declare an ordered sequence of steps that run in order inside one environment, verifying after each. Results for each step get saved (with at least name and reward). The trial-level reward is configured as either `mean` (average across steps, absent keys count as 0) or `final` (last step).
+"""
+procedure = """
+- Discover STEPS_FIELD, the result-model SHAPE, the reward-strategy field KEY,
+  and the per-step OUTPUT CONTAINER (see the instructions). Author the
+  multi-step task.toml by mirroring the existing single-task structure and call
+  `write_task_scaffold`, then `run_trial(..., is_mounted=False)` — following the
+  CANONICAL CONSTRUCTION in the instructions, adapting names AND shape to your
+  discovered structure (this story sets no min_reward, so MIN_KEY is unused).
+- Set `step_names` to `result["step_names"]`.
+- Set `n_executed` to `result["n_executed"]`.
+- Set `both_step_rewards_present` to whether every entry in
+  `result["step_rewards"]` is not None.
+- Set `instructions_in_order` to whether `"step-one"` appears in the first
+  agent instruction and `"step-two"` in the second
+  (`result["agent_instructions"]`).
+- Set `trial_rewards_json` to `json.dumps(result["trial_rewards"], sort_keys=True)`.
+- Inspect `result["trial_dir"]` with `pathlib`. Set `n_isolated_step_output_dirs`
+  to the number of CONTAINER's immediate subdirectories that are non-empty, e.g.
+  `sum(1 for p in (Path(result["trial_dir"]) / CONTAINER).iterdir() if p.is_dir() and any(p.iterdir()))`.
+- Set `empty_root_mount_dirs` to the trial-root mount dirs the run left behind
+  empty:
+  `sorted(n for n in ("agent", "verifier", "artifacts") if (Path(result["trial_dir"]) / n).is_dir() and not any((Path(result["trial_dir"]) / n).iterdir()))`.
+- EXPECTED: step_names equals expected["step_names"].
+- EXPECTED: n_executed equals expected["n_executed"].
+- EXPECTED: both_step_rewards_present equals expected["both_step_rewards_present"].
+- EXPECTED: instructions_in_order equals expected["instructions_in_order"].
+- EXPECTED: trial_rewards_json equals expected["trial_rewards_json"].
+- EXPECTED: n_isolated_step_output_dirs equals
+  expected["n_isolated_step_output_dirs"] (each executed step keeps its own
+  non-empty output directory under the discovered container).
+- EXPECTED: empty_root_mount_dirs equals expected["empty_root_mount_dirs"]
+  (the empty list — the run leaves no empty mount dirs at the trial root).
+"""
+
+# mean over {reward:0.0},{reward:1.0} -> {reward:0.5}; ordered run + per-step
+# isolation observed in one unmounted pass.
+[[story.test_case]]
+[story.test_case.inputs]
+steps_json = '[{"name": "step-one", "rewards": {"reward": 0.0}}, {"name": "step-two", "rewards": {"reward": 1.0}}]'
+reward_strategy = "mean"
+[story.test_case.expected]
+step_names = ["step-one", "step-two"]
+n_executed = 2
+both_step_rewards_present = true
+instructions_in_order = true
+trial_rewards_json = '{"reward": 0.5}'
+n_isolated_step_output_dirs = 2
+empty_root_mount_dirs = []
+
+# final over the same -> the last step's reward verbatim ({reward:1.0}).
+[[story.test_case]]
+[story.test_case.inputs]
+steps_json = '[{"name": "step-one", "rewards": {"reward": 0.0}}, {"name": "step-two", "rewards": {"reward": 1.0}}]'
+reward_strategy = "final"
+[story.test_case.expected]
+step_names = ["step-one", "step-two"]
+n_executed = 2
+both_step_rewards_present = true
+instructions_in_order = true
+trial_rewards_json = '{"reward": 1.0}'
+n_isolated_step_output_dirs = 2
+empty_root_mount_dirs = []
+
+# multi-key mean: step-one lacks "style"; the missing key is averaged against
+# 0. correctness=(1.0+0.0)/2=0.5, style=(0+1.0)/2=0.5.
+[[story.test_case]]
+[story.test_case.inputs]
+steps_json = '[{"name": "step-one", "rewards": {"correctness": 1.0}}, {"name": "step-two", "rewards": {"correctness": 0.0, "style": 1.0}}]'
+reward_strategy = "mean"
+[story.test_case.expected]
+step_names = ["step-one", "step-two"]
+n_executed = 2
+both_step_rewards_present = true
+instructions_in_order = true
+trial_rewards_json = '{"correctness": 0.5, "style": 0.5}'
+n_isolated_step_output_dirs = 2
+empty_root_mount_dirs = []
+
+
+[[story]]
+id = "aborts_run"
+driver = "pytest"
+description = """
+A trial short-circuits when a step fails fatally or when a step's reward misses a configurable minimum threshold (a single threshold for the overall reward, or a per-key threshold).
+"""
+procedure = """
+- Discover STEPS_FIELD, the per-step threshold field MIN_KEY, the result-model
+  SHAPE, and the reward-strategy field KEY (see the instructions). Author the
+  multi-step task.toml by mirroring the existing single-task structure (this
+  story sets per-step `min_reward` on some cases — write it under MIN_KEY, scalar
+  or inline-table form) and call `write_task_scaffold`, then `run_trial(...,
+  verifier_disabled=inputs["verifier_disabled"])` — following the CANONICAL
+  CONSTRUCTION in the instructions, adapting names AND shape to your discovered
+  structure.
+- Set `n_executed` to `result["n_executed"]`.
+- Set `step_names` to `result["step_names"]`.
+- Set `trial_rewards_json` to `json.dumps(result["trial_rewards"], sort_keys=True)`.
+- EXPECTED: n_executed equals expected["n_executed"].
+- EXPECTED: step_names equals expected["step_names"].
+- EXPECTED: trial_rewards_json equals expected["trial_rewards_json"]
+  (a fatal step leaves the literal string "null"; an aborted min-threshold run
+  leaves the aggregate of the steps that ran).
+"""
+
+# fatal step: step-one's agent raises and produces no verifier result -> abort
+# with no further steps and no overall reward.
+[[story.test_case]]
+[story.test_case.inputs]
+steps_json = '[{"name": "step-one", "agent_raises": true}, {"name": "step-two", "rewards": {"reward": 1.0}}]'
+reward_strategy = "mean"
+verifier_disabled = true
+[story.test_case.expected]
+n_executed = 1
+step_names = ["step-one"]
+trial_rewards_json = "null"
+
+# scalar threshold gates the conventional "reward" key: 0.4 < 0.5 -> abort
+# after step-one; trial reward is the aggregate of the one step that ran.
+[[story.test_case]]
+[story.test_case.inputs]
+steps_json = '[{"name": "step-one", "min_reward": 0.5, "rewards": {"reward": 0.4}}, {"name": "step-two", "rewards": {"reward": 1.0}}]'
+reward_strategy = "mean"
+verifier_disabled = false
+[story.test_case.expected]
+n_executed = 1
+step_names = ["step-one"]
+trial_rewards_json = '{"reward": 0.4}'
+
+# per-key threshold passes: correctness 0.9 >= 0.8 -> continue; mean
+# correctness across both steps = (0.9+1.0)/2 = 0.95.
+[[story.test_case]]
+[story.test_case.inputs]
+steps_json = '[{"name": "step-one", "min_reward": {"correctness": 0.8}, "rewards": {"correctness": 0.9}}, {"name": "step-two", "rewards": {"correctness": 1.0}}]'
+reward_strategy = "mean"
+verifier_disabled = false
+[story.test_case.expected]
+n_executed = 2
+step_names = ["step-one", "step-two"]
+trial_rewards_json = '{"correctness": 0.95}'
+
+# per-key threshold fails: correctness 0.7 < 0.8 -> abort after step-one;
+# trial reward is the aggregate of the one step that ran.
+[[story.test_case]]
+[story.test_case.inputs]
+steps_json = '[{"name": "step-one", "min_reward": {"correctness": 0.8}, "rewards": {"correctness": 0.7}}, {"name": "step-two", "rewards": {"correctness": 1.0}}]'
+reward_strategy = "mean"
+verifier_disabled = false
+[story.test_case.expected]
+n_executed = 1
+step_names = ["step-one"]
+trial_rewards_json = '{"correctness": 0.7}'
+
+
+[[story]]
+id = "per_step_user_fallback"
+driver = "pytest"
+description = """
+Per-step agent configuration overlays the task-level defaults: a step that sets its own agent user uses it; a step that omits it falls back to the task-level agent user.
+"""
+procedure = """
+- Discover STEPS_FIELD and the result-model SHAPE (see the instructions). Author
+  the multi-step task.toml by mirroring the existing single-task structure: write
+  the task-level `[agent]` user from `inputs["task_agent_user"]` and each step's
+  own `agent` user from its `agent_user` config field (omit it when the step does
+  not set one, so it falls back to the task-level user). Call
+  `write_task_scaffold`, then `run_trial(..., verifier_disabled=inputs["verifier_disabled"])`
+  — following the CANONICAL CONSTRUCTION in the instructions, adapting names AND
+  shape to your discovered structure.
+- Set `agent_users` to `result["agent_users"]`.
+- EXPECTED: agent_users equals expected["agent_users"].
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+steps_json = '[{"name": "step-one", "agent_user": "step-agent"}, {"name": "step-two"}]'
+task_agent_user = "task-agent"
+verifier_disabled = true
+[story.test_case.expected]
+agent_users = ["step-agent", "task-agent"]

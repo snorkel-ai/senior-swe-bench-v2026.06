@@ -1,0 +1,28 @@
+# Go runner config (see runners/go.py for contract).
+#
+# Two verify_*_test.go files, each targeting a different package:
+#  - verify_pagination_test.go  → services/context
+#  - verify_repository_test.go  → services/repository
+#
+# The runner discovers `verify*_test.go` files in this directory and
+# matches per-file overrides via the [go.tests.<file-stem>] section.
+# Settings under top-level [go] apply to every file; per-file blocks
+# extend or override them.
+#
+# Build tags: sqlite + sqlite_unlock_notify required because
+# services/repository/main_test.go calls unittest.MainTest, which refuses
+# to start without the sqlite tag (modules/setting/testenv.go). Harmless
+# for services/context, which does not invoke MainTest.
+#
+# Timeout: 240s per file is headroom; warm-cache runs take <5s. The slow
+# path is the cgo compile of mattn/go-sqlite3 on a fresh worker.
+
+[go]
+build_tags = ["sqlite", "sqlite_unlock_notify"]
+timeout = 240
+
+[go.tests.verify_pagination_test]
+package = "services/context"
+
+[go.tests.verify_repository_test]
+package = "services/repository"

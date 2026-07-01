@@ -1,0 +1,177 @@
+stack_profile = "python-api"
+
+instructions = """
+General environment for every story in this task.
+
+ENVIRONMENT
+- The Prefect repo is at /repo/prefect with a uv-managed venv at
+  /repo/prefect/.venv. tests/test-setup.sh + validation-setup.sh have
+  already synced dev dependencies and started an ephemeral Prefect server
+  on http://127.0.0.1:4200/api.
+- ``PREFECT_API_URL`` is exported in your shell env (set to the URL
+  above). Subprocesses spawned by your tests inherit it automatically when
+  pytest passes ``env={**os.environ, ...}``.
+- A test harness is available at ``/tests/validate/test_harness.py`` and
+  is on PYTHONPATH; import it via ``import test_harness`` or
+  ``from test_harness import ...``.
+- The harness exposes two end-to-end helpers — read its docstring to see
+  the exact return-dict keys:
+    * ``test_harness.run_nested_cancellation_test(*, async_flows: bool, ...) -> dict``
+      Stands up a process work pool, deploys a busy parent + busy child
+      flow (with on_cancellation hooks), executes via ``prefect flow-run
+      execute`` as a subprocess, waits for both to be RUNNING, sets
+      parent state to ``Cancelling`` via the API, waits for the
+      subprocess to exit, then collects terminal states and
+      on_cancellation marker file evidence. The ``async_flows`` flag
+      selects the sync or async parent/child entrypoint.
+    * ``test_harness.run_nested_completion_test(*, ...) -> dict``
+      Same shape but using a quick parent + quick child that return
+      normally (no cancellation). Both must reach COMPLETED.
+- Each helper handles deploy + subprocess + cancel + cleanup. Your tests
+  call the helper, capture the returned dict, and assert on the
+  ``inputs`` / ``expected`` you receive from the pytest fixtures.
+
+WHY THIS HARNESS
+- The behaviour under test is end-to-end: a parent flow run with an
+  in-process nested subflow is cancelled by the user, and both runs must
+  reach ``Cancelled`` and run their ``on_cancellation`` hooks.
+- It is observable through pre-existing public Prefect interfaces only —
+  the ``prefect flow-run execute`` CLI subcommand, the
+  ``PrefectClient.set_flow_run_state(..., Cancelling())`` API, and the
+  ``@flow(on_cancellation=[...])`` hook contract. No internal modules,
+  env vars, signal codes, sockets, or implementation-specific names are
+  involved.
+
+TEST AUTHORING CONVENTION
+- Cast string expectations and bool expectations directly. No clever
+  comparisons — the harness already returns concrete strings, ints,
+  bools.
+- Run only the assertions described in the procedure — adding
+  exploratory assertions risks breaking on alternative implementations
+  that produce the same observable end-to-end behaviour through
+  different internals.
+
+Before writing tests, read the submitted patch in full and adjust for any implementation-specific details in the solution, within the bounds the procedures below set.
+"""
+
+[settings]
+va_max_turns = 60
+va_timeout_sec = 1800
+script_timeout_sec = 360
+
+[settings.pytest]
+python = "/repo/prefect/.venv/bin/python"
+
+
+[[story]]
+id = "nested_subflow_cancellation_runs_hooks"
+driver = "pytest"
+description = """
+When a user cancels a flow that has an in-process nested subflow, the
+cancellation propagates to the nested subflow: both the outer flow run
+and the in-process child subflow run reach the Cancelled state, and
+both flows' `on_cancellation` hooks fire (their on-disk markers are
+present and contain the corresponding flow_run_id). This holds for both
+the sync parent/child entrypoint and the async one.
+"""
+procedure = """
+- Import ``json`` and ``test_harness``.
+- Read ``async_flows = json.loads(inputs["async_flows"])`` (a JSON bool;
+  ``false`` selects the sync parent/child entrypoint, ``true`` the async
+  one).
+- Call ``test_harness.run_nested_cancellation_test(async_flows=async_flows)``
+  and capture the returned dict as ``observed``. The harness performs the
+  full deploy → execute → cancel → observe pattern using only pre-
+  existing public Prefect interfaces (``prefect.flow.from_source(...)``,
+  ``PrefectClient.set_flow_run_state(..., Cancelling())``, the
+  ``prefect flow-run execute`` CLI). It returns concrete observable
+  values described in the test_harness docstring.
+- EXPECTED: ``observed["parent_terminal_state"]`` equals
+  ``expected["parent_terminal_state"]`` (the user-facing state name,
+  e.g. ``"Cancelled"``).
+- EXPECTED: ``observed["child_terminal_state"]`` equals
+  ``expected["child_terminal_state"]``.
+- EXPECTED: ``observed["parent_hook_marker_present"]`` equals
+  ``expected["parent_hook_marker_present"]`` (whether the parent's
+  on_cancellation hook fired and wrote its marker).
+- EXPECTED: ``observed["child_hook_marker_present"]`` equals
+  ``expected["child_hook_marker_present"]`` (whether the child's
+  on_cancellation hook fired).
+- EXPECTED: ``observed["child_hook_marker_matches_id"]`` equals
+  ``expected["child_hook_marker_matches_id"]`` — the child marker's
+  contents must equal the child flow_run_id, proving the hook ran in the
+  child's frame (not the parent's).
+- EXPECTED: ``observed["subprocess_exit_code"]`` equals
+  ``expected["subprocess_exit_code"]`` — ``prefect flow-run execute``
+  exits 0 on a clean cancellation.
+- If any assertion fails, include ``observed["log_tail"]`` in the failure
+  message so a reviewer can see the subprocess output.
+"""
+
+# sync parent/child entrypoint
+[[story.test_case]]
+[story.test_case.inputs]
+async_flows = "false"
+[story.test_case.expected]
+parent_terminal_state = "Cancelled"
+child_terminal_state = "Cancelled"
+parent_hook_marker_present = true
+child_hook_marker_present = true
+child_hook_marker_matches_id = true
+subprocess_exit_code = 0
+
+# async parent/child entrypoint
+[[story.test_case]]
+[story.test_case.inputs]
+async_flows = "true"
+[story.test_case.expected]
+parent_terminal_state = "Cancelled"
+child_terminal_state = "Cancelled"
+parent_hook_marker_present = true
+child_hook_marker_present = true
+child_hook_marker_matches_id = true
+subprocess_exit_code = 0
+
+
+[[story]]
+id = "non_cancelled_nested_flow_completes_normally"
+driver = "pytest"
+description = """
+A normal nested-flow execution still works end-to-end: a parent flow that
+calls a child flow in-process and is NOT cancelled completes
+successfully. Both runs reach the Completed state, the subprocess exits
+0, and both flow bodies' user-side side effects (the `parent-finished`
+and `child-finished` markers) are present. Pass-to-pass regression
+guard for the new control mechanism.
+"""
+procedure = """
+- Import ``test_harness``.
+- Call ``test_harness.run_nested_completion_test()`` and capture the
+  returned dict as ``observed``. The harness deploys a quick parent +
+  quick child via ``prefect.flow.from_source(...)``, runs ``prefect
+  flow-run execute`` as a subprocess, waits for it to finish naturally
+  (no cancel), then reads terminal states.
+- EXPECTED: ``observed["parent_terminal_state"]`` equals
+  ``expected["parent_terminal_state"]``.
+- EXPECTED: ``observed["child_terminal_state"]`` equals
+  ``expected["child_terminal_state"]``.
+- EXPECTED: ``observed["subprocess_exit_code"]`` equals
+  ``expected["subprocess_exit_code"]``.
+- EXPECTED: ``observed["child_finished_marker_present"]`` equals
+  ``expected["child_finished_marker_present"]`` (the child body ran to
+  completion).
+- EXPECTED: ``observed["parent_finished_marker_present"]`` equals
+  ``expected["parent_finished_marker_present"]`` (the parent body ran to
+  completion).
+- On failure include ``observed["log_tail"]`` in the message.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case = "happy_path"
+[story.test_case.expected]
+parent_terminal_state = "Completed"
+child_terminal_state = "Completed"
+subprocess_exit_code = 0
+child_finished_marker_present = true
+parent_finished_marker_present = true

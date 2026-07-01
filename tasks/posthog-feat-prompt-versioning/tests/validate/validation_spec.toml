@@ -1,0 +1,667 @@
+stack_profile = "python-api"
+
+instructions = """
+This task uses one validation driver:
+
+- "pytest" stories — Django backend tests that drive the LLM-Prompt
+  HTTP API. Import the harness first (it handles Django setup):
+
+      import sys; sys.path.insert(0, "/tests")
+      from test_harness import (
+          get_team_and_user,
+          get_authenticated_client,
+          enable_llm_prompts_feature,
+          parse_json_response,
+      )
+
+  Available helpers:
+    - get_team_and_user() -> (team, user)
+      Creates Org -> Project -> Team + User chain. Fresh each call.
+    - get_authenticated_client(user) -> DRF APIClient (force_login)
+    - enable_llm_prompts_feature() — context manager that patches the
+      pre-existing feature gate so the LLM-Prompt API responds 200 in
+      tests instead of 403. Wrap EVERY API call in this context (or
+      wrap the whole test body in a single ``with`` block) — without
+      it the pre-existing ``LLMPromptFeatureFlagPermission`` returns
+      403 and the test sees the wrong status.
+    - parse_json_response(response) -> dict | None
+      Best-effort JSON decode (returns None for 204 / empty bodies).
+
+## Pre-existing endpoints
+
+Every URL is rooted at
+``/api/environments/{team.id}/llm_prompts/`` — the pre-existing
+viewset registered in ``posthog/api/__init__.py``
+(``environments_router.register(r"llm_prompts", ...)``). The pre-fix
+endpoints stay reachable:
+
+    POST   /api/environments/{team.id}/llm_prompts/                   (create)
+    GET    /api/environments/{team.id}/llm_prompts/                   (list)
+    GET    /api/environments/{team.id}/llm_prompts/name/{name}/       (fetch by name)
+
+Response keys exposed by the pre-existing ``LLMPrompt`` model:
+``"prompt"`` (text) and ``"version"`` (int). Read those keys directly
+from response JSON.
+
+## Discovery — publish, archive, and per-version reads
+
+The publish, archive, and per-version-read endpoints are introduced
+by this task; the agent picks their exact HTTP method, URL path, and
+(for publish) body shape. Each story that exercises one of these
+reads the agent's source ONCE to determine the shape, then uses the
+discovered values directly in test code. Do not enumerate candidates
+against the live server.
+
+Where to look:
+
+- The agent's LLM-prompt viewset — conventionally
+  ``posthog/api/llm_prompt.py``; the agent may have placed it
+  elsewhere under ``posthog/api/`` or in a service module.
+- The agent's serializer(s) — conventionally inline in the viewset
+  module or under ``posthog/api/serializers/``.
+
+### Publish call
+
+The action that creates a new immutable version of a prompt by name.
+From the agent's source, determine:
+
+- ``publish_method`` (str: ``"patch"``, ``"put"``, or ``"post"``) —
+  read the ``methods=[...]`` argument on the relevant ``@action``
+  decorator (or the inferred method if the action uses the standard
+  DRF mapping).
+- ``publish_url`` (str) for a given ``team_id`` and ``name`` — assemble
+  it from the agent's ``url_path``.
+- The body keys the action's serializer accepts — one for the new
+  prompt content, one for the caller's version-token int.
+
+Reference example: ``publish_method = "patch"``,
+``publish_url = f"/api/environments/{team.id}/llm_prompts/name/{name}/"``,
+body ``{"prompt": <new_content>, "base_version": <int>}``. Other
+defensible choices include sub-paths like ``.../name/{name}/publish/``
+or ``.../name/{name}/version/``, and body keys like ``"content"`` /
+``"expected_version"``, ``"prompt_text"`` / ``"prior_version"``, etc.
+Use whichever shape the agent registered.
+
+### Archive call
+
+The action that removes a prompt name from active reads (soft-deletes
+every version of that name). From the agent's source, determine
+``archive_method`` and ``archive_url(team_id, name)``.
+
+Reference example: ``archive_method = "post"``,
+``archive_url = f"/api/environments/{team.id}/llm_prompts/name/{name}/archive/"``
+with empty body ``{}``. Other defensible choices include DELETE on the
+by-name path or PATCH with a flag.
+
+### Per-version read
+
+The way to fetch a specific historical version of a prompt by name.
+From the agent's URL routing or viewset, determine
+``historical_url(team_id, name, version)`` — the URL that returns
+version ``N`` of ``name`` with the version's prompt text under the
+pre-existing ``"prompt"`` key.
+
+Reference example: ``f"/api/environments/{team.id}/llm_prompts/name/{name}/?version={N}"``
+(a query parameter on the by-name endpoint). Other defensible choices
+include ``.../name/{name}/version/{N}/`` or
+``.../resolve/name/{name}/?version={N}``.
+Multi-database marker (PostHog framework mechanics): mark EVERY pytest test with
+``@pytest.mark.django_db(transaction=True, databases="__all__")``. A plain
+``@pytest.mark.django_db`` or a non-transactional ``databases="__all__"`` can
+ERROR at setup with ``OperationalError: Temporary failure in name resolution`` —
+PostHog configures auxiliary databases (persons, visual_review) on a host that is
+not reachable in this backend-only environment, and a non-transactional
+all-databases marker eagerly connects to them. The transactional form connects
+lazily (only the default database is touched) and the conftest tolerates the
+cross-database teardown.
+
+"""
+
+[settings]
+script_timeout_sec = 600
+va_timeout_sec = 1800
+
+[settings.pytest]
+python = "uv run python"
+django_settings = "posthog.settings"
+
+
+# =============================================================================
+# Story 1 — basic creation establishes version 1 with versioning metadata
+# =============================================================================
+
+[[story]]
+id = "create_exposes_version_one_metadata"
+driver = "pytest"
+description = """
+Creating a fresh prompt establishes version 1. The created response
+carries enough information for callers to see that the new prompt is
+the only existing version: an integer version equal to 1, and the
+prompt is treated as the most recent version of its name.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        enable_llm_prompts_feature,
+        parse_json_response,
+    )
+
+Wrap every API call in ``enable_llm_prompts_feature()``.
+
+Steps:
+
+1. Get a fresh team and user: ``team, user = get_team_and_user()``.
+
+2. Get an authenticated DRF client: ``client = get_authenticated_client(user)``.
+
+3. Create a prompt at version 1. POST
+   ``/api/environments/{team.id}/llm_prompts/`` with body
+   ``{"name": inputs["name"], "prompt": inputs["initial_content"]}``
+   and ``format="json"``. Read ``response.status_code``, the response
+   body, and ``int(body["version"])``:
+   - ``response_status = response.status_code``
+   - ``version_value = int(body.get("version", -1))``
+
+4. Re-fetch the prompt to confirm the create persisted (a fresh GET
+   detects implementations that return ``version=1`` in the create
+   response without writing a row). GET
+   ``/api/environments/{team.id}/llm_prompts/name/{inputs['name']}/``.
+   Read ``get_response.status_code`` and the response body's ``"prompt"``
+   and ``"version"`` keys:
+   - ``get_status = get_response.status_code``
+   - ``version_value_after_get = int(get_body.get("version", -1))``
+   - ``content_round_trip = str(get_body.get("prompt", ""))``
+
+- EXPECTED: ``response_status`` matches ``expected["response_status"]`` exactly.
+- EXPECTED: ``version_value`` matches ``expected["version_value"]`` exactly.
+- EXPECTED: ``get_status`` matches ``expected["get_status"]`` exactly.
+- EXPECTED: ``version_value_after_get`` matches ``expected["version_value_after_get"]`` exactly.
+- EXPECTED: ``content_round_trip`` matches ``expected["content_round_trip"]`` exactly.
+
+Return ``{"response_status": response_status, "version_value": version_value, "get_status": get_status, "version_value_after_get": version_value_after_get, "content_round_trip": content_round_trip}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "alpha-prompt"
+initial_content = "Initial alpha content"
+[story.test_case.expected]
+response_status = 201
+version_value = 1
+get_status = 200
+version_value_after_get = 1
+content_round_trip = "Initial alpha content"
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "beta-prompt"
+initial_content = "Beta starting content"
+[story.test_case.expected]
+response_status = 201
+version_value = 1
+get_status = 200
+version_value_after_get = 1
+content_round_trip = "Beta starting content"
+
+
+# =============================================================================
+# Story 2 — publishing a new version creates an immutable second row
+# =============================================================================
+
+[[story]]
+id = "publish_creates_new_immutable_row"
+driver = "pytest"
+description = """
+Editing an existing prompt creates a new immutable version rather than
+overwriting the original. After a publish, the original version's
+content is still retrievable when fetched by its version number.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        enable_llm_prompts_feature,
+        parse_json_response,
+    )
+
+Wrap every API call in ``enable_llm_prompts_feature()``.
+
+This story exercises the publish call and a per-version read. Read the
+agent's source per the **Discovery** section in the spec instructions
+to determine ``publish_method``, ``publish_url(team_id, name)``,
+the body keys for publish, and ``historical_url(team_id, name, version)``
+before writing the test. Use the discovered shapes directly in steps
+4 and 6 — do not enumerate candidates at the HTTP layer.
+
+Steps:
+
+1. Get a fresh team and user: ``team, user = get_team_and_user()``.
+
+2. Get an authenticated DRF client: ``client = get_authenticated_client(user)``.
+
+3. Create the prompt at version 1. POST
+   ``/api/environments/{team.id}/llm_prompts/`` with body
+   ``{"name": inputs["name"], "prompt": inputs["initial_content"]}``
+   and ``format="json"``. Assert ``status_code == 201``.
+
+4. Publish version 2 using the discovered call. The body should map
+   ``inputs["new_content"]`` to the agent's "new content" field and
+   ``1`` to the agent's "base version" field. Send the request via
+   ``client.<publish_method>(<publish_url>, <publish_body>, format="json")``
+   and assert the response is 2xx (200 or 201).
+
+5. Re-fetch the latest by name. GET
+   ``/api/environments/{team.id}/llm_prompts/name/{inputs['name']}/``.
+   Read the response body:
+   - ``latest_content_after_publish = str(latest_body.get("prompt", ""))``
+   - ``latest_version_after_publish = int(latest_body.get("version", -1))``
+
+6. Fetch version 1 explicitly using the discovered ``historical_url``.
+   GET ``historical_url(team.id, inputs["name"], 1)``. Read the
+   response body's ``"prompt"`` key:
+   - ``historical_content_v1 = str(historical_body.get("prompt", ""))``
+
+- EXPECTED: ``latest_content_after_publish`` matches ``expected["latest_content_after_publish"]`` exactly.
+- EXPECTED: ``latest_version_after_publish`` matches ``expected["latest_version_after_publish"]`` exactly.
+- EXPECTED: ``historical_content_v1`` matches ``expected["historical_content_v1"]`` exactly.
+
+Return ``{"latest_content_after_publish": latest_content_after_publish, "latest_version_after_publish": latest_version_after_publish, "historical_content_v1": historical_content_v1}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "publish-alpha"
+initial_content = "alpha v1"
+new_content = "alpha v2"
+[story.test_case.expected]
+latest_content_after_publish = "alpha v2"
+latest_version_after_publish = 2
+historical_content_v1 = "alpha v1"
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "publish-beta"
+initial_content = "first beta"
+new_content = "second beta"
+[story.test_case.expected]
+latest_content_after_publish = "second beta"
+latest_version_after_publish = 2
+historical_content_v1 = "first beta"
+
+
+# =============================================================================
+# Story 3 — fetch returns latest by default and historical on request
+# =============================================================================
+
+[[story]]
+id = "latest_by_default_and_historical_access"
+driver = "pytest"
+description = """
+Fetching a prompt by name returns the latest version's content by
+default. After a publish, a follow-up fetch reflects the new content.
+Fetching with a specific version number returns that version's content.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        enable_llm_prompts_feature,
+        parse_json_response,
+    )
+
+Wrap every API call in ``enable_llm_prompts_feature()``.
+
+This story exercises the publish call and a per-version read. Read
+the agent's source per the **Discovery** section to determine
+``publish_method``, ``publish_url(team_id, name)``, the publish body
+keys, and ``historical_url(team_id, name, version)``.
+
+Steps:
+
+1. Get a fresh team and user: ``team, user = get_team_and_user()``.
+
+2. Get an authenticated DRF client: ``client = get_authenticated_client(user)``.
+
+3. Create the prompt at version 1. POST
+   ``/api/environments/{team.id}/llm_prompts/`` with body
+   ``{"name": inputs["name"], "prompt": inputs["initial_content"]}``
+   and ``format="json"``. Assert ``status_code == 201``.
+
+4. Publish version 2 using the discovered call: send
+   ``inputs["new_content"]`` (new content) with base-version 1, via
+   the agent's ``publish_method`` on ``publish_url(team.id, inputs["name"])``,
+   ``format="json"``. Assert the response is 2xx.
+
+5. Re-fetch the latest by name. GET
+   ``/api/environments/{team.id}/llm_prompts/name/{inputs['name']}/``.
+   Read the response body's ``"prompt"`` key:
+   - ``latest_content = str(latest_body.get("prompt", ""))``
+
+6. Fetch version 1 explicitly via the discovered ``historical_url``:
+   GET ``historical_url(team.id, inputs["name"], 1)``. Read the
+   response body's ``"prompt"`` key:
+   - ``historical_content = str(hist_body.get("prompt", ""))``
+
+- EXPECTED: ``latest_content`` matches ``expected["latest_content"]`` exactly.
+- EXPECTED: ``historical_content`` matches ``expected["historical_content"]`` exactly.
+
+Return ``{"latest_content": latest_content, "historical_content": historical_content}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "cache-x"
+initial_content = "x-v1"
+new_content = "x-v2"
+[story.test_case.expected]
+latest_content = "x-v2"
+historical_content = "x-v1"
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "cache-y"
+initial_content = "y-v1"
+new_content = "y-v2"
+[story.test_case.expected]
+latest_content = "y-v2"
+historical_content = "y-v1"
+
+
+# =============================================================================
+# Story 4 — concurrent publishes are detected and rejected
+# =============================================================================
+
+[[story]]
+id = "stale_base_publish_rejected"
+driver = "pytest"
+description = """
+When a publish is attempted with a stale base-version token (the
+caller's view of the current version is no longer current), the server
+rejects it with a 4xx response and adds no new version. The
+currently-active version is unchanged.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        enable_llm_prompts_feature,
+        parse_json_response,
+    )
+
+Wrap every API call in ``enable_llm_prompts_feature()``.
+
+Read the agent's source per the **Discovery** section to determine
+``publish_method``, ``publish_url(team_id, name)``, and the publish
+body keys. The same discovered shape is used for both the successful
+and the stale publish in this story.
+
+Steps:
+
+1. Get a fresh team and user: ``team, user = get_team_and_user()``.
+
+2. Get an authenticated DRF client: ``client = get_authenticated_client(user)``.
+
+3. Create the prompt at version 1. POST
+   ``/api/environments/{team.id}/llm_prompts/`` with body
+   ``{"name": inputs["name"], "prompt": inputs["initial_content"]}``
+   and ``format="json"``. Assert ``status_code == 201``.
+
+4. Publish version 2 (the successful call). Use the discovered shape
+   to send ``inputs["second_content"]`` with base-version 1. Assert
+   the response is 2xx.
+
+5. Issue a stale publish using the SAME ``publish_method``, the SAME
+   URL, and the SAME body keys — but with ``inputs["stale_content"]``
+   as the new content and base-version 1 again (the current latest is
+   now version 2, so 1 is stale). Read ``stale_resp.status_code``.
+   Categorise the result so the assertion surfaces concretely:
+
+       if 400 <= stale_resp.status_code < 500:
+           stale_status_category = "client_error_4xx"
+       elif 200 <= stale_resp.status_code < 300:
+           stale_status_category = "succeeded_2xx"
+       else:
+           stale_status_category = f"unexpected_{stale_resp.status_code}"
+
+6. Re-fetch the latest by name to confirm the failed publish persisted
+   nothing. GET
+   ``/api/environments/{team.id}/llm_prompts/name/{inputs['name']}/``.
+   Read:
+   - ``version_after_failed_publish = int(get_body.get("version", -1))``
+   - ``latest_content_after_failed_publish = str(get_body.get("prompt", ""))``
+
+- EXPECTED: ``stale_status_category`` matches ``expected["stale_status_category"]`` exactly.
+- EXPECTED: ``version_after_failed_publish`` matches ``expected["version_after_failed_publish"]`` exactly.
+- EXPECTED: ``latest_content_after_failed_publish`` matches ``expected["latest_content_after_failed_publish"]`` exactly.
+
+Return ``{"stale_status_category": stale_status_category, "version_after_failed_publish": version_after_failed_publish, "latest_content_after_failed_publish": latest_content_after_failed_publish}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "race-x"
+initial_content = "x1"
+second_content = "x2"
+stale_content = "x3-stale"
+[story.test_case.expected]
+stale_status_category = "client_error_4xx"
+version_after_failed_publish = 2
+latest_content_after_failed_publish = "x2"
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "race-y"
+initial_content = "y1"
+second_content = "y2"
+stale_content = "y3-stale"
+[story.test_case.expected]
+stale_status_category = "client_error_4xx"
+version_after_failed_publish = 2
+latest_content_after_failed_publish = "y2"
+
+
+# =============================================================================
+# Story 5 — archive then recreate restarts at version 1
+# =============================================================================
+
+[[story]]
+id = "archive_then_recreate_starts_at_version_one"
+driver = "pytest"
+description = """
+Archiving a multi-version prompt removes it from active reads. After
+archive, creating a fresh prompt with the same name succeeds (the name
+is reusable from a clean slate) and starts at version 1.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        enable_llm_prompts_feature,
+        parse_json_response,
+    )
+
+Wrap every API call in ``enable_llm_prompts_feature()``.
+
+Read the agent's source per the **Discovery** section to determine
+``publish_method``, ``publish_url(team_id, name)``, the publish body
+keys, ``archive_method``, and ``archive_url(team_id, name)``.
+
+Steps:
+
+1. Get a fresh team and user: ``team, user = get_team_and_user()``.
+
+2. Get an authenticated DRF client: ``client = get_authenticated_client(user)``.
+
+3. Create the prompt at version 1. POST
+   ``/api/environments/{team.id}/llm_prompts/`` with body
+   ``{"name": inputs["name"], "prompt": inputs["initial"]}``
+   and ``format="json"``. Assert ``status_code == 201``.
+
+4. Publish version 2 using the discovered publish call: send
+   ``inputs["second"]`` with base-version 1. (A multi-version chain
+   confirms archive removes ALL versions, not just the current one.)
+
+5. Archive the prompt by name using the discovered archive call:
+   ``client.<archive_method>(<archive_url(team.id, inputs["name"])>, ..., format="json")``.
+   For POST/PATCH archive, send empty body ``{}``; for DELETE, no
+   body. Assert the response is 2xx (200, 202, or 204).
+
+6. Confirm archive removed the name from active reads. GET
+   ``/api/environments/{team.id}/llm_prompts/name/{inputs['name']}/``.
+   Read ``fetch_after_archive_status = response.status_code``.
+
+7. Recreate the prompt with the same name. POST
+   ``/api/environments/{team.id}/llm_prompts/`` with body
+   ``{"name": inputs["name"], "prompt": inputs["recreate"]}``
+   and ``format="json"``. Read:
+   - ``recreate_status = response.status_code``
+   - ``recreate_version = int(recreate_body.get("version", -1))``
+
+8. Round-trip the recreated content via GET-by-name to prove the new
+   prompt is real (not a stale fragment of the archived data). GET
+   ``/api/environments/{team.id}/llm_prompts/name/{inputs['name']}/``.
+   Read:
+   - ``recreate_content_round_trip = str(get_body.get("prompt", ""))``
+
+- EXPECTED: ``fetch_after_archive_status`` matches ``expected["fetch_after_archive_status"]`` exactly.
+- EXPECTED: ``recreate_status`` matches ``expected["recreate_status"]`` exactly.
+- EXPECTED: ``recreate_version`` matches ``expected["recreate_version"]`` exactly.
+- EXPECTED: ``recreate_content_round_trip`` matches ``expected["recreate_content_round_trip"]`` exactly.
+
+Return ``{"fetch_after_archive_status": fetch_after_archive_status, "recreate_status": recreate_status, "recreate_version": recreate_version, "recreate_content_round_trip": recreate_content_round_trip}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "archive-x"
+initial = "x1"
+second = "x2"
+recreate = "fresh-x"
+[story.test_case.expected]
+fetch_after_archive_status = 404
+recreate_status = 201
+recreate_version = 1
+recreate_content_round_trip = "fresh-x"
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "archive-y"
+initial = "y1"
+second = "y2"
+recreate = "fresh-y"
+[story.test_case.expected]
+fetch_after_archive_status = 404
+recreate_status = 201
+recreate_version = 1
+recreate_content_round_trip = "fresh-y"
+
+
+# =============================================================================
+# Story 6 — list returns one entry per active name
+# =============================================================================
+
+[[story]]
+id = "list_returns_only_latest_per_name"
+driver = "pytest"
+description = """
+Listing prompts returns one entry per active name (the latest version
+for that name), not every historical version. Archived prompts do not
+appear in the list at all.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests")
+    from test_harness import (
+        get_team_and_user,
+        get_authenticated_client,
+        enable_llm_prompts_feature,
+        parse_json_response,
+    )
+
+Wrap every API call in ``enable_llm_prompts_feature()``.
+
+Read the agent's source per the **Discovery** section to determine
+``publish_method``, ``publish_url(team_id, name)``, the publish body
+keys, ``archive_method``, and ``archive_url(team_id, name)``.
+
+Steps:
+
+1. Get a fresh team and user: ``team, user = get_team_and_user()``.
+
+2. Get an authenticated DRF client: ``client = get_authenticated_client(user)``.
+
+3. Seed three prompts with different active states:
+   - **A** — three versions, latest is v3:
+     create at version 1 (content ``"a-v1"``); publish v2 with content
+     ``"a-v2"`` and base-version 1; publish v3 with content ``"a-v3"``
+     and base-version 2. Use the discovered publish call for the two
+     publishes; the create uses the pre-existing POST.
+   - **B** — two versions, latest is v2:
+     create at version 1 (content ``"b-v1"``); publish v2 with content
+     ``"b-v2"`` and base-version 1.
+   - **C** — created and then archived (no active versions):
+     create at version 1 (content ``"c-v1"``); archive via the
+     discovered archive call. Assert the archive response is 2xx.
+
+4. List the active prompts. GET
+   ``/api/environments/{team.id}/llm_prompts/``. Read:
+   - ``results = list_body.get("results", [])``
+   - ``count = len(results)``
+   - ``names_seen = sorted([str(row.get("name", "")) for row in results])``
+   - look up A's row and B's row by name and read their ``"version"``
+     keys:
+     - ``version_for_a = int(by_name.get(inputs["a_name"], {}).get("version", -1))``
+     - ``version_for_b = int(by_name.get(inputs["b_name"], {}).get("version", -1))``
+
+- EXPECTED: ``count`` matches ``expected["count"]`` exactly.
+- EXPECTED: ``names_seen`` matches ``expected["names_seen"]`` exactly.
+- EXPECTED: ``version_for_a`` matches ``expected["version_for_a"]`` exactly.
+- EXPECTED: ``version_for_b`` matches ``expected["version_for_b"]`` exactly.
+
+Return ``{"count": count, "names_seen": names_seen, "version_for_a": version_for_a, "version_for_b": version_for_b}``.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+a_name = "list-p-a"
+b_name = "list-p-b"
+c_name = "list-p-c"
+[story.test_case.expected]
+count = 2
+names_seen = ["list-p-a", "list-p-b"]
+version_for_a = 3
+version_for_b = 2
+
+[[story.test_case]]
+[story.test_case.inputs]
+a_name = "list-q-a"
+b_name = "list-q-b"
+c_name = "list-q-c"
+[story.test_case.expected]
+count = 2
+names_seen = ["list-q-a", "list-q-b"]
+version_for_a = 3
+version_for_b = 2

@@ -1,0 +1,13 @@
+# Verifier runner config.
+#
+# Timeout breakdown (worst case observed locally):
+#   - Django setup, pytest collection, fixture cycles:      ~30s
+#   - 4 correctness cases × small fixture builds:           ~20s
+#   - Soft-delete + tag-hierarchy + custom-fields cases:    ~20s
+#   - Perf fixture (8K docs + 100 tags + 100 cfs + 2K perms): ~55s
+#   - 2 perf tests × 3 timed runs (≤1.5s each):             ~15s
+#   - 5 CRUD round-trips:                                   ~10s
+#   - Slack for cold caches / CI variance:                  ~50s
+# Total budget: 600s (10 min) for safety under heavy CI.
+[shell]
+timeout = 600

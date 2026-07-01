@@ -1,0 +1,192 @@
+version = "1.0"
+
+[environment]
+base_image = "turborepo-feat-add-circular-package:latest"
+build_timeout_sec = 1200.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1200.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "turborepo"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "turborepo"
+
+[metadata]
+family = "turborepo-feat-add-circular-package"
+variant = "hard"
+segment = "design"
+repo = "turborepo"
+tags = ["turborepo", "rust"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Extend `turbo boundaries` so circular package dependencies surface as
+structured diagnostics. Today, when a workspace contains a cycle like
+`@repo/pkg-a -> @repo/pkg-b -> @repo/pkg-c -> @repo/pkg-a`, the only
+trace is a single `tracing::warn!` line emitted deep inside
+`PackageGraph::validate()`. The boundaries linter and the GraphQL
+`boundaries` query both report "no issues found" and the command
+exits 0 — the cycle is invisible to anyone running the linter as a
+CI gate. The task is to add a circular-dependency rule that flags
+each circular package dependency chain through the existing
+boundaries pipeline so it appears in CLI output and in the
+`turbo query` JSON.
+"""
+context = """The relevant subsystem spans three crates that work together for
+boundary linting:
+
+- `turborepo-repository` owns the `PackageGraph` (a
+  `petgraph::Graph<PackageNode, ()>`). Its `validate()` method already
+  calls `petgraph::algo::is_cyclic_directed` plus
+  `petgraph::algo::tarjan_scc` and emits a `tracing::warn!` line that
+  starts with "Circular package dependency detected" on cyclic
+  workspaces. The cycle text is therefore a pre-existing data fact in
+  the codebase — it is not invented by the fix.
+
+- `turborepo-boundaries` owns the diagnostic engine. It defines a
+  small `PackageGraphProvider` trait so the boundaries crate doesn't
+  depend on `PackageGraph` directly, a `BoundariesDiagnostic` enum,
+  and a `BoundariesChecker::check_boundaries` driver that walks all
+  filtered packages and pushes diagnostics into a `BoundariesResult`.
+  The result is rendered by `BoundariesResult::emit` and exposed via
+  the public API used by both the CLI and the GraphQL query.
+
+- `turborepo-query` adapts boundaries diagnostics into the GraphQL
+  `Diagnostic` type via an exhaustive `From<BoundariesDiagnostic> for
+  Diagnostic` match. Every diagnostic kind needs an arm here, or the
+  query returns nothing for that variant.
+
+The CLI plumbing is in `turborepo-lib/src/commands/boundaries.rs`:
+`run.check_boundaries(true).await?`, then `result.emit(color_config)`,
+exit code 0 if `result.is_ok()` else 1.
+
+Adjacent gotcha: the existing `check_boundaries` loop counts the root
+package in the progress-bar total but skips it inside the loop, so
+the displayed total is off-by-one. Coherent solutions tidy this up
+while they're already in the function; agents that only address the
+cycle issue and leave the count drift in place miss a senior nuance.
+
+Red herrings:
+- `crates/turborepo-engine` does its own task-graph cycle detection
+  (deadlock prevention in Walker). That is a separate cycle: turbo
+  deliberately allows cyclic *package* dependencies (matches
+  npm/pnpm/yarn behavior) but rejects cyclic *task* dependencies.
+  Don't conflate the two — adding cycle detection to the task graph
+  would break callers that depend on package cycles being legal.
+
+- An agent might be tempted to make `PackageGraph::validate()` return
+  an error on cycles. That changes pre-existing behavior (`turbo run`
+  would start failing on workspaces it currently accepts) and is the
+  wrong fix. The cycle should surface only through the boundaries
+  pipeline.
+
+- The same PR that added this feature also added a `vscode` builtin
+  exception to the type-only-import rule. That second change is out
+  of scope for this task — you only need to handle circular package
+  dependencies.
+"""
+solution = """The reference example adds cycle detection at the package-graph layer
+and surfaces it as a new diagnostic in the boundaries pipeline:
+
+1. A `find_cycles(&self) -> Vec<Vec<PackageName>>` method on
+   `PackageGraph` (in `turborepo-repository`) using
+   `petgraph::algo::tarjan_scc`, filtering SCCs of size > 1
+   (excluding self-edges and the root node), and deterministically
+   tracing a representative cycle path with the lexicographically
+   smallest name first.
+
+2. The `PackageGraphProvider` trait in `turborepo-boundaries` is
+   extended with the matching `find_cycles` method so the boundaries
+   checker can reach cycle data without depending on `PackageGraph`
+   concretely.
+
+3. A `CircularDependency { cycle_path: String }` variant is added to
+   `BoundariesDiagnostic`, with display text
+   `"Circular package dependency detected: {cycle_path}"`.
+
+4. `BoundariesChecker::check_boundaries` calls `find_cycles` once at
+   the top of its run and pushes one `CircularDependency` diagnostic
+   per non-trivial SCC, formatted as
+   `"a -> b -> c -> a"`. The same patch fixes the progress-bar
+   off-by-one by materializing the filtered package list before
+   constructing the bar.
+
+5. A new arm in `From<BoundariesDiagnostic> for Diagnostic` (in
+   `turborepo-query`) maps `CircularDependency` to a `Diagnostic`
+   whose `message` is the diagnostic's display text — so the
+   GraphQL query surfaces it.
+
+Valid alternatives we accept:
+- Kosaraju's SCC, Johnson's elementary-cycles, or any other
+  algorithm that produces the same set of cycles. Cycle path
+  representation may differ (comma vs arrow separator) — story
+  assertions look for the canonical phrase plus package names, not
+  for a specific separator.
+- The SCC scan placed inline in `BoundariesChecker::check_boundaries`
+  without extending `PackageGraphProvider`. The CLI and query still
+  work; the rubric judges this lower because cycle detection becomes
+  unreachable from outside the boundaries crate, but the validation
+  stories pass.
+- Different cycle-message formatting as long as every package in the
+  SCC appears together with the canonical "Circular package
+  dependency detected" phrase.
+
+What naive implementations get wrong:
+- Surfacing the cycle only via stdout/stderr from a print statement
+  (rather than pushing a `BoundariesDiagnostic` into
+  `BoundariesResult`), so `turbo query` still doesn't see it.
+- Forgetting to add the new arm in `turborepo-query`. The Rust
+  compiler catches a missing arm in the exhaustive match, but a
+  sloppy agent may collapse the impl into a catchall arm that erases
+  the diagnostic message.
+- Including `PackageName::Root` in the cycle output (it shows up as
+  a synthetic root node and shouldn't be reported as a workspace
+  package).
+- Including single-node SCCs (self-edges) as cycles — defensive impls
+  filter `scc.len() > 1`.
+- Stopping after the first cycle and not iterating across all SCCs.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["rust"]
+runtime_dependence = "runtime-helpful"
+skills = ["interface-design", "framework-fluency", "cross-service-reasoning", "data-model-design", "build-tooling", "codebase-exploration"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 96
+files = 3
+hunks = 7
+scope = "broad"
+
+[metadata.origin]
+repo = "vercel/turborepo"
+pr_numbers = [12567]
+base_commit = "8479f02f44a3d0fd8dd9cf4caf4b9a9691f57461"
+base_commit_date = "2026-04-06"
+merged_at = "2026-04-06"
+
+
+
+

@@ -1,0 +1,16 @@
+{
+  "files": [
+    "src/documents/migrations/"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "forward_migration_preserves_visibility",
+      "description": "A data migration preserves existing visibility preferences through the schema change: views that were previously on a user's dashboard or sidebar remain visible in those surfaces after upgrade. Pre-existing user settings are not overwritten."
+    },
+    {
+      "name": "reverse_migration_restores_booleans",
+      "description": "The migration reverses cleanly: running it backward restores the legacy boolean visibility fields on each saved view based on the owner's per-user settings, so a downgrade does not lose visibility data."
+    }
+  ],
+  "pass_to_pass": []
+}

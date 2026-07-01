@@ -1,0 +1,181 @@
+version = "1.0"
+
+[environment]
+base_image = "harbor-add-agent-file-retention:latest"
+build_timeout_sec = 1200.0
+cpus = 2
+memory = "4G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1800.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "harbor"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 14400.0
+
+[solution.env]
+REPO_NAME = "harbor"
+
+[metadata]
+family = "harbor-add-agent-file-retention"
+variant = "hard"
+segment = "design"
+repo = "harbor"
+tags = ["harbor", "python-lib"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """A long-running Harbor job can leave thousands of agent log files behind —
+enough to bump into file-count limits on the backing storage. Most of
+those files are never needed again; only the trajectory JSON files are
+consumed downstream (by trace export). Give users a knob that controls
+which agent files Harbor keeps after each trial finishes: keep everything
+(today's behavior), keep only the trajectory files needed for trace
+export, or keep nothing. The knob should be selectable from the command
+line when launching a run, and must work whether the environment mounts
+the log directory locally (so files already live on the host) or runs
+remotely (so files are pulled back over the wire).
+"""
+context = """The change spans four layers, all pre-existing in the codebase before
+this task:
+
+- CLI: the run launcher in `src/harbor/cli/jobs.py` (the `start` command,
+  exposed as `harbor run`) parses launch-time options and writes them
+  onto a `TrialConfig`. Each option follows the pattern
+  `if <opt> is not None: config.environment.<field> = <opt>`. The
+  "Environment" rich-help panel groups the environment-related options.
+- Config model: `src/harbor/models/trial/config.py` holds `TrialConfig`
+  and its nested `EnvironmentConfig` (the TRIAL-side environment config —
+  distinct from the task-side `harbor.models.task.config.EnvironmentConfig`).
+  New launch options become fields on this model.
+- Environment base: `src/harbor/environments/base.py` defines the
+  abstract `BaseEnvironment`. It already exposes `is_mounted` (Docker and
+  other local environments mount the log dirs and return True; remote
+  environments such as Daytona/e2b/GKE return False) and an abstract
+  `async download_dir(source_dir, target_dir)` that pulls a directory
+  back from a non-mounted environment.
+- Trial lifecycle: `src/harbor/trial/trial.py` finalizes a trial. Two
+  pre-existing methods matter. `_maybe_download_logs(source_dir,
+  target_dir)` runs for NON-mounted environments only (it early-returns
+  when `self._environment.is_mounted` is true) and calls
+  `download_dir` to pull the agent logs back to the local trial dir.
+  `_cleanup_and_finalize()` runs at the end of every trial. For MOUNTED
+  environments the agent files already sit in the local trial dir
+  (`self._trial_paths.agent_dir`), so nothing is downloaded — any pruning
+  has to happen locally during finalization.
+
+Downstream consumer (defines what a "trajectory file" is):
+- `src/harbor/utils/traces_utils.py` discovers trajectory files in the
+  ROOT of the agent dir (not in subdirectories). It reads the base
+  `trajectory.json`, continuation files `trajectory.cont-<n>.json`, and
+  summarization files
+  `trajectory.summarization-<n>-(summary|questions|answers).json`. The
+  retention filter's notion of "trajectory file" must line up with these
+  names, or `trajectories_only` would drop files trace export still needs.
+
+The task commits only the GOAL and the three retention modes (keep
+everything / keep only trajectory files / keep none) exposed as a launch-time
+option on the run launcher. The option's name and its three value tokens are
+the implementing agent's design — they are NOT spelled out in the hard
+instruction, and the reward stack DISCOVERS them from the solution rather
+than pinning any spelling (a reference example might use
+`--agent-file-retention` with `all`/`trajectories_only`/`none`, but that is
+illustrative only). Keep-everything is the default, in effect when the option
+is omitted, preserving current behavior. The discriminating behavior is WHICH
+files survive in the local agent dir for each setting.
+"""
+solution = """Canonical approach (reference example):
+
+- Add a string enum `AgentFileRetention` (`all` / `trajectories_only` /
+  `none`) to `models/trial/config.py` and a field
+  `agent_file_retention: AgentFileRetention = AgentFileRetention.ALL` on
+  the trial-side `EnvironmentConfig` (default preserves today's behavior).
+- Add the `--agent-file-retention` option to the `start` command in
+  `cli/jobs.py`, in the Environment help panel, and propagate it with the
+  existing `if agent_file_retention is not None:
+  config.environment.agent_file_retention = agent_file_retention` pattern.
+- In `environments/base.py`, add a predicate that decides whether a
+  filename is a trajectory file — matching exactly the names
+  `traces_utils.py` consumes (`trajectory.json`,
+  `trajectory.cont-<n>.json`,
+  `trajectory.summarization-<n>-(summary|questions|answers).json`) — and a
+  `download_files_matching(source_dir, target_dir, match_func)` method
+  with a default implementation that downloads the whole dir then prunes:
+  remove every subdirectory entirely and every root file the predicate
+  rejects, leaving only matching files in the root.
+- Wire both code paths in `trial.py`:
+  * NON-mounted (download path, `_maybe_download_logs`): branch on the
+    retention setting — `all` downloads the whole dir as before,
+    `trajectories_only` downloads only matching files, `none` downloads
+    nothing.
+  * MOUNTED (local path, called from `_cleanup_and_finalize`): the files
+    already exist locally, so prune `self._trial_paths.agent_dir` in
+    place — `all` is a no-op, `none` empties the dir (and recreates it
+    empty), `trajectories_only` removes all subdirectories and all
+    non-trajectory root files.
+
+Senior-engineer nuances any strong solution gets right (a naive one
+misses):
+- The retention filter applies to the ROOT of the agent dir only and
+  removes subdirectories ENTIRELY under `trajectories_only` — this
+  mirrors how `traces_utils.py` discovers trajectories (root only), so
+  keeping nested files would be both useless and misleading.
+- The trajectory predicate must match the exact `traces_utils.py` name
+  set, including continuation (`cont-<n>`) and the three summarization
+  variants — a predicate that only matched `trajectory.json` would
+  silently break trace export for summarized/continued runs.
+- BOTH environment kinds must be handled. Mounted environments never hit
+  the download path, so a solution that only filters during download
+  would do nothing for the common Docker case; mounted cleanup has to
+  happen during finalization against the local dir.
+- `none` for a mounted environment should leave a clean, still-usable
+  agent dir (empty), not a missing directory.
+- `all` must remain a true no-op so the default behavior is byte-for-byte
+  unchanged.
+
+Non-optimal solutions that should NOT pass: only wiring the CLI/config
+without changing what files survive; only handling the non-mounted
+download path (Docker, the default, keeps all files); a trajectory
+predicate that misses continuation/summarization files; leaving nested
+subdirectories in place under `trajectories_only`; deleting the agent dir
+outright under `none` for mounted environments.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["python-lib"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "framework-fluency", "interface-design", "cross-service-reasoning", "logic-fix"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 107
+files = 4
+hunks = 14
+scope = "broad"
+
+[metadata.origin]
+repo = "harbor-framework/harbor"
+pr_numbers = [1349]
+base_commit = "e371289fdf7aa2ee9534cc0c70af304a267ff0f2"
+base_commit_date = "2026-04-02"
+merged_at = "2026-04-02"
+
+
+
+

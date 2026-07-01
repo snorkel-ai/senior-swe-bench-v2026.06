@@ -1,0 +1,18 @@
+{
+  "files": [
+    "crates/turborepo-repository/src/package_graph/mod.rs",
+    "crates/turborepo-boundaries/src/lib.rs",
+    "crates/turborepo-query/src/boundaries.rs"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "cycle_detection_layered_in_package_graph",
+      "description": "Cycle detection is exposed at the package-graph layer (e.g. a method on the `PackageGraph` type, or an extension to the `PackageGraphProvider` trait the boundaries crate already uses to talk to the graph) rather than buried as an inline strongly-connected-component scan inside `BoundariesChecker::check_boundaries`. The discriminating choice mirrors the existing pattern: the boundaries crate already abstracts over the graph through the provider trait; the new cycle data should flow through the same abstraction so it is reusable from outside the boundaries checker. Award credit when the diff in `crates/turborepo-repository/src/package_graph/mod.rs` introduces a public method that returns cycles AND `BoundariesChecker::check_boundaries` consumes that method (directly or via the provider trait); deduct when the SCC scan lives inline inside the checker with no corresponding abstraction. The scan algorithm itself (Tarjan's, Kosaraju's, Johnson's) is not graded — both petgraph helpers and a hand-rolled DFS are acceptable."
+    },
+    {
+      "name": "graphql_diagnostic_mapping_complete",
+      "description": "The `From<BoundariesDiagnostic> for Diagnostic` impl in `crates/turborepo-query/src/boundaries.rs` includes a sensible match arm for the new circular-dependency variant: the resulting `Diagnostic.message` is non-empty (typically the diagnostic's `Display` text such as 'Circular package dependency detected: ...') and the other fields (`path`, `start`, `end`, `import`, `reason`) are mapped to plausible values. A cycle diagnostic has no associated import statement, so the `import` field MUST be `None` — penalise any arm that sets `import` to `Some(...)` (a cycle path is not an import specifier and belongs in `message`, not `import`). Also penalise an empty message, a panic in this arm, a catchall `_ =>` that erases the message, or a field mis-mapping that puts the cycle path into the wrong field."
+    }
+  ],
+  "pass_to_pass": []
+}

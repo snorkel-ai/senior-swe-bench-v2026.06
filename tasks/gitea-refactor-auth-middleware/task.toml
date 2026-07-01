@@ -1,0 +1,271 @@
+version = "1.0"
+
+[environment]
+base_image = "gitea-refactor-auth-middleware:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1200.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "gitea"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "gitea"
+
+[metadata]
+family = "gitea-refactor-auth-middleware"
+variant = "hard"
+segment = "design"
+repo = "gitea"
+tags = ["gitea", "go"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """We've accumulated a pile of FIXMEs around how the web framework decides
+which auth methods to attempt on each request. Today the auth methods
+themselves inspect the URL (regexes for "is this a feed", "is this a
+git path", "is this an API path") to decide whether to fire — that's
+brittle, and it's the reason workflow status badges can't be embedded
+in private README sections from a CI worker that uses Basic auth or a
+personal access token. Refactor the framework so that each route
+declares which auth methods it accepts, and remove the URL-pattern
+guessing in the auth methods. As a deliberate user-visible
+consequence, the workflow status badge endpoint should now respond to
+Basic auth and OAuth2 token credentials in addition to the existing
+browser session cookie.
+"""
+context = """The web framework lives in `modules/web/router.go`. Today it exposes
+one entry point for adding middlewares — `(*Router).Use(middlewares
+...any)` — which delegates to chi's `Use`. That's a problem for
+middlewares that need to declare *route-level* options (this route
+accepts Basic auth, that one needs CORS, the third one disables the
+CSRF check) because chi's `Use` runs per-router, before any path
+resolution; route-level middlewares can't communicate with the
+"global" middlewares that run before them.
+
+The current workaround for auth is in `services/auth/`. Each auth
+method (`Basic`, `OAuth2`, `ReverseProxy`, `SSPI`) inspects the
+request URL via the `authPathDetector` helper in
+`services/auth/auth.go` (regexes for "is this a feed", "is this a
+git path", "is this an API path", etc.) and bails out if the URL
+doesn't match. That's brittle: when a new endpoint needs Basic auth
+or a Bearer token, the regexes have to be updated, and the framework
+has no idea which routes opted into which auth methods.
+
+The path-detection scheme is also why the workflow-status-badge URL
+(`/{owner}/{repo}/actions/workflows/{workflow_name}/badge.svg`)
+currently can't be hit with Basic auth: the URL doesn't match any
+of the path-detection regexes, so `Basic.parseAuthBasic` returns
+empty before checking the Authorization header, leaving the request
+anonymous. On a private repo, the anonymous request fails the
+RepoAssignment middleware and returns 404. Users embedding badges in
+private READMEs from CI workers (which use Basic auth or OAuth2
+tokens) hit this immediately.
+
+Other FIXMEs in the same area:
+  - The `defer recover()` in `prepareHandleArgsIn` (modules/web/handler.go)
+    panics with the recovered value as-is; it should wrap with the
+    stack trace at the recovery site.
+  - The error-page renderer (`routers/common/errpage.go`) double-stacks
+    the trace because both the recovery site and the rendering function
+    add `log.Stack(2)`.
+  - SSPI is in the API auth chain on Linux installs, where it cannot
+    fire — confusing for anyone reading the auth flow.
+  - `ReverseProxy.Verify` decides whether to call `handleSignIn` based
+    on URL pattern detection; it needs an explicit knob.
+
+Test infrastructure for verifying the user-visible change:
+  - The integration test package `tests/integration/` runs against a
+    real chi router (`testWebRoutes = routers.NormalRoutes()`) via
+    `httptest.ResponseRecorder`. The test uses `MakeRequest`,
+    `NewRequest`, `AddBasicAuth`, `AddTokenAuth`, `getUserToken`,
+    `loginUser`, `getTokenForLoggedInUser` — all already wired up.
+  - `models/fixtures/repository.yml` ships `user2/repo2` as a private
+    repo. `models/fixtures/repo_unit.yml` ships TypeActions only on
+    `user2/repo1` (public); a private+actions test must insert a
+    RepoUnit row during setup.
+  - `models/fixtures/user.yml` users all have password "password"
+    (`AddBasicAuth("user2")` defaults to that).
+  - `tests/sqlite.ini` is materialised at image-build time with
+    `I_AM_BEING_UNSAFE_RUNNING_AS_ROOT = true` baked in.
+
+The only design alternative discussed in the PR review thread is
+about whether to keep stack-trace wrapping in the rendering function
+(reviewer suggested removing it; author kept it for backward
+compatibility with callers that don't do their own `recover()`).
+"""
+solution = """Canonical fix (reference example, 23 files):
+
+1. **Framework primitive (modules/web/router.go).** Introduce a new
+   middleware kind — call it `PreMiddlewareProvider` — that runs BEFORE
+   the normal middlewares on the same routing level. The point of the
+   new kind: a route can pass a `PreMiddlewareProvider` as one of its
+   per-route middlewares, and that provider runs before the
+   "ambient" middlewares the parent group declared. That gives each
+   route a hook to set context values, mark itself with options, etc.
+   that the ambient middlewares can read.
+
+2. **Splitting `Use` (modules/web/router.go).** Replace `Use` with two
+   methods:
+   - `BeforeRouting(...)` — registers chi-level middlewares that fire
+     before path resolution. Reserved for framework-level concerns
+     that need to mutate the request method/URL (security headers,
+     gzip, CORS, protocol middlewares).
+   - `AfterRouting(...)` — registers middlewares that fire after path
+     resolution and can see resolved path parameters. Most application
+     middlewares (auth, context binding, repo assignment) belong
+     here.
+   `Mount`, `Methods`, `Any`, etc. wrap the after-routing middlewares
+   plus per-route middlewares (with PreMiddleware ordering) around the
+   handler. A `RouterPathMatcher` (used by package routes) does NOT
+   support PreMiddleware and panics if one is passed.
+
+3. **Per-route auth opt-in (routers/web/web.go).** Replace the global
+   `buildAuthGroup()` for the web router with a struct holding two
+   `PreMiddlewareProvider` values (`AllowOAuth2`, `AllowBasic`) and a
+   per-request middleware handler. The pre-middlewares set context
+   values; the per-request handler reads them and constructs a
+   per-request `auth_service.Group` containing only the methods the
+   route opted into (plus always Session, plus ReverseProxy with
+   `CreateSession=!isSessionless`, plus SSPI on Windows with
+   `CreateSession=!isSessionless`). Sessionless = the route opted
+   into Basic or OAuth2 only.
+
+4. **Route migration (routers/web/web.go and friends).** Annotate every
+   web route that needs Basic and/or OAuth2 with the new pre-middlewares.
+   The full list of routes that need annotation:
+   - **Workflow badge** (the new behavior):
+     `/{owner}/{repo}/actions/workflows/{workflow_name}/badge.svg`
+     gets both `AllowBasic` and `AllowOAuth2`.
+   - **RSS/atom feeds** (preserved): `/{owner}.rss`, `/{owner}.atom`,
+     `/{owner}/{repo}.rss`, `/{owner}/{repo}.atom`,
+     `/{owner}/{repo}/releases.rss/.atom`,
+     `/{owner}/{repo}/tags.rss/.atom`,
+     `/{owner}/{repo}/rss/branch/...`,
+     `/{owner}/{repo}/atom/branch/...` — all get `AllowBasic`.
+   - **Archives, raw, attachments, releases** (preserved):
+     `/{owner}/{repo}/archive/*`, `/{owner}/{repo}/media/*`,
+     `/{owner}/{repo}/raw/*`, `/{owner}/{repo}/attachments/{uuid}`,
+     `/{owner}/{repo}/releases/attachments/{uuid}`,
+     `/{owner}/{repo}/releases/download/{vTag}/{fileName}`,
+     `/attachments/{uuid}` — all get `AllowBasic` and `AllowOAuth2`.
+   - **OAuth2 token endpoints** (preserved):
+     `/login/oauth/access_token`, `/login/oauth/keys`,
+     `/login/oauth/introspect`, `/login/oauth/userinfo` — get
+     `AllowOAuth2`.
+   - **Username route** (preserved): `/{username}` (handles user.rss
+     internally) — gets `AllowBasic`.
+   - **Repo home** (preserved):
+     `/{owner}/{reponame}` (handles repo.rss internally) — gets
+     `AllowBasic`.
+   - **Git over HTTP and Git LFS**: get `AllowBasic` (and
+     `AllowOAuth2` on git-http; LFS uses its own JWT auth and only
+     needs Basic for the token-handshake path).
+
+5. **Auth method cleanup (services/auth/).** Delete the
+   `authPathDetector` helper, `globalVarsStruct`, and all the path-
+   detection regexes. Update `Basic.parseAuthBasic` to attempt auth on
+   every request that reaches it (the route opted in by registering
+   `AllowBasic`). Update `OAuth2.Verify` similarly. Add a
+   `CreateSession bool` field to `ReverseProxy` and `SSPI`; use it
+   to gate `handleSignIn`. SSPI's `shouldAuthenticate` simplifies to
+   "match `/user/login` with `auth_with_sspi=1` form value".
+
+6. **API auth chain (routers/api/v1/api.go).** Drop SSPI from the API
+   auth group entirely (it was only ever applicable on Windows installs
+   and its semantics in an API chain were confusing). Keep the API's
+   auth chain otherwise unchanged.
+
+7. **Internal middleware migration (routers/init.go,
+   routers/install/routes.go, routers/private/internal.go,
+   routers/api/v1/api.go, routers/api/packages/api.go,
+   routers/api/actions/artifacts.go).** Convert every existing
+   `r.Use(...)` callsite to either `BeforeRouting` (framework-level,
+   request-mutating) or `AfterRouting` (everything else — the common
+   case).
+
+8. **Panic recovery polish (modules/web/handler.go,
+   routers/common/errpage.go, routers/common/middleware.go,
+   modules/web/routing/{context,logger_manager,requestrecord}.go).**
+   Wrap the recovered panic value with its stack trace at the recovery
+   site (`prepareHandleArgsIn`, `RequestContextHandler`'s defer-recover,
+   the routing logger manager). Drop the second `log.Stack(2)` in the
+   error-page renderer. Make `routing.UpdatePanicError` accept `error`
+   (not `any`) and store it as `error`. Rename
+   `RenderPanicErrorPage` to `renderPanicErrorPage` (now package-private).
+
+Alternative valid implementations the verifier must accept:
+  - An agent that does NOT introduce `PreMiddlewareProvider` as a
+    distinct type. Equivalent options: a custom Router subtype with
+    per-route metadata, a chi-style `Router.With(opts).Get(path,
+    handler)` chain, or per-route options structs threaded through
+    the existing middleware list.
+  - An agent that uses different naming for the per-route auth knobs
+    (`webAuth.AcceptBasic`, `webAuth.PermitBasic`, `RouteAuth{Basic:
+    true}`, etc.). The verifier never imports these names.
+  - An agent that keeps `Use(...)` and adds a separate "before-
+    routing" method (e.g., `UseGlobal`, `UseFramework`).
+  - An agent that whitelists the workflow badge URL pattern in the
+    existing path-detection regex INSTEAD of refactoring. This is a
+    minimal-diff valid alternative — the verifier passes (workflow
+    badge with Basic/Bearer works) and the rubric's pass-to-pass
+    criterion is satisfied. It scores lower on architectural quality
+    in the rubric judgment but is a formally valid solution.
+  - An agent that renames identifiers to non-English names. The
+    verifier never imports framework-level identifiers.
+
+Non-optimal patterns the verifier should reject:
+  - An agent that ONLY changes the workflow badge route (e.g., adds
+    Basic-auth handling inline in the badge handler) and leaves
+    existing Basic-auth routes broken. The pass-to-pass criterion
+    catches the regression.
+  - An agent that breaks the API auth chain (removes Bearer-token
+    handling from `/api/v1/`) — the API regression is a manifestation
+    of the same bad refactor.
+  - An agent that strips Session auth from web routes — the cookie
+    session is the default for browser users and must continue to
+    work. (Out of scope for the verifier here, but a clear regression.)
+"""
+
+[metadata.taxonomy]
+task_type = "migration"
+stack = ["go"]
+runtime_dependence = "runtime-helpful"
+skills = ["framework-fluency", "architectural-refactoring", "interface-design", "security-reasoning", "api-contract-design", "codebase-exploration"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 518
+files = 23
+hunks = 65
+scope = "extensive"
+
+[metadata.origin]
+repo = "go-gitea/gitea"
+pr_numbers = [36848]
+base_commit = "a0996cb229ee50514b2490b3c1423cb00ed18b7a"
+base_commit_date = "2026-03-06"
+merged_at = "2026-03-08"
+
+
+
+

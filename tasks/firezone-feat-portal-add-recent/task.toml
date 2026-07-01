@@ -1,0 +1,191 @@
+version = "1.0"
+
+[environment]
+base_image = "firezone-feat-portal-add-recent:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1200.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "firezone"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "firezone"
+
+[metadata]
+family = "firezone-feat-portal-add-recent"
+variant = "hard"
+segment = "design"
+repo = "firezone"
+tags = ["firezone", "elixir"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Firezone's Portal admin web UI gives operators a per-entity detail page for
+each Client, Policy, and Resource. From those pages an admin can inspect the
+entity's configuration, but there is no way to see the recent policy
+authorizations that involve the entity — which actor's client was granted
+access to which resource, under which policy, and when it expires.
+
+A Portal.PolicyAuthorization record is written every time a client is
+authorized against a policy/resource pair, but that history is invisible from
+the admin web surface. When investigating an access question ("did this client
+ever reach that resource?", "who has this policy been authorizing lately?")
+an operator has to drop to the database.
+
+Add a recent-policy-authorizations view to the Clients, Policies, and
+Resources detail pages so an admin can see, for the entity they are looking
+at, the relevant recent authorizations — the resource, the group (or
+"Everyone"), the responsible actor, and the relevant timestamps — without
+leaving the page and without disturbing the page's existing default content.
+The three panels should behave consistently, each scoped to its own entity and
+to the admin's own account.
+"""
+context = """The feature lives entirely in the Portal Elixir control plane's admin web
+endpoint (PortalWeb), specifically the three Phoenix LiveView modules that back
+the entity detail (`:show`) pages:
+
+  - elixir/lib/portal_web/live/clients.ex (+ live/clients/components.ex)
+  - elixir/lib/portal_web/live/policies.ex (+ live/policies/components.ex)
+  - elixir/lib/portal_web/live/resources.ex (+ live/resources/components.ex)
+
+Routing (elixir/lib/portal_web/router.ex), all under the
+`/:account_id_or_slug` admin scope guarded by EnsureAuthenticated + EnsureAdmin:
+
+  live "/clients/:id",   Clients,   :show
+  live "/policies/:id",  Policies,  :show
+  live "/resources/:id", Resources, :show
+
+The data already exists. Portal.PolicyAuthorization
+(elixir/lib/portal/policy_authorization.ex) is an Ecto schema with a composite
+{account_id, id} key and fields policy_id, initiating_device_id (client),
+receiving_device_id (gateway), resource_id, token_id, membership_id (nullable —
+nil for "Everyone" group policies), expires_at, and inserted_at. Each panel
+needs to surface the authorizations keyed to its own entity: the client's
+authorizations (where the client is the initiating/receiving device), the
+policy's authorizations, the resource's authorizations.
+
+Query/scoping conventions: existing Portal database functions select through a
+subject-scoped query helper so an admin only ever sees rows inside their own
+account. Listings over large tables in this codebase are paginated rather than
+loaded whole.
+
+Test infrastructure: PortalWeb.ConnCase boots the full Phoenix endpoint with a
+per-test SQL Sandbox. Tests authenticate with `authorize_conn(conn, actor)` and
+drive the page with Phoenix.LiveViewTest's `live/2`, `render_click/1`, and
+assertions against the rendered HTML. A comprehensive fixture system
+(elixir/test/support/fixtures/) builds accounts, actors, clients, gateways,
+resources, groups, policies, memberships, tokens, and policy authorizations —
+policy_authorization_fixture/1 is fully self-contained and creates every
+dependency it needs. The bundled Postgres is started by tests/test-setup.sh at
+image-prep time so SQL Sandbox checkouts succeed.
+"""
+solution = """Reference example (the merged PR #13052):
+
+  1. On each of the three `:show` LiveViews (clients, policies, resources), add
+     a secondary view that lists the entity's recent policy authorizations
+     alongside the existing default view, reachable without losing the default
+     content. The reference uses a tab bar (Overview/Authorizations for
+     clients & policies, Groups/Authorizations for resources) with the active
+     view tracked in a URL query param so it survives navigation.
+  2. Add a database query per panel that selects PolicyAuthorization rows keyed
+     to the entity:
+       - client: initiating_device_id == client.id OR receiving_device_id == client.id
+       - policy: policy_id == policy.id
+       - resource: resource_id == resource.id
+     joining Policy/Group/Resource/Device for display, ordered newest-first,
+     run through the subject-scoped query helper (Safe.scoped(subject, ...)) so
+     it is account-scoped, and paginated (the reference uses page size 25 with
+     the limit(page_size + 1) has-next trick).
+  3. Render a table per panel showing the resource, the group (or "Everyone"
+     when membership/group is nil), the responsible actor, and the
+     authorized/expires timestamps, with an empty state when there are none and
+     Previous/Next pagination. Resolve the actor safely even when membership_id
+     is nil.
+  4. Wire LiveView state: handle_params parses the active-view (and page)
+     param; handle_event switches the view (patching the URL) and pages.
+  5. (Supporting) core_components.ex gains an :expired status-badge variant used
+     by the expires column.
+
+Equally valid alternatives we accept (validation stories assert observable
+behavior through the rendered LiveView, not implementation names):
+
+  - Different navigation mechanism: a different query-param name/value, a
+    dedicated sub-route (/clients/:id/authorizations), or an always-visible
+    inline section instead of a tab. Stories reach the view by discovering the
+    mechanism from the agent's source or by clicking the labeled tab.
+  - Different module/function placement: a Portal context function instead of an
+    inline Database submodule; different private component names.
+  - Different table layout, column order, or empty-state copy. Stories assert on
+    seeded actor/resource/group names, not on copy.
+  - Different pagination algorithm or page size, as long as the listing is
+    bounded.
+  - Non-English identifiers; the observable HTTP/HTML surface is unchanged.
+
+What naive implementations get wrong:
+
+  - Implementing the view on only one or two of the three panels. The feature is
+    a consistent surface across Clients, Policies, and Resources; per-panel
+    stories plus the all-three-panels rubric criterion catch a partial build.
+  - Crashing on "Everyone" policies. membership_id is nil for those rows; a
+    naive row.membership.actor.name dereference raises. The actor must be
+    resolved through a non-membership path.
+  - An unscoped query that returns authorizations from other accounts. The
+    listing must be subject/account-scoped.
+  - Keying the wrong column (e.g. keying the client panel on actor_id instead of
+    the device ids), which shows the wrong rows or none.
+  - Loading all rows unbounded instead of paginating.
+  - Breaking the existing default view when introducing the tab bar (regression
+    guarded by the default-view pass-to-pass story).
+
+Red herrings:
+
+  - Portal.Workers.DeleteExpiredPolicyAuthorizations — a background cleanup
+    worker, unrelated to displaying recent authorizations.
+  - elixir/lib/portal_api/gateway/views/policy_authorization.ex — the gateway
+    API view for authorizations, a different surface from the admin web UI.
+  - Portal.Changes.Hooks.PolicyAuthorizations — change-tracking hook, not UI.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["elixir"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "framework-fluency", "interface-design", "data-model-design", "test-execution"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 1055
+files = 7
+hunks = 45
+scope = "extensive"
+
+[metadata.origin]
+repo = "firezone/firezone"
+pr_numbers = [13052]
+base_commit = "4408d028e9279dcf47cefb1c525be7fbe55d9695"
+base_commit_date = "2026-03-02"
+merged_at = "2026-03-02"
+
+
+
+

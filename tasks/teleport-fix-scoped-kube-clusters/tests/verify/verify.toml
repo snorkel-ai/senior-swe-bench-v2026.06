@@ -1,0 +1,15 @@
+# Two runners ship and both must pass: [shell] verify_build.sh (compile gate)
+# and [go] verify_dedup_test.go (behavioral discrimination).
+
+[shell]
+timeout = 900
+env = { GOFLAGS = "-mod=mod", CGO_ENABLED = "1", GOTOOLCHAIN = "local" }
+
+[go]
+# Package the verifier test is injected into and run from. lib/services/local
+# lives in the root module, so no module_dir override is needed. The cold test
+# compile of this package (it transitively pulls lib/auth deps) dominates the
+# cost; the broad shell compile usually warms the cache first.
+package = "lib/services/local"
+timeout = 1500
+env = { GOFLAGS = "-mod=mod", CGO_ENABLED = "1", GOTOOLCHAIN = "local" }

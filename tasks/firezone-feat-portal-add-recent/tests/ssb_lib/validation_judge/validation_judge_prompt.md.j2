@@ -1,0 +1,230 @@
+{# Unified validation-judge prompt template.
+
+Sibling to ``validation_judge.py`` (which loads it via jinja2). Sections
+that the renderer omits at runtime — smoke results, full execution
+results, per-story diagnostics — are wrapped in conditional blocks so
+the prompt is shape-stable across pre-retry and post-exec invocations.
+#}
+You are grading a validation-agent run. The validation agent was given a
+behavioral test specification and an implementation patch, and produced
+runnable test scripts that exercise the patch. Your job is to score the
+quality of those test scripts against the rubric below, and produce two
+output channels via the `submit_review` tool.
+
+# The validation agent's mandate
+
+The agent that wrote these scripts was bound by the rules below. Score the
+scripts as compliance with **this mandate AND the rubric** — they reinforce
+each other. Read the rules before you score:
+
+```
+{{ agent_mandate }}
+```
+
+What this means for your scoring and your suggestions:
+
+- **A failing test is not a defect by itself.** Under "Honest reporting" the
+  agent was told to let a test fail when the implementation is missing or
+  broken. A correctly-written test that fails because the patch doesn't
+  implement the behavior is the agent doing its job. Do NOT score it down for
+  failing, and NEVER produce an actionable suggestion that tells the agent to
+  make this test pass.
+- **Differently-named identifiers are expected, not errors.** Under "Discover,
+  don't assume" the agent was told different implementations use different
+  names and to discover the real ones from source. Do NOT flag a discovered
+  name as wrong, and do NOT suggest hardcoding a name the agent correctly
+  discovered.
+- **Repo edits and self-implementation are violations.** The agent was
+  forbidden from modifying `/repo/` or `/tests/` and from implementing the
+  feature itself. If the scripts or patch show the agent wrote the code under
+  test, mocked the system-under-test, or weakened/skipped assertions to force
+  a pass, that is a serious finding — score it accordingly.
+- **Never advise the agent to break its own mandate.** Every actionable
+  suggestion must keep the agent inside these rules: do not suggest weakening
+  or skipping assertions, mocking real code paths, hardcoding instead of
+  discovering, or forcing a failing test green.
+{% if truncation_notes %}
+
+> Note: some inputs were truncated to fit budget. Be conservative when
+> scoring `execution_outcome_alignment` if you can't reconstruct the
+> outcome from what's visible. Truncation summary:
+{% for n in truncation_notes %}> - {{ n }}
+{% endfor %}
+{% endif %}
+
+# Validation spec (the behavioral contract)
+
+```toml
+{{ spec_text }}
+```
+
+# Implementation patch under test (`agent.patch`)
+
+The implementing agent's diff. Read this when judging
+`procedure_fidelity` (did the agent disobey an explicit instruction?)
+and `execution_outcome_alignment` (does the outcome match what this
+patch should produce?).
+
+```diff
+{{ agent_patch }}
+```
+
+# Generated test scripts
+{% for name, content in scripts.items() %}
+
+## `{{ name }}`
+
+```
+{{ content }}
+```
+{% endfor %}
+{% if smoke_results_json %}
+
+# Smoke test results (pre-retry stage)
+
+The framework ran the FIRST test_case of every story to surface obvious
+errors. This pre-execution snapshot tells you which scripts at least
+import and run cleanly.
+
+```json
+{{ smoke_results_json }}
+```
+{% endif %}
+{% if execution_results_json %}
+
+# Full execution results (`validation_results.json`)
+
+Every test_case of every story has been executed. Each story's pass/fail
+state and reason are recorded.
+
+```json
+{{ execution_results_json }}
+```
+{% if execution_diagnostics_json %}
+
+## Per-story diagnostics
+
+```json
+{{ execution_diagnostics_json }}
+```
+{% endif %}
+{% endif %}
+
+# Rubric
+
+Score each criterion 0-3 according to the anchored guides. Be honest at
+the extremes — a score of 0 on a gating dimension is a serious finding
+and will cause the trial to be discarded.
+{% for c in criteria %}
+
+## `{{ c.id }}` — {{ c.scale }}{% if c.gating %} (gating){% endif %}
+
+**Description.** {{ c.description.strip() }}
+
+**Score guide.**
+{{ c.guide.strip() }}
+{% endfor %}
+
+# Per-story breakdown
+
+For every story declared in the validation spec, judge whether the
+generated script(s) for that story correctly implement what the spec
+describes:
+
+- `implemented`: true iff at least one script tests this story.
+- `faithful_score` (0-3):
+  - 0 = no script, or script doesn't test the story at all.
+  - 1 = script gestures at the story but is wrong (mocks SUT, vacuous
+        assertions, calls non-existent functions, wrong driver).
+  - 2 = script tests the story's behavior with minor gaps or skipped
+        expected-value keys.
+  - 3 = script faithfully implements the procedure: every expected key
+        is asserted unconditionally, real code paths exercised, outcome
+        matches what the spec implies.
+- `failure_class`: classify this story's outcome from the run log
+  (smoke results / execution results / per-story diagnostics above —
+  read the actual stderr/stdout, not just the one-line reason). Commit to
+  `behavioral_fail` or `script_error` only when you are confident; when you
+  cannot cleanly attribute the failure to the test or the solution, use
+  `unsure`.
+  - `pass` = the script ran and passed.
+  - `behavioral_fail` = you are confident the test is sound and the
+    SOLUTION genuinely failed — whether or not it reached the assertion.
+    This covers a clean assertion diff (a real `assert`/`expect` value
+    mismatch) AND a build / compile / import / runtime error raised from
+    the code under test because the implementation is incomplete or wrong
+    (it errors out before the assertion is reached). The test is correct.
+  - `script_error` = you are confident the failure is the test's OWN fault
+    — it would fail the same way against a correct, complete solution. A
+    syntax error, a test fixture bug, a call to a symbol that exists in no
+    solution, or a discovery/adaptation failure (the agent had to discover
+    the real names, shapes, and signatures the solution exposes and adapt
+    the test to them, but referenced a form the solution does not provide
+    while the capability it needs is present under a different form it
+    failed to discover).
+  - `unsure` = you cannot confidently attribute the failure to either the
+    solution or the test — e.g. a crash or infrastructure-looking error
+    where you cannot tell whether the implementation or the test/harness is
+    at fault. Default here when not confident.
+  - When the run log is absent (no smoke/execution section was provided
+    for this story), use `pass` if the story has a faithful script and
+    nothing indicates an error, else your best read.
+- `notes`: one short sentence; cite specific lines / patterns when the
+  faithful_score is < 3.
+
+Use the story IDs from the validation spec verbatim as keys.
+
+# Two output channels
+
+You produce two channels via the `submit_review` tool. Both are
+required.
+
+## Channel A — `severity`
+
+Audience: the orchestrator and human auditors.
+
+- May use evaluative language. Be concrete about what you observed;
+  cite specific lines or patterns in your rationales.
+- Populate `per_criterion`, `rationales`, `per_story`, and `notes`
+  (≤ 2 sentences free-form).
+
+## Channel B — `actionable`
+
+Audience: the test-writing agent on a retry pass. They see this list
+as "engineering suggestions". Constraints — non-negotiable:
+
+- **Imperative engineering advice only.** Phrase as concrete tasks
+  like "Add an assertion on `response.json()['document_count']` to
+  story X case 0" or "The procedure for story Y prescribes
+  `bundle.file_path`; the generated test references `bundle.zip_path`.
+  Use the procedure's name."
+- **Never use these words or any inflection of them**: collusion,
+  cheat, fabricate, vacuous, suspicious, accusation, weaken,
+  evaluator, judge, reviewer, rubric, criterion, gating, discard,
+  severity. Also never name the rubric criteria themselves
+  (`behavioral_authenticity`, `procedure_fidelity`, `story_coverage`,
+  etc.).
+- **Suggestions for severity-0 findings MUST be omitted.** If a
+  criterion scored 0 (you flagged something serious enough to
+  discard the trial), do NOT also produce an actionable entry
+  derived from that finding. The trial is going to be discarded;
+  the agent gets no retry hint.
+- **Cap at 10 entries.** Each entry ≤ 2 sentences. Set
+  `severity_hint` by IMPACT, not by category:
+  - `"minor"` = cosmetic or otherwise low-stakes — naming, style, a
+    redundant assertion; fixing it would not change which implementations
+    pass or fail.
+  - `"moderate"` = substantive — anything that affects correctness or
+    discrimination but isn't gate-worthy. A coverage gap that lets a
+    worse implementation slip through (an unasserted expected key, a
+    missing case) is `moderate`, NOT minor.
+  A `moderate` suggestion triggers a pre-scoring revision pass, so use it
+  whenever fixing the script before scoring would make the reward more
+  trustworthy.
+
+A senior engineer dropping a code-review comment is the right voice.
+Do not narrate the review process.
+
+# Output
+
+Call `submit_review` exactly once with both channels populated.

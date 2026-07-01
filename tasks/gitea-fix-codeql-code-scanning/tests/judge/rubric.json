@@ -1,0 +1,9 @@
+{
+  "files": [
+    "services/context/pagination.go",
+    "services/context/api.go",
+    "services/repository/adopt.go"
+  ],
+  "fail_to_pass": [],
+  "pass_to_pass": []
+}

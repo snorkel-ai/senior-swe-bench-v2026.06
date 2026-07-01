@@ -1,0 +1,227 @@
+stack_profile = "cli-tool"
+
+instructions = """
+All stories drive the prebuilt `turbo` CLI binary at
+`/repo/turborepo/target/debug/turbo` against fixture monorepos that
+`validation-setup.sh` has staged under `/tmp/cycle_fixtures/`
+(three_cycle, two_cycle, multi_cycle, acyclic, acyclic_minimal). DO NOT
+modify, recreate, or `npm install` them, and do NOT run `cargo build`
+or `git` — the binary is already built from the agent's edits.
+
+Required env when calling turbo (mirrors the repo's integration tests):
+
+    import os
+    ENV = {**os.environ,
+           "TURBO_TELEMETRY_MESSAGE_DISABLED": "1",
+           "TURBO_GLOBAL_WARNING_DISABLED": "1",
+           "TURBO_PRINT_VERSION_DISABLED": "1",
+           "DO_NOT_TRACK": "1",
+           "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+           "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+
+The canonical cycle diagnostic is the case-sensitive substring
+`Circular package dependency detected`, in combined stdout+stderr (CLI) or
+in the GraphQL `boundaries.items[].message` field (`turbo query`).
+
+Fixtures are immutable.
+
+Skeleton:
+
+    import subprocess, os, json
+    TURBO = "/repo/turborepo/target/debug/turbo"
+    ENV = {**os.environ, "TURBO_TELEMETRY_MESSAGE_DISABLED": "1",
+           "TURBO_GLOBAL_WARNING_DISABLED": "1", "TURBO_PRINT_VERSION_DISABLED": "1",
+           "DO_NOT_TRACK": "1", "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+           "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+
+    def test_cli_three_cycle(inputs, expected):
+        d = f"/tmp/cycle_fixtures/{inputs['fixture']}"
+        r = subprocess.run([TURBO, "boundaries"], cwd=d, capture_output=True,
+                           text=True, timeout=120, env=ENV, check=False)
+        out = (r.stdout or "") + (r.stderr or "")
+        assert (r.returncode != 0) == expected["exit_nonzero"]
+        assert ("Circular package dependency detected" in out) == expected["phrase_present"]
+        # ...one assert per expected key...
+
+For `turbo query` stories run
+`[TURBO, "query", "query { boundaries { items { message import } } }"]` and
+parse `r.stdout` with `json.loads` (default to `{}` on failure).
+
+The solution shape and interface details above represent the most likely design of the submitted patch. Read the submitted patch in full first and adapt your test code to any implementation-specific details, staying within the behavior the procedures below specify.
+"""
+
+# ---------------------------------------------------------------------------
+# Stories
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "cli_three_cycle"
+driver = "pytest"
+description = """
+Running `turbo boundaries` against a workspace with a 3-package
+circular dependency (`@repo/pkg-a` → `@repo/pkg-b` → `@repo/pkg-c` →
+`@repo/pkg-a`) reports the cycle: the command exits non-zero and its
+combined output contains the canonical `Circular package dependency
+detected` phrase together with every package name in the cycle.
+"""
+procedure = """
+Write `def test_cli_three_cycle(inputs, expected)` that runs
+`turbo boundaries` with cwd=`/tmp/cycle_fixtures/{inputs['fixture']}` and the
+standard ENV, combines stdout+stderr into `out`, and asserts:
+
+EXPECTED: (result.returncode != 0) equals expected["exit_nonzero"].
+EXPECTED: ("Circular package dependency detected" in out) equals expected["phrase_present"].
+EXPECTED: ("@repo/pkg-a" in out) equals expected["pkg_a_present"].
+EXPECTED: ("@repo/pkg-b" in out) equals expected["pkg_b_present"].
+EXPECTED: ("@repo/pkg-c" in out) equals expected["pkg_c_present"].
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+fixture = "three_cycle"
+[story.test_case.expected]
+exit_nonzero = true
+phrase_present = true
+pkg_a_present = true
+pkg_b_present = true
+pkg_c_present = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+fixture = "two_cycle"
+[story.test_case.expected]
+exit_nonzero = true
+phrase_present = true
+pkg_a_present = true
+pkg_b_present = true
+pkg_c_present = false
+
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "query_three_cycle"
+driver = "pytest"
+description = """
+The same circular dependency surfaces through the GraphQL boundaries
+query: `turbo query 'query { boundaries { items { message import } } }'`
+returns a JSON document with at least one item whose `message` carries
+the canonical `Circular package dependency detected` phrase plus every
+package name in the cycle.
+"""
+procedure = """
+Write `def test_query_three_cycle(inputs, expected)` that runs
+`turbo query "query { boundaries { items { message import } } }"` with
+cwd=`/tmp/cycle_fixtures/{inputs['fixture']}` and the standard ENV, parses
+stdout as JSON (default `{}` on failure), extracts
+`items = data.get("data",{}).get("boundaries",{}).get("items",[])`, filters
+`cycle_messages = [it.get("message","") for it in items if "Circular package dependency detected" in it.get("message","")]`,
+and computes `all_three = any(all(n in m for n in ["@repo/pkg-a","@repo/pkg-b","@repo/pkg-c"]) for m in cycle_messages)`.
+
+EXPECTED: len(cycle_messages) is at least expected["cycle_message_count_min"].
+EXPECTED: all_three equals expected["all_three_names_in_a_cycle_msg"].
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+fixture = "three_cycle"
+[story.test_case.expected]
+cycle_message_count_min = 1
+all_three_names_in_a_cycle_msg = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+fixture = "two_cycle"
+[story.test_case.expected]
+cycle_message_count_min = 1
+all_three_names_in_a_cycle_msg = false
+
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "acyclic_passes"
+driver = "pytest"
+description = """
+A workspace with no circular package dependencies is unaffected by the
+new rule: `turbo boundaries` against the pre-existing `basic_monorepo`
+fixture (apps/my-app → packages/util, plus the unrelated `another`
+package) does not emit a `Circular package dependency detected`
+diagnostic.
+"""
+procedure = """
+Write `def test_acyclic_passes(inputs, expected)` that runs `turbo boundaries`
+with cwd=`/tmp/cycle_fixtures/{inputs['fixture']}` and the standard ENV,
+combines stdout+stderr into `out`.
+
+EXPECTED: ("Circular package dependency detected" in out) equals expected["phrase_present"].
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+fixture = "acyclic"
+[story.test_case.expected]
+phrase_present = false
+
+[[story.test_case]]
+[story.test_case.inputs]
+fixture = "acyclic_minimal"
+[story.test_case.expected]
+phrase_present = false
+
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "multiple_disjoint_cycles"
+driver = "pytest"
+description = """
+Multiple independent circular dependency chains in the same workspace
+each produce their own diagnostic. Given two disjoint 2-cycles
+(`@repo/pkg-a ↔ @repo/pkg-b` and `@repo/pkg-x ↔ @repo/pkg-y`), the
+GraphQL boundaries query returns at least two distinct cycle
+diagnostics — one whose message names the (a, b) pair and another
+whose message names the (x, y) pair.
+"""
+procedure = """
+Write `def test_multiple_disjoint_cycles(inputs, expected)` that runs the
+`turbo query` boundaries query (as in query_three_cycle), filters cycle
+messages, and computes
+`ab = any("@repo/pkg-a" in m and "@repo/pkg-b" in m for m in cycle_messages)`,
+`xy = any("@repo/pkg-x" in m and "@repo/pkg-y" in m for m in cycle_messages)`.
+
+EXPECTED: len(cycle_messages) is at least expected["cycle_message_count_min"].
+EXPECTED: ab equals expected["ab_pair_present"].
+EXPECTED: xy equals expected["xy_pair_present"].
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+fixture = "multi_cycle"
+[story.test_case.expected]
+cycle_message_count_min = 2
+ab_pair_present = true
+xy_pair_present = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+fixture = "two_cycle"
+[story.test_case.expected]
+cycle_message_count_min = 1
+ab_pair_present = true
+xy_pair_present = false
+
+# ---------------------------------------------------------------------------
+# Driver settings
+# ---------------------------------------------------------------------------
+
+[settings]
+# 5 small subprocess scripts — generous turn budget for the validation agent to plan +
+# write all five plus self-correct on syntax issues.
+va_max_turns = 60
+# Validation-setup.sh runs `cargo build -p turbo` (incremental: ~1-3
+# min when the image baseline is warm), then stages 4 fixtures. The
+# The validation agent gets 25 minutes of wall-clock for the full
+# write-and-execute loop including any retries.
+va_timeout_sec = 1500
+# Each of the 5 stories spawns a subprocess that runs `turbo
+# boundaries` or `turbo query` — a few seconds. 120 s per case is
+# slack for slow Modal sandboxes.
+script_timeout_sec = 180

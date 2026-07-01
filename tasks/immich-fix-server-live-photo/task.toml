@@ -1,0 +1,217 @@
+version = "1.0"
+
+[environment]
+base_image = "immich-fix-server-live-photo:latest"
+build_timeout_sec = 1800.0
+cpus = 2
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1200.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "immich"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "immich"
+
+[metadata]
+family = "immich-fix-server-live-photo"
+variant = "hard"
+segment = "investigate"
+repo = "immich"
+tags = ["immich", "typescript-service"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """A self-hosted immich user has set their storage template to something
+like `{{y}}/{{#if album}}{{album}}{{else}}other{{/if}}/{{filename}}`
+so that photos which belong to an album live under the album name and
+orphan photos under `other/`. After running the storage-template
+migration job, all *still* photos land where they should — but for
+every Live Photo (iPhone-style still + motion-video pair), only the
+still ends up in the album folder. The accompanying motion video gets
+moved to the `else` branch (typically `other/<MM>/...`) instead. The
+user has to re-run the migration repeatedly and the result never
+converges — the two halves of the live photo end up split across
+different folders. The bug only shows up when the template references
+`{{album}}` (or album-derived tokens like `album-startDate`); for
+album-free templates (e.g., date-only), the migration of live photos
+works as expected.
+"""
+context = """Setting:
+- The buggy code path lives in the storage-template migration that
+  runs both as a one-shot job (single asset processed by the
+  `StorageTemplateMigrationSingle` queue) and as a bulk reconciliation
+  job (`StorageTemplateMigration`).
+- iPhone Live Photos are stored as TWO asset rows: a still image and
+  a hidden video. The still row references the video via a
+  `livePhotoVideoId` foreign key, and the video row is marked
+  `visibility = hidden`. Album membership is recorded only on the
+  still row (the album-asset join points at the still's id) — the
+  hidden motion video has no entries in `album_asset` and no direct
+  link to any album.
+- The storage template is a Handlebars template with helpers for
+  date components, album name, and EXIF tokens (`make`, `model`,
+  `lensModel`). The `{{album}}` token expands to the asset's first
+  album name; without an album it expands to empty (the `{{else}}`
+  branch fires).
+
+Investigation evidence available in the linked production reports
+(GitHub issue #17668 and PR #25329):
+- The user's directory tree post-migration shows still photos under
+  `<album>/...` correctly, while their .mp4 motion-video pairs land
+  under the `else` branch (typically `other/<MM>/...`) — split from
+  their still.
+- One reporter additionally observed strays after changing the
+  user's storage label: re-running migration moved the still part to
+  the new label folder but left the motion-video part in the old
+  label folder. Same root cause: motion video's path is computed
+  from its own (storage-label-less, album-less) metadata while the
+  still's path is computed from the renamed user's metadata.
+- The bug does NOT manifest for date-only or non-album templates,
+  because both halves of the pair share the same `fileCreatedAt` in
+  the typical Apple capture flow, so the still's date and the
+  motion's date produce the same folder.
+
+Red herrings the agent will likely investigate first:
+1. The Handlebars `{{album}}` resolver in the template's
+   `compile()` / `getStorageTemplateOptions()` — it looks like
+   template-rendering logic, but it's already correct. The bug is
+   upstream of rendering: the `albumName` value passed into
+   `render(...)` is null for the motion video, and the resolver
+   faithfully expands the `{{else}}` branch.
+2. The `presetOptions` array in the template-options getter — the
+   user's template matches one of the album-aware presets, which
+   makes it tempting to pin the bug to a "preset registration"
+   path. There is no bug there.
+3. The `AssetVisibility.Hidden` flag on motion videos — agents may
+   try to make motion videos non-hidden, or to expose them in album
+   listings. That changes the user-facing surface (they'd appear
+   in the timeline) and doesn't fix the migration's path
+   computation.
+
+The actual root cause and fix:
+- Inside the migration's path-computation helper, the album lookup
+  is done as `albumRepository.getByAssetId(asset.ownerId, asset.id)`.
+  When `asset` is the motion-video record, this returns no albums —
+  album membership is on the still, not the motion. So
+  `albumName = null`, the `{{else}}` branch fires, and the motion
+  video lands in a different folder than its still.
+- Same situation for the date / EXIF substitutions — when motion
+  and still have slightly different `fileCreatedAt` values, the
+  motion ends up in a different date folder than the still.
+- The fix: when migrating a Live Photo, the motion-video's path
+  must be computed using the **still** photo's metadata (album
+  membership, owner id, fileCreatedAt, make / model / lensModel),
+  not the motion's own. Then both halves of the pair land together.
+- Additionally, hidden motion videos must not be processed as
+  standalone items in the bulk migration's stream — they must only
+  be moved via the still photo's livePhoto branch. Otherwise a
+  motion video would be moved twice: once independently (to the
+  wrong folder) and again via the still (to the right folder),
+  producing failures or stranded files.
+"""
+solution = """Canonical fix (reference example):
+- Plumb the still photo through `moveAsset` / `getTemplatePath`. The
+  reference adds an optional `stillPhoto?: StorageAsset` 3rd
+  parameter: `moveAsset(asset, metadata, stillPhoto?)` and the same
+  on `getTemplatePath`. Inside `getTemplatePath`, set
+  `assetForMetadata = stillPhoto ?? asset` and use it for the album
+  lookup, the render's `asset` field, and the make / model /
+  lensModel substitutions.
+- In `handleMigrationSingle` and `handleMigration`, when invoking
+  `moveAsset` for the motion video, pass the still as the third
+  argument: `await this.moveAsset(livePhotoVideo, { ... }, asset);`.
+- In the bulk-stream path, exclude hidden assets from the stream
+  query so motion videos are never iterated as standalone items.
+- For the still photo's livePhoto branch, the inner
+  `getForStorageTemplateJob(motionVideoId)` call must still be able
+  to fetch hidden rows — the reference adds an
+  `options?: { includeHidden?: boolean }` argument and passes
+  `{ includeHidden: true }` in the inner call.
+
+Alternative valid fixes the verifier accepts:
+1. Pre-resolve the still's album / date / EXIF outside
+   `getTemplatePath` and feed them into `MoveAssetMetadata` (no new
+   function arg); the resolver pulls album / date from `metadata`
+   if present. Same externally-observable behaviour.
+2. Factor out a `LivePhotoMigration` helper that owns both moves
+   atomically, computes both paths from the still, and never exposes
+   the motion to `moveAsset` directly.
+3. Different parameter naming (`parentStill`, `referenceAsset`,
+   `siblingStill`, `fotoFissa`, etc.).
+4. Different option naming for the get-by-id include-hidden flag
+   (`withHidden`, `allowHidden`, `bypassVisibilityFilter`, etc.).
+5. Different stream-filter mechanism (filter at the stream consumer
+   instead of in the SQL query, e.g., a `for await` skip for hidden
+   assets).
+
+Non-optimal "fixes" the verifier rejects:
+- Fixing only the album lookup (`stillPhoto.id` for `getByAssetId`)
+  but leaving the date / EXIF substitutions on the motion's own
+  metadata. This puts still+motion in the same album folder but in
+  different date subfolders for templates that combine
+  `{{album}}/{{y}}-{{MM}}-{{dd}}/...`.
+- Promoting motion videos to non-hidden so the album lookup finds
+  them. Doesn't actually attach the album to the motion (album
+  membership is on the still); also makes motion videos visible in
+  the timeline, a regression unrelated to the migration.
+- Fixing the path computation but not filtering hidden out of the
+  stream. Motion video gets moved twice (once independently, once
+  via still) — second move fails because file is gone, leaving the
+  motion at the still-less location.
+- Removing the `{{album}}` token from `compile()` so the template
+  silently downgrades to non-album. Disables the user-visible
+  feature entirely.
+
+Pre-existing test parity: the pre-fix
+`server/src/services/storage-template.service.spec.ts` contains an
+assertion at the end of the `should migrate live photo motion video
+alongside the still image` test that becomes stale once the inner
+get-by-id call signature changes. Test-file changes are stripped
+from the reference; the verifier runs only the dedicated verifier
+spec via --testPathPattern, so the stale assertion does not
+contribute to scoring. Agents may freely modify the existing spec
+file as part of their fix.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["typescript-service"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "framework-fluency", "logic-fix", "data-population", "test-execution"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 43
+files = 2
+hunks = 9
+scope = "localized"
+
+[metadata.origin]
+repo = "immich-app/immich"
+pr_numbers = [25329]
+base_commit = "28ca5f59fe6ba18350c213cd70fd54efcdd73f44"
+base_commit_date = "2026-01-17"
+merged_at = "2026-02-27"
+
+
+
+

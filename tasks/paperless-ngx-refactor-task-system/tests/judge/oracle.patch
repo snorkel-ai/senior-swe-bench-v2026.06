@@ -1,0 +1,3196 @@
+diff --git a/src/documents/admin.py b/src/documents/admin.py
+index f0e5ccd25..d0a43ce9c 100644
+--- a/src/documents/admin.py
++++ b/src/documents/admin.py
+@@ -144,18 +144,29 @@ class StoragePathAdmin(GuardedModelAdmin):
+ 
+ 
+ class TaskAdmin(admin.ModelAdmin):
+-    list_display = ("task_id", "task_file_name", "task_name", "date_done", "status")
+-    list_filter = ("status", "date_done", "task_name")
+-    search_fields = ("task_name", "task_id", "status", "task_file_name")
++    list_display = (
++        "task_id",
++        "task_type",
++        "trigger_source",
++        "status",
++        "date_created",
++        "date_done",
++        "duration_seconds",
++    )
++    list_filter = ("status", "task_type", "trigger_source", "date_done")
++    search_fields = ("task_id", "task_type", "status")
+     readonly_fields = (
+         "task_id",
+-        "task_file_name",
+-        "task_name",
++        "task_type",
++        "trigger_source",
+         "status",
+         "date_created",
+         "date_started",
+         "date_done",
+-        "result",
++        "duration_seconds",
++        "wait_time_seconds",
++        "input_data",
++        "result_data",
+     )
+ 
+ 
+diff --git a/src/documents/barcodes.py b/src/documents/barcodes.py
+index 38a28081a..2bb96f1ea 100644
+--- a/src/documents/barcodes.py
++++ b/src/documents/barcodes.py
+@@ -17,7 +17,9 @@ from pikepdf import Pdf
+ from documents.converters import convert_from_tiff_to_pdf
+ from documents.data_models import ConsumableDocument
+ from documents.data_models import DocumentMetadataOverrides
++from documents.data_models import DocumentSource
+ from documents.models import Document
++from documents.models import PaperlessTask
+ from documents.models import Tag
+ from documents.plugins.base import ConsumeTaskPlugin
+ from documents.plugins.base import StopConsumeTaskError
+@@ -193,23 +195,36 @@ class BarcodePlugin(ConsumeTaskPlugin):
+ 
+             from documents import tasks
+ 
++            _SOURCE_TO_TRIGGER: dict[DocumentSource, PaperlessTask.TriggerSource] = {
++                DocumentSource.ConsumeFolder: PaperlessTask.TriggerSource.FOLDER_CONSUME,
++                DocumentSource.ApiUpload: PaperlessTask.TriggerSource.API_UPLOAD,
++                DocumentSource.MailFetch: PaperlessTask.TriggerSource.EMAIL_CONSUME,
++                DocumentSource.WebUI: PaperlessTask.TriggerSource.WEB_UI,
++            }
++            trigger_source = _SOURCE_TO_TRIGGER.get(
++                self.input_doc.source,
++                PaperlessTask.TriggerSource.MANUAL,
++            )
++
+             # Create the split document tasks
+             for new_document in self.separate_pages(separator_pages):
+                 copy_file_with_basic_stats(new_document, tmp_dir / new_document.name)
+ 
+-                task = tasks.consume_file.delay(
+-                    ConsumableDocument(
+-                        # Same source, for templates
+-                        source=self.input_doc.source,
+-                        mailrule_id=self.input_doc.mailrule_id,
+-                        # Can't use same folder or the consume might grab it again
+-                        original_file=(tmp_dir / new_document.name).resolve(),
+-                        # Adding optional original_path for later uses in
+-                        # workflow matching
+-                        original_path=self.input_doc.original_file,
+-                    ),
+-                    # All the same metadata
+-                    self.metadata,
++                task = tasks.consume_file.apply_async(
++                    kwargs={
++                        "input_doc": ConsumableDocument(
++                            # Same source, for templates
++                            source=self.input_doc.source,
++                            mailrule_id=self.input_doc.mailrule_id,
++                            # Can't use same folder or the consume might grab it again
++                            original_file=(tmp_dir / new_document.name).resolve(),
++                            # Adding optional original_path for later uses in
++                            # workflow matching
++                            original_path=self.input_doc.original_file,
++                        ),
++                        "overrides": self.metadata,
++                    },
++                    headers={"trigger_source": trigger_source},
+                 )
+                 logger.info(f"Created new task {task.id} for {new_document.name}")
+ 
+diff --git a/src/documents/bulk_edit.py b/src/documents/bulk_edit.py
+index 3f80b699d..65ce3c785 100644
+--- a/src/documents/bulk_edit.py
++++ b/src/documents/bulk_edit.py
+@@ -22,6 +22,7 @@ from documents.models import CustomField
+ from documents.models import CustomFieldInstance
+ from documents.models import Document
+ from documents.models import DocumentType
++from documents.models import PaperlessTask
+ from documents.models import StoragePath
+ from documents.models import Tag
+ from documents.permissions import set_permissions_for_object
+@@ -113,7 +114,10 @@ def set_correspondent(
+     affected_docs = list(qs.values_list("pk", flat=True))
+     qs.update(correspondent=correspondent)
+ 
+-    bulk_update_documents.delay(document_ids=affected_docs)
++    bulk_update_documents.apply_async(
++        kwargs={"document_ids": affected_docs},
++        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
++    )
+ 
+     return "OK"
+ 
+@@ -132,8 +136,9 @@ def set_storage_path(doc_ids: list[int], storage_path: StoragePath) -> Literal["
+     affected_docs = list(qs.values_list("pk", flat=True))
+     qs.update(storage_path=storage_path)
+ 
+-    bulk_update_documents.delay(
+-        document_ids=affected_docs,
++    bulk_update_documents.apply_async(
++        kwargs={"document_ids": affected_docs},
++        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+     )
+ 
+     return "OK"
+@@ -151,7 +156,10 @@ def set_document_type(doc_ids: list[int], document_type: DocumentType) -> Litera
+     affected_docs = list(qs.values_list("pk", flat=True))
+     qs.update(document_type=document_type)
+ 
+-    bulk_update_documents.delay(document_ids=affected_docs)
++    bulk_update_documents.apply_async(
++        kwargs={"document_ids": affected_docs},
++        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
++    )
+ 
+     return "OK"
+ 
+@@ -177,7 +185,10 @@ def add_tag(doc_ids: list[int], tag: int) -> Literal["OK"]:
+         DocumentTagRelationship.objects.bulk_create(to_create)
+ 
+     if affected_docs:
+-        bulk_update_documents.delay(document_ids=list(affected_docs))
++        bulk_update_documents.apply_async(
++            kwargs={"document_ids": list(affected_docs)},
++            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
++        )
+ 
+     return "OK"
+ 
+@@ -195,7 +206,10 @@ def remove_tag(doc_ids: list[int], tag: int) -> Literal["OK"]:
+     qs.delete()
+ 
+     if affected_docs:
+-        bulk_update_documents.delay(document_ids=affected_docs)
++        bulk_update_documents.apply_async(
++            kwargs={"document_ids": affected_docs},
++            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
++        )
+ 
+     return "OK"
+ 
+@@ -254,7 +268,10 @@ def modify_tags(
+                     )
+ 
+             if affected_docs:
+-                bulk_update_documents.delay(document_ids=affected_docs)
++                bulk_update_documents.apply_async(
++                    kwargs={"document_ids": affected_docs},
++                    headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
++                )
+     except Exception as e:
+         logger.error(f"Error modifying tags: {e}")
+         return "ERROR"
+@@ -326,7 +343,10 @@ def modify_custom_fields(
+         field_id__in=remove_custom_fields,
+     ).hard_delete()
+ 
+-    bulk_update_documents.delay(document_ids=affected_docs)
++    bulk_update_documents.apply_async(
++        kwargs={"document_ids": affected_docs},
++        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
++    )
+ 
+     return "OK"
+ 
+@@ -369,8 +389,9 @@ def delete(doc_ids: list[int]) -> Literal["OK"]:
+ 
+ def reprocess(doc_ids: list[int]) -> Literal["OK"]:
+     for document_id in doc_ids:
+-        update_document_content_maybe_archive_file.delay(
+-            document_id=document_id,
++        update_document_content_maybe_archive_file.apply_async(
++            kwargs={"document_id": document_id},
++            headers={"trigger_source": PaperlessTask.TriggerSource.MANUAL},
+         )
+ 
+     return "OK"
+@@ -396,7 +417,10 @@ def set_permissions(
+ 
+     affected_docs = list(qs.values_list("pk", flat=True))
+ 
+-    bulk_update_documents.delay(document_ids=affected_docs)
++    bulk_update_documents.apply_async(
++        kwargs={"document_ids": affected_docs},
++        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
++    )
+ 
+     return "OK"
+ 
+@@ -407,6 +431,7 @@ def rotate(
+     *,
+     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
+     user: User | None = None,
++    trigger_source: PaperlessTask.TriggerSource = PaperlessTask.TriggerSource.WEB_UI,
+ ) -> Literal["OK"]:
+     logger.info(
+         f"Attempting to rotate {len(doc_ids)} documents by {degrees} degrees.",
+@@ -453,13 +478,16 @@ def rotate(
+             if user is not None:
+                 overrides.actor_id = user.id
+ 
+-            consume_file.delay(
+-                ConsumableDocument(
+-                    source=DocumentSource.ConsumeFolder,
+-                    original_file=filepath,
+-                    root_document_id=root_doc.id,
+-                ),
+-                overrides,
++            consume_file.apply_async(
++                kwargs={
++                    "input_doc": ConsumableDocument(
++                        source=DocumentSource.ConsumeFolder,
++                        original_file=filepath,
++                        root_document_id=root_doc.id,
++                    ),
++                    "overrides": overrides,
++                },
++                headers={"trigger_source": trigger_source},
+             )
+             logger.info(
+                 f"Queued new rotated version for document {root_doc.id} by {degrees} degrees",
+@@ -478,6 +506,7 @@ def merge(
+     archive_fallback: bool = False,
+     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
+     user: User | None = None,
++    trigger_source: PaperlessTask.TriggerSource = PaperlessTask.TriggerSource.WEB_UI,
+ ) -> Literal["OK"]:
+     logger.info(
+         f"Attempting to merge {len(doc_ids)} documents into a single document.",
+@@ -556,12 +585,12 @@ def merge(
+     logger.info("Adding merged document to the task queue.")
+ 
+     consume_task = consume_file.s(
+-        ConsumableDocument(
++        input_doc=ConsumableDocument(
+             source=DocumentSource.ConsumeFolder,
+             original_file=filepath,
+         ),
+-        overrides,
+-    )
++        overrides=overrides,
++    ).set(headers={"trigger_source": trigger_source})
+ 
+     if delete_originals:
+         backup = release_archive_serial_numbers(affected_docs)
+@@ -577,7 +606,7 @@ def merge(
+             restore_archive_serial_numbers(backup)
+             raise
+     else:
+-        consume_task.delay()
++        consume_task.apply_async()
+ 
+     return "OK"
+ 
+@@ -589,6 +618,7 @@ def split(
+     delete_originals: bool = False,
+     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
+     user: User | None = None,
++    trigger_source: PaperlessTask.TriggerSource = PaperlessTask.TriggerSource.WEB_UI,
+ ) -> Literal["OK"]:
+     logger.info(
+         f"Attempting to split document {doc_ids[0]} into {len(pages)} documents",
+@@ -631,12 +661,12 @@ def split(
+                 )
+                 consume_tasks.append(
+                     consume_file.s(
+-                        ConsumableDocument(
++                        input_doc=ConsumableDocument(
+                             source=DocumentSource.ConsumeFolder,
+                             original_file=filepath,
+                         ),
+-                        overrides,
+-                    ),
++                        overrides=overrides,
++                    ).set(headers={"trigger_source": trigger_source}),
+                 )
+ 
+             if delete_originals:
+@@ -669,6 +699,7 @@ def delete_pages(
+     *,
+     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
+     user: User | None = None,
++    trigger_source: PaperlessTask.TriggerSource = PaperlessTask.TriggerSource.WEB_UI,
+ ) -> Literal["OK"]:
+     logger.info(
+         f"Attempting to delete pages {pages} from {len(doc_ids)} documents",
+@@ -698,13 +729,16 @@ def delete_pages(
+         overrides = DocumentMetadataOverrides().from_document(root_doc)
+         if user is not None:
+             overrides.actor_id = user.id
+-        consume_file.delay(
+-            ConsumableDocument(
+-                source=DocumentSource.ConsumeFolder,
+-                original_file=filepath,
+-                root_document_id=root_doc.id,
+-            ),
+-            overrides,
++        consume_file.apply_async(
++            kwargs={
++                "input_doc": ConsumableDocument(
++                    source=DocumentSource.ConsumeFolder,
++                    original_file=filepath,
++                    root_document_id=root_doc.id,
++                ),
++                "overrides": overrides,
++            },
++            headers={"trigger_source": trigger_source},
+         )
+         logger.info(
+             f"Queued new version for document {root_doc.id} after deleting pages {pages}",
+@@ -724,6 +758,7 @@ def edit_pdf(
+     include_metadata: bool = True,
+     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
+     user: User | None = None,
++    trigger_source: PaperlessTask.TriggerSource = PaperlessTask.TriggerSource.WEB_UI,
+ ) -> Literal["OK"]:
+     """
+     Operations is a list of dictionaries describing the final PDF pages.
+@@ -781,13 +816,16 @@ def edit_pdf(
+             if user is not None:
+                 overrides.owner_id = user.id
+                 overrides.actor_id = user.id
+-            consume_file.delay(
+-                ConsumableDocument(
+-                    source=DocumentSource.ConsumeFolder,
+-                    original_file=filepath,
+-                    root_document_id=root_doc.id,
+-                ),
+-                overrides,
++            consume_file.apply_async(
++                kwargs={
++                    "input_doc": ConsumableDocument(
++                        source=DocumentSource.ConsumeFolder,
++                        original_file=filepath,
++                        root_document_id=root_doc.id,
++                    ),
++                    "overrides": overrides,
++                },
++                headers={"trigger_source": trigger_source},
+             )
+         else:
+             consume_tasks = []
+@@ -812,12 +850,12 @@ def edit_pdf(
+                 pdf.save(version_filepath)
+                 consume_tasks.append(
+                     consume_file.s(
+-                        ConsumableDocument(
++                        input_doc=ConsumableDocument(
+                             source=DocumentSource.ConsumeFolder,
+                             original_file=version_filepath,
+                         ),
+-                        overrides,
+-                    ),
++                        overrides=overrides,
++                    ).set(headers={"trigger_source": trigger_source}),
+                 )
+ 
+             if delete_original:
+@@ -853,6 +891,7 @@ def remove_password(
+     include_metadata: bool = True,
+     source_mode: SourceMode = SourceModeChoices.LATEST_VERSION,
+     user: User | None = None,
++    trigger_source: PaperlessTask.TriggerSource = PaperlessTask.TriggerSource.WEB_UI,
+ ) -> Literal["OK"]:
+     """
+     Remove password protection from PDF documents.
+@@ -887,13 +926,16 @@ def remove_password(
+                     if user is not None:
+                         overrides.owner_id = user.id
+                         overrides.actor_id = user.id
+-                    consume_file.delay(
+-                        ConsumableDocument(
+-                            source=DocumentSource.ConsumeFolder,
+-                            original_file=filepath,
+-                            root_document_id=root_doc.id,
+-                        ),
+-                        overrides,
++                    consume_file.apply_async(
++                        kwargs={
++                            "input_doc": ConsumableDocument(
++                                source=DocumentSource.ConsumeFolder,
++                                original_file=filepath,
++                                root_document_id=root_doc.id,
++                            ),
++                            "overrides": overrides,
++                        },
++                        headers={"trigger_source": trigger_source},
+                     )
+                 else:
+                     consume_tasks = []
+@@ -908,12 +950,12 @@ def remove_password(
+ 
+                     consume_tasks.append(
+                         consume_file.s(
+-                            ConsumableDocument(
++                            input_doc=ConsumableDocument(
+                                 source=DocumentSource.ConsumeFolder,
+                                 original_file=filepath,
+                             ),
+-                            overrides,
+-                        ),
++                            overrides=overrides,
++                        ).set(headers={"trigger_source": trigger_source}),
+                     )
+ 
+                     if delete_original:
+diff --git a/src/documents/consumer.py b/src/documents/consumer.py
+index 83bc832ce..390ce3e66 100644
+--- a/src/documents/consumer.py
++++ b/src/documents/consumer.py
+@@ -20,6 +20,7 @@ from rest_framework.reverse import reverse
+ 
+ from documents.classifier import load_classifier
+ from documents.data_models import ConsumableDocument
++from documents.data_models import ConsumeFileSuccessResult
+ from documents.data_models import DocumentMetadataOverrides
+ from documents.file_handling import create_source_path_directory
+ from documents.file_handling import generate_filename
+@@ -90,6 +91,15 @@ class ConsumerError(Exception):
+     pass
+ 
+ 
++class ConsumeFileDuplicateError(ConsumerError):
++    """Raised when a file is rejected because it duplicates an existing document."""
++
++    def __init__(self, message: str, duplicate_id: int, *, in_trash: bool) -> None:
++        super().__init__(message)
++        self.duplicate_id = duplicate_id
++        self.in_trash = in_trash
++
++
+ class ConsumerStatusShortMessage(StrEnum):
+     DOCUMENT_ALREADY_EXISTS = "document_already_exists"
+     DOCUMENT_ALREADY_EXISTS_IN_TRASH = "document_already_exists_in_trash"
+@@ -395,7 +405,7 @@ class ConsumerPlugin(
+                 exception=e,
+             )
+ 
+-    def run(self) -> str:
++    def run(self) -> "ConsumeFileSuccessResult":
+         """
+         Return the document object if it was successfully created.
+         """
+@@ -771,7 +781,7 @@ class ConsumerPlugin(
+         # Return the most up to date fields
+         document.refresh_from_db()
+ 
+-        return f"Success. New document id {document.pk} created"
++        return ConsumeFileSuccessResult(document_id=document.pk)
+ 
+     def _parse_title_placeholders(self, title: str) -> str:
+         local_added = timezone.localtime(timezone.now())
+@@ -1010,9 +1020,13 @@ class ConsumerPreflightPlugin(
+                     )
+                     failure_msg += " Note: existing document is in the trash."
+ 
+-                self._fail(
+-                    status_msg,
+-                    failure_msg,
++                self._send_progress(100, 100, ProgressStatusOptions.FAILED, status_msg)
++                self.log.error(failure_msg)
++                in_trash = duplicates_in_trash.exists()
++                raise ConsumeFileDuplicateError(
++                    f"{self.filename}: {failure_msg}",
++                    duplicate.pk,
++                    in_trash=in_trash,
+                 )
+ 
+     def pre_check_directories(self) -> None:
+diff --git a/src/documents/data_models.py b/src/documents/data_models.py
+index a2452a8af..6d9e3a187 100644
+--- a/src/documents/data_models.py
++++ b/src/documents/data_models.py
+@@ -2,6 +2,7 @@ import dataclasses
+ import datetime
+ from enum import IntEnum
+ from pathlib import Path
++from typing import TypedDict
+ 
+ import magic
+ from guardian.shortcuts import get_groups_with_perms
+@@ -184,3 +185,26 @@ class ConsumableDocument:
+         # Get the file type once at init
+         # Note this function isn't called when the object is unpickled
+         self.mime_type = magic.from_file(self.original_file, mime=True)
++
++
++class ConsumeFileDuplicateResult(TypedDict):
++    """Returned by consume_file when the file is rejected as a duplicate."""
++
++    duplicate_of: int
++    duplicate_in_trash: bool
++
++
++class ConsumeFileSuccessResult(TypedDict):
++    """Returned by consume_file when the document is created successfully."""
++
++    document_id: int
++
++
++class ConsumeFileStoppedResult(TypedDict):
++    """Returned by consume_file when a plugin raises StopConsumeTaskError.
++
++    Examples: barcode split dispatched child tasks, double-sided scan waiting
++    for the second half, workflow deleted the document during consumption.
++    """
++
++    reason: str
+diff --git a/src/documents/filters.py b/src/documents/filters.py
+index b2b226ee1..ba1dc11c6 100644
+--- a/src/documents/filters.py
++++ b/src/documents/filters.py
+@@ -26,8 +26,10 @@ from django.db.models.functions import Cast
+ from django.utils.translation import gettext_lazy as _
+ from django_filters import DateFilter
+ from django_filters.rest_framework import BooleanFilter
++from django_filters.rest_framework import DateTimeFilter
+ from django_filters.rest_framework import Filter
+ from django_filters.rest_framework import FilterSet
++from django_filters.rest_framework import MultipleChoiceFilter
+ from drf_spectacular.utils import extend_schema_field
+ from guardian.utils import get_group_obj_perms_model
+ from guardian.utils import get_user_obj_perms_model
+@@ -862,18 +864,51 @@ class ShareLinkBundleFilterSet(FilterSet):
+ 
+ 
+ class PaperlessTaskFilterSet(FilterSet):
++    task_type = MultipleChoiceFilter(
++        choices=PaperlessTask.TaskType.choices,
++        label="Task Type",
++    )
++
++    trigger_source = MultipleChoiceFilter(
++        choices=PaperlessTask.TriggerSource.choices,
++        label="Trigger Source",
++    )
++
++    status = MultipleChoiceFilter(
++        choices=PaperlessTask.Status.choices,
++        label="Status",
++    )
++
++    is_complete = BooleanFilter(
++        method="filter_is_complete",
++        label="Is Complete",
++    )
++
+     acknowledged = BooleanFilter(
+         label="Acknowledged",
+         field_name="acknowledged",
+     )
+ 
++    date_created_after = DateTimeFilter(
++        field_name="date_created",
++        lookup_expr="gte",
++        label="Created After",
++    )
++
++    date_created_before = DateTimeFilter(
++        field_name="date_created",
++        lookup_expr="lte",
++        label="Created Before",
++    )
++
+     class Meta:
+         model = PaperlessTask
+-        fields = {
+-            "type": ["exact"],
+-            "task_name": ["exact"],
+-            "status": ["exact"],
+-        }
++        fields = ["task_type", "trigger_source", "status", "acknowledged", "owner"]
++
++    def filter_is_complete(self, queryset, name, value):
++        if value:
++            return queryset.filter(status__in=PaperlessTask.COMPLETE_STATUSES)
++        return queryset.exclude(status__in=PaperlessTask.COMPLETE_STATUSES)
+ 
+ 
+ class ObjectOwnedOrGrantedPermissionsFilter(ObjectPermissionsFilter):
+diff --git a/src/documents/management/commands/document_consumer.py b/src/documents/management/commands/document_consumer.py
+index 5ba8d30cd..acfbf6e3d 100644
+--- a/src/documents/management/commands/document_consumer.py
++++ b/src/documents/management/commands/document_consumer.py
+@@ -27,6 +27,7 @@ from watchfiles import watch
+ from documents.data_models import ConsumableDocument
+ from documents.data_models import DocumentMetadataOverrides
+ from documents.data_models import DocumentSource
++from documents.models import PaperlessTask
+ from documents.models import Tag
+ from documents.parsers import get_supported_file_extensions
+ from documents.tasks import consume_file
+@@ -338,12 +339,15 @@ def _consume_file(
+     # Queue for consumption
+     try:
+         logger.info(f"Adding {filepath} to the task queue")
+-        consume_file.delay(
+-            ConsumableDocument(
+-                source=DocumentSource.ConsumeFolder,
+-                original_file=filepath,
+-            ),
+-            DocumentMetadataOverrides(tag_ids=tag_ids),
++        consume_file.apply_async(
++            kwargs={
++                "input_doc": ConsumableDocument(
++                    source=DocumentSource.ConsumeFolder,
++                    original_file=filepath,
++                ),
++                "overrides": DocumentMetadataOverrides(tag_ids=tag_ids),
++            },
++            headers={"trigger_source": PaperlessTask.TriggerSource.FOLDER_CONSUME},
+         )
+     except Exception:
+         logger.exception(f"Error while queuing document {filepath}")
+diff --git a/src/documents/management/commands/document_create_classifier.py b/src/documents/management/commands/document_create_classifier.py
+index b662195a7..3fa7bdb29 100644
+--- a/src/documents/management/commands/document_create_classifier.py
++++ b/src/documents/management/commands/document_create_classifier.py
+@@ -22,7 +22,6 @@ class Command(PaperlessCommand):
+             self.buffered_logging("paperless.classifier"),
+         ):
+             train_classifier(
+-                scheduled=False,
+                 status_callback=lambda msg: self.console.print(f"  {msg}"),
+             )
+ 
+diff --git a/src/documents/management/commands/document_llmindex.py b/src/documents/management/commands/document_llmindex.py
+index 3b9e3440b..9823b1b87 100644
+--- a/src/documents/management/commands/document_llmindex.py
++++ b/src/documents/management/commands/document_llmindex.py
+@@ -17,7 +17,6 @@ class Command(PaperlessCommand):
+     def handle(self, *args: Any, **options: Any) -> None:
+         llmindex_index(
+             rebuild=options["command"] == "rebuild",
+-            scheduled=False,
+             iter_wrapper=lambda docs: self.track(
+                 docs,
+                 description="Indexing documents...",
+diff --git a/src/documents/management/commands/document_sanity_checker.py b/src/documents/management/commands/document_sanity_checker.py
+index 598ddf7bb..c8921d064 100644
+--- a/src/documents/management/commands/document_sanity_checker.py
++++ b/src/documents/management/commands/document_sanity_checker.py
+@@ -111,7 +111,6 @@ class Command(PaperlessCommand):
+ 
+     def handle(self, *args: Any, **options: Any) -> None:
+         messages = check_sanity(
+-            scheduled=False,
+             iter_wrapper=lambda docs: self.track(
+                 docs,
+                 description="Checking documents...",
+diff --git a/src/documents/migrations/0019_task_system_redesign.py b/src/documents/migrations/0019_task_system_redesign.py
+new file mode 100644
+index 000000000..7b7a77cf4
+--- /dev/null
++++ b/src/documents/migrations/0019_task_system_redesign.py
+@@ -0,0 +1,209 @@
++"""
++Drop and recreate the PaperlessTask table with the new structured schema.
++
++We intentionally drop all existing task data -- the old schema was
++string-based and incompatible with the new JSONField result storage.
++"""
++
++import django.db.models.deletion
++import django.utils.timezone
++from django.conf import settings
++from django.db import migrations
++from django.db import models
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("documents", "0018_saved_view_simple_search_rules"),
++        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
++    ]
++
++    operations = [
++        migrations.DeleteModel(name="PaperlessTask"),
++        migrations.CreateModel(
++            name="PaperlessTask",
++            fields=[
++                (
++                    "id",
++                    models.AutoField(
++                        auto_created=True,
++                        primary_key=True,
++                        serialize=False,
++                        verbose_name="ID",
++                    ),
++                ),
++                (
++                    "owner",
++                    models.ForeignKey(
++                        blank=True,
++                        default=None,
++                        null=True,
++                        on_delete=django.db.models.deletion.SET_NULL,
++                        to=settings.AUTH_USER_MODEL,
++                        verbose_name="owner",
++                    ),
++                ),
++                (
++                    "task_id",
++                    models.CharField(
++                        help_text="Celery task ID",
++                        max_length=72,
++                        unique=True,
++                        verbose_name="Task ID",
++                    ),
++                ),
++                (
++                    "task_type",
++                    models.CharField(
++                        choices=[
++                            ("consume_file", "Consume File"),
++                            ("train_classifier", "Train Classifier"),
++                            ("sanity_check", "Sanity Check"),
++                            ("index_optimize", "Index Optimize"),
++                            ("mail_fetch", "Mail Fetch"),
++                            ("llm_index", "LLM Index"),
++                            ("empty_trash", "Empty Trash"),
++                            ("check_workflows", "Check Workflows"),
++                            ("bulk_update", "Bulk Update"),
++                            ("reprocess_document", "Reprocess Document"),
++                            ("build_share_link", "Build Share Link"),
++                            ("bulk_delete", "Bulk Delete"),
++                        ],
++                        db_index=True,
++                        help_text="The kind of work being performed",
++                        max_length=50,
++                        verbose_name="Task Type",
++                    ),
++                ),
++                (
++                    "trigger_source",
++                    models.CharField(
++                        choices=[
++                            ("scheduled", "Scheduled"),
++                            ("web_ui", "Web UI"),
++                            ("api_upload", "API Upload"),
++                            ("folder_consume", "Folder Consume"),
++                            ("email_consume", "Email Consume"),
++                            ("system", "System"),
++                            ("manual", "Manual"),
++                        ],
++                        db_index=True,
++                        help_text="What initiated this task",
++                        max_length=50,
++                        verbose_name="Trigger Source",
++                    ),
++                ),
++                (
++                    "status",
++                    models.CharField(
++                        choices=[
++                            ("pending", "Pending"),
++                            ("started", "Started"),
++                            ("success", "Success"),
++                            ("failure", "Failure"),
++                            ("revoked", "Revoked"),
++                        ],
++                        db_index=True,
++                        default="pending",
++                        max_length=30,
++                        verbose_name="Status",
++                    ),
++                ),
++                (
++                    "date_created",
++                    models.DateTimeField(
++                        db_index=True,
++                        default=django.utils.timezone.now,
++                        verbose_name="Created",
++                    ),
++                ),
++                (
++                    "date_started",
++                    models.DateTimeField(
++                        blank=True,
++                        null=True,
++                        verbose_name="Started",
++                    ),
++                ),
++                (
++                    "date_done",
++                    models.DateTimeField(
++                        blank=True,
++                        db_index=True,
++                        null=True,
++                        verbose_name="Completed",
++                    ),
++                ),
++                (
++                    "duration_seconds",
++                    models.FloatField(
++                        blank=True,
++                        help_text="Elapsed time from start to completion",
++                        null=True,
++                        verbose_name="Duration (seconds)",
++                    ),
++                ),
++                (
++                    "wait_time_seconds",
++                    models.FloatField(
++                        blank=True,
++                        help_text="Time from task creation to worker pickup",
++                        null=True,
++                        verbose_name="Wait Time (seconds)",
++                    ),
++                ),
++                (
++                    "input_data",
++                    models.JSONField(
++                        blank=True,
++                        default=dict,
++                        help_text="Structured input parameters for the task",
++                        verbose_name="Input Data",
++                    ),
++                ),
++                (
++                    "result_data",
++                    models.JSONField(
++                        blank=True,
++                        help_text="Structured result data from task execution",
++                        null=True,
++                        verbose_name="Result Data",
++                    ),
++                ),
++                (
++                    "acknowledged",
++                    models.BooleanField(
++                        db_index=True,
++                        default=False,
++                        verbose_name="Acknowledged",
++                    ),
++                ),
++            ],
++            options={
++                "verbose_name": "Task",
++                "verbose_name_plural": "Tasks",
++                "ordering": ["-date_created"],
++            },
++        ),
++        migrations.AddIndex(
++            model_name="paperlesstask",
++            index=models.Index(
++                fields=["status", "date_created"],
++                name="documents_p_status_8aa687_idx",
++            ),
++        ),
++        migrations.AddIndex(
++            model_name="paperlesstask",
++            index=models.Index(
++                fields=["task_type", "status"],
++                name="documents_p_task_ty_e4a93f_idx",
++            ),
++        ),
++        migrations.AddIndex(
++            model_name="paperlesstask",
++            index=models.Index(
++                fields=["owner", "acknowledged", "date_created"],
++                name="documents_p_owner_i_62c545_idx",
++            ),
++        ),
++    ]
+diff --git a/src/documents/migrations/0020_drop_celery_results.py b/src/documents/migrations/0020_drop_celery_results.py
+new file mode 100644
+index 000000000..7d256db33
+--- /dev/null
++++ b/src/documents/migrations/0020_drop_celery_results.py
+@@ -0,0 +1,26 @@
++from django.db import migrations
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("documents", "0019_task_system_redesign"),
++    ]
++
++    operations = [
++        migrations.RunSQL(
++            sql="DROP TABLE IF EXISTS django_celery_results_taskresult;",
++            reverse_sql=migrations.RunSQL.noop,
++        ),
++        migrations.RunSQL(
++            sql="DROP TABLE IF EXISTS django_celery_results_groupresult;",
++            reverse_sql=migrations.RunSQL.noop,
++        ),
++        migrations.RunSQL(
++            sql="DROP TABLE IF EXISTS django_celery_results_chordcounter;",
++            reverse_sql=migrations.RunSQL.noop,
++        ),
++        migrations.RunSQL(
++            sql="DELETE FROM django_migrations WHERE app = 'django_celery_results';",
++            reverse_sql=migrations.RunSQL.noop,
++        ),
++    ]
+diff --git a/src/documents/models.py b/src/documents/models.py
+index e2f5bb3dc..98202de0f 100644
+--- a/src/documents/models.py
++++ b/src/documents/models.py
+@@ -3,7 +3,6 @@ from pathlib import Path
+ from typing import Final
+ 
+ import pathvalidate
+-from celery import states
+ from django.conf import settings
+ from django.contrib.auth.models import Group
+ from django.contrib.auth.models import User
+@@ -663,97 +662,167 @@ class UiSettings(models.Model):
+ 
+ 
+ class PaperlessTask(ModelWithOwner):
+-    ALL_STATES = sorted(states.ALL_STATES)
+-    TASK_STATE_CHOICES = sorted(zip(ALL_STATES, ALL_STATES))
++    """
++    Tracks background task execution for user visibility and debugging.
+ 
+-    class TaskType(models.TextChoices):
+-        AUTO = ("auto_task", _("Auto Task"))
+-        SCHEDULED_TASK = ("scheduled_task", _("Scheduled Task"))
+-        MANUAL_TASK = ("manual_task", _("Manual Task"))
++    State transitions:
++        PENDING -> STARTED -> SUCCESS
++        PENDING -> STARTED -> FAILURE
++        PENDING -> REVOKED (if cancelled before starting)
++    """
+ 
+-    class TaskName(models.TextChoices):
+-        CONSUME_FILE = ("consume_file", _("Consume File"))
+-        TRAIN_CLASSIFIER = ("train_classifier", _("Train Classifier"))
+-        CHECK_SANITY = ("check_sanity", _("Check Sanity"))
+-        INDEX_OPTIMIZE = ("index_optimize", _("Index Optimize"))
+-        LLMINDEX_UPDATE = ("llmindex_update", _("LLM Index Update"))
++    class Status(models.TextChoices):
++        PENDING = "pending", _("Pending")
++        STARTED = "started", _("Started")
++        SUCCESS = "success", _("Success")
++        FAILURE = "failure", _("Failure")
++        REVOKED = "revoked", _("Revoked")
+ 
++    class TaskType(models.TextChoices):
++        CONSUME_FILE = "consume_file", _("Consume File")
++        TRAIN_CLASSIFIER = "train_classifier", _("Train Classifier")
++        SANITY_CHECK = "sanity_check", _("Sanity Check")
++        INDEX_OPTIMIZE = "index_optimize", _("Index Optimize")
++        MAIL_FETCH = "mail_fetch", _("Mail Fetch")
++        LLM_INDEX = "llm_index", _("LLM Index")
++        EMPTY_TRASH = "empty_trash", _("Empty Trash")
++        CHECK_WORKFLOWS = "check_workflows", _("Check Workflows")
++        BULK_UPDATE = "bulk_update", _("Bulk Update")
++        REPROCESS_DOCUMENT = "reprocess_document", _("Reprocess Document")
++        BUILD_SHARE_LINK = "build_share_link", _("Build Share Link")
++        BULK_DELETE = "bulk_delete", _("Bulk Delete")
++
++    COMPLETE_STATUSES = (
++        Status.SUCCESS,
++        Status.FAILURE,
++        Status.REVOKED,
++    )
++
++    class TriggerSource(models.TextChoices):
++        SCHEDULED = "scheduled", _("Scheduled")  # Celery beat
++        WEB_UI = "web_ui", _("Web UI")  # Document uploaded via web
++        API_UPLOAD = "api_upload", _("API Upload")  # Document uploaded via API
++        FOLDER_CONSUME = "folder_consume", _("Folder Consume")  # Consume folder
++        EMAIL_CONSUME = "email_consume", _("Email Consume")  # Email attachment
++        SYSTEM = "system", _("System")  # Auto-triggered (self-heal, config side-effect)
++        MANUAL = "manual", _("Manual")  # User explicitly ran via /api/tasks/run/
++
++    # Identification
+     task_id = models.CharField(
+-        max_length=255,
++        max_length=72,
+         unique=True,
+         verbose_name=_("Task ID"),
+-        help_text=_("Celery ID for the Task that was run"),
++        help_text=_("Celery task ID"),
+     )
+ 
+-    acknowledged = models.BooleanField(
+-        default=False,
+-        verbose_name=_("Acknowledged"),
+-        help_text=_("If the task is acknowledged via the frontend or API"),
+-    )
+-
+-    task_file_name = models.CharField(
+-        null=True,
+-        max_length=255,
+-        verbose_name=_("Task Filename"),
+-        help_text=_("Name of the file which the Task was run for"),
++    task_type = models.CharField(
++        max_length=50,
++        choices=TaskType.choices,
++        verbose_name=_("Task Type"),
++        help_text=_("The kind of work being performed"),
++        db_index=True,
+     )
+ 
+-    task_name = models.CharField(
+-        null=True,
+-        max_length=255,
+-        choices=TaskName.choices,
+-        verbose_name=_("Task Name"),
+-        help_text=_("Name of the task that was run"),
++    trigger_source = models.CharField(
++        max_length=50,
++        choices=TriggerSource.choices,
++        verbose_name=_("Trigger Source"),
++        help_text=_("What initiated this task"),
++        db_index=True,
+     )
+ 
++    # State tracking
+     status = models.CharField(
+         max_length=30,
+-        default=states.PENDING,
+-        choices=TASK_STATE_CHOICES,
+-        verbose_name=_("Task State"),
+-        help_text=_("Current state of the task being run"),
++        choices=Status.choices,
++        default=Status.PENDING,
++        verbose_name=_("Status"),
++        db_index=True,
+     )
+ 
++    # Timestamps
+     date_created = models.DateTimeField(
+-        null=True,
+         default=timezone.now,
+-        verbose_name=_("Created DateTime"),
+-        help_text=_("Datetime field when the task result was created in UTC"),
++        verbose_name=_("Created"),
++        db_index=True,
+     )
+ 
+     date_started = models.DateTimeField(
+         null=True,
+-        default=None,
+-        verbose_name=_("Started DateTime"),
+-        help_text=_("Datetime field when the task was started in UTC"),
++        blank=True,
++        verbose_name=_("Started"),
+     )
+ 
+     date_done = models.DateTimeField(
+         null=True,
+-        default=None,
+-        verbose_name=_("Completed DateTime"),
+-        help_text=_("Datetime field when the task was completed in UTC"),
++        blank=True,
++        verbose_name=_("Completed"),
++        db_index=True,
+     )
+ 
+-    result = models.TextField(
++    # Duration fields -- populated by task_postrun signal handler
++    duration_seconds = models.FloatField(
+         null=True,
+-        default=None,
++        blank=True,
++        verbose_name=_("Duration (seconds)"),
++        help_text=_("Elapsed time from start to completion"),
++    )
++
++    wait_time_seconds = models.FloatField(
++        null=True,
++        blank=True,
++        verbose_name=_("Wait Time (seconds)"),
++        help_text=_("Time from task creation to worker pickup"),
++    )
++
++    # Input/Output data
++    input_data = models.JSONField(
++        default=dict,
++        blank=True,
++        verbose_name=_("Input Data"),
++        help_text=_("Structured input parameters for the task"),
++    )
++
++    result_data = models.JSONField(
++        null=True,
++        blank=True,
+         verbose_name=_("Result Data"),
+-        help_text=_(
+-            "The data returned by the task",
+-        ),
++        help_text=_("Structured result data from task execution"),
+     )
+ 
+-    type = models.CharField(
+-        max_length=30,
+-        choices=TaskType.choices,
+-        default=TaskType.AUTO,
+-        verbose_name=_("Task Type"),
+-        help_text=_("The type of task that was run"),
++    # Acknowledgment
++    acknowledged = models.BooleanField(
++        default=False,
++        verbose_name=_("Acknowledged"),
++        db_index=True,
+     )
+ 
+-    def __str__(self) -> str:
+-        return f"Task {self.task_id}"
++    class Meta:
++        verbose_name = _("Task")
++        verbose_name_plural = _("Tasks")
++        ordering = ["-date_created"]
++        indexes = [
++            models.Index(fields=["status", "date_created"]),
++            models.Index(fields=["task_type", "status"]),
++            models.Index(fields=["owner", "acknowledged", "date_created"]),
++        ]
++
++    def __str__(self) -> str:  # pragma: no cover
++        return f"{self.get_task_type_display()} [{self.task_id[:8]}]"
++
++    @property
++    def is_complete(self) -> bool:  # pragma: no cover
++        return self.status in self.COMPLETE_STATUSES
++
++    @property
++    def related_document_ids(self) -> list[int]:  # pragma: no cover
++        if not self.result_data:
++            return []
++        if doc_id := self.result_data.get("document_id"):
++            return [doc_id]
++        if dup_id := self.result_data.get("duplicate_of"):
++            return [dup_id]
++        return []
+ 
+ 
+ class Note(SoftDeleteModel):
+diff --git a/src/documents/permissions.py b/src/documents/permissions.py
+index 648b0ded1..99e1425de 100644
+--- a/src/documents/permissions.py
++++ b/src/documents/permissions.py
+@@ -72,7 +72,7 @@ def has_system_status_permission(user: User | None) -> bool:
+     return (
+         getattr(user, "is_superuser", False)
+         or getattr(user, "is_staff", False)
+-        or user.has_perm("paperless.view_system_status")
++        or user.has_perm("paperless.view_system_monitoring")
+     )
+ 
+ 
+diff --git a/src/documents/sanity_checker.py b/src/documents/sanity_checker.py
+index a6d00cd3a..b824e6683 100644
+--- a/src/documents/sanity_checker.py
++++ b/src/documents/sanity_checker.py
+@@ -10,7 +10,6 @@ is an identity function that adds no overhead.
+ """
+ 
+ import logging
+-import uuid
+ from collections import defaultdict
+ from collections.abc import Iterator
+ from pathlib import Path
+@@ -18,12 +17,9 @@ from typing import TYPE_CHECKING
+ from typing import Final
+ from typing import TypedDict
+ 
+-from celery import states
+ from django.conf import settings
+-from django.utils import timezone
+ 
+ from documents.models import Document
+-from documents.models import PaperlessTask
+ from documents.utils import IterWrapper
+ from documents.utils import compute_checksum
+ from documents.utils import identity
+@@ -287,33 +283,17 @@ def _check_document(
+ 
+ def check_sanity(
+     *,
+-    scheduled: bool = True,
+     iter_wrapper: IterWrapper[Document] = identity,
+ ) -> SanityCheckMessages:
+     """Run a full sanity check on the document archive.
+ 
+     Args:
+-        scheduled: Whether this is a scheduled (automatic) or manual check.
+-            Controls the task type recorded in the database.
+         iter_wrapper: A callable that wraps the document iterable, e.g.,
+             for progress bar display. Defaults to identity (no wrapping).
+ 
+     Returns:
+         A SanityCheckMessages instance containing all detected issues.
+     """
+-    paperless_task = PaperlessTask.objects.create(
+-        task_id=uuid.uuid4(),
+-        type=(
+-            PaperlessTask.TaskType.SCHEDULED_TASK
+-            if scheduled
+-            else PaperlessTask.TaskType.MANUAL_TASK
+-        ),
+-        task_name=PaperlessTask.TaskName.CHECK_SANITY,
+-        status=states.STARTED,
+-        date_created=timezone.now(),
+-        date_started=timezone.now(),
+-    )
+-
+     messages = SanityCheckMessages()
+     present_files = _build_present_files()
+ 
+@@ -332,22 +312,4 @@ def check_sanity(
+     for extra_file in present_files:
+         messages.warning(None, f"Orphaned file in media dir: {extra_file}")
+ 
+-    paperless_task.status = states.SUCCESS if not messages.has_error else states.FAILURE
+-    if messages.total_issue_count == 0:
+-        paperless_task.result = "No issues found."
+-    else:
+-        parts: list[str] = []
+-        if messages.document_error_count:
+-            parts.append(f"{messages.document_error_count} document(s) with errors")
+-        if messages.document_warning_count:
+-            parts.append(f"{messages.document_warning_count} document(s) with warnings")
+-        if messages.global_warning_count:
+-            parts.append(f"{messages.global_warning_count} global warning(s)")
+-        paperless_task.result = ", ".join(parts) + " found."
+-        if messages.has_error:
+-            paperless_task.result += " Check logs for details."
+-
+-    paperless_task.date_done = timezone.now()
+-    paperless_task.save(update_fields=["status", "result", "date_done"])
+-
+     return messages
+diff --git a/src/documents/serialisers.py b/src/documents/serialisers.py
+index 1efbf6b7b..3cba0fafa 100644
+--- a/src/documents/serialisers.py
++++ b/src/documents/serialisers.py
+@@ -12,7 +12,6 @@ from typing import Literal
+ from typing import TypedDict
+ 
+ import magic
+-from celery import states
+ from django.conf import settings
+ from django.contrib.auth.models import Group
+ from django.contrib.auth.models import User
+@@ -40,6 +39,7 @@ from drf_spectacular.utils import extend_schema_field
+ from drf_spectacular.utils import extend_schema_serializer
+ from drf_writable_nested.serializers import NestedUpdateMixin
+ from guardian.core import ObjectPermissionChecker
++from guardian.shortcuts import get_objects_for_user
+ from guardian.shortcuts import get_users_with_perms
+ from guardian.utils import get_group_obj_perms_model
+ from guardian.utils import get_user_obj_perms_model
+@@ -1604,6 +1604,7 @@ class RotateDocumentsSerializer(DocumentSelectionSerializer, SourceModeValidatio
+         required=False,
+         default=bulk_edit.SourceModeChoices.LATEST_VERSION,
+     )
++    from_webui = serializers.BooleanField(required=False, default=False)
+ 
+ 
+ class MergeDocumentsSerializer(DocumentListSerializer, SourceModeValidationMixin):
+@@ -1617,6 +1618,7 @@ class MergeDocumentsSerializer(DocumentListSerializer, SourceModeValidationMixin
+         required=False,
+         default=bulk_edit.SourceModeChoices.LATEST_VERSION,
+     )
++    from_webui = serializers.BooleanField(required=False, default=False)
+ 
+ 
+ class EditPdfDocumentsSerializer(DocumentListSerializer, SourceModeValidationMixin):
+@@ -1628,6 +1630,7 @@ class EditPdfDocumentsSerializer(DocumentListSerializer, SourceModeValidationMix
+         required=False,
+         default=bulk_edit.SourceModeChoices.LATEST_VERSION,
+     )
++    from_webui = serializers.BooleanField(required=False, default=False)
+ 
+     def validate(self, attrs):
+         documents = attrs["documents"]
+@@ -1679,6 +1682,7 @@ class RemovePasswordDocumentsSerializer(
+         required=False,
+         default=bulk_edit.SourceModeChoices.LATEST_VERSION,
+     )
++    from_webui = serializers.BooleanField(required=False, default=False)
+ 
+ 
+ class DeleteDocumentsSerializer(DocumentSelectionSerializer):
+@@ -1726,6 +1730,7 @@ class BulkEditSerializer(
+     )
+ 
+     parameters = serializers.DictField(allow_empty=True, default={}, write_only=True)
++    from_webui = serializers.BooleanField(required=False, default=False)
+ 
+     def _validate_tag_id_list(self, tags, name="tags") -> None:
+         if not isinstance(tags, list):
+@@ -2398,7 +2403,10 @@ class StoragePathSerializer(MatchingModelSerializer, OwnedObjectSerializer):
+         """
+         doc_ids = [doc.id for doc in instance.documents.all()]
+         if doc_ids:
+-            bulk_edit.bulk_update_documents.delay(doc_ids)
++            bulk_edit.bulk_update_documents.apply_async(
++                kwargs={"document_ids": doc_ids},
++                headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
++            )
+ 
+         return super().update(instance, validated_data)
+ 
+@@ -2431,67 +2439,193 @@ class UiSettingsViewSerializer(serializers.ModelSerializer[UiSettings]):
+         return ui_settings
+ 
+ 
+-class TasksViewSerializer(OwnedObjectSerializer):
++class TaskSerializerV10(OwnedObjectSerializer):
++    """Task serializer for API v10+ using new field names."""
++
++    related_document_ids = serializers.ListField(
++        child=serializers.IntegerField(),
++        read_only=True,
++    )
++    task_type_display = serializers.CharField(
++        source="get_task_type_display",
++        read_only=True,
++    )
++    trigger_source_display = serializers.CharField(
++        source="get_trigger_source_display",
++        read_only=True,
++    )
++    status_display = serializers.CharField(
++        source="get_status_display",
++        read_only=True,
++    )
++
+     class Meta:
+         model = PaperlessTask
+         fields = (
+             "id",
+             "task_id",
+-            "task_name",
+-            "task_file_name",
++            "task_type",
++            "task_type_display",
++            "trigger_source",
++            "trigger_source_display",
++            "status",
++            "status_display",
+             "date_created",
++            "date_started",
+             "date_done",
++            "duration_seconds",
++            "wait_time_seconds",
++            "input_data",
++            "result_data",
++            "related_document_ids",
++            "acknowledged",
++            "owner",
++        )
++        read_only_fields = fields
++
++
++class TaskSerializerV9(serializers.ModelSerializer):
++    """Task serializer for API v9 backwards compatibility.
++
++    Maps old field names to the new model fields so existing clients continue
++    to work unchanged.
++    """
++
++    # v9 field: task_name -> task_type (with value remapping for renamed tasks)
++    task_name = serializers.SerializerMethodField()
++
++    # v9 field: task_file_name -> input_data.filename
++    task_file_name = serializers.SerializerMethodField()
++
++    # v9 field: type -> trigger_source (mapped to old enum labels)
++    type = serializers.SerializerMethodField()
++
++    # v9 field: status -> uppercase Celery state strings
++    status = serializers.SerializerMethodField()
++
++    # v9 field: result -> derived from result_data
++    result = serializers.SerializerMethodField()
++
++    # v9 field: related_document -> first document ID from result_data
++    related_document = serializers.SerializerMethodField()
++
++    # v9 field: duplicate_documents -> list of duplicate IDs from result_data
++    duplicate_documents = serializers.SerializerMethodField()
++
++    class Meta:
++        model = PaperlessTask
++        fields = (
++            "id",
++            "task_id",
++            "task_name",
++            "task_file_name",
+             "type",
+             "status",
++            "date_created",
++            "date_done",
+             "result",
+             "acknowledged",
+             "related_document",
+             "duplicate_documents",
+             "owner",
+         )
++        read_only_fields = fields
+ 
+-    related_document = serializers.SerializerMethodField()
+-    duplicate_documents = serializers.SerializerMethodField()
+-    created_doc_re = re.compile(r"New document id (\d+) created")
+-    duplicate_doc_re = re.compile(r"It is a duplicate of .* \(#(\d+)\)")
+-
+-    def get_related_document(self, obj) -> str | None:
+-        result = None
+-        re = None
+-        if obj.result:
+-            match obj.status:
+-                case states.SUCCESS:
+-                    re = self.created_doc_re
+-                case states.FAILURE:
+-                    re = (
+-                        self.duplicate_doc_re
+-                        if "existing document is in the trash" not in obj.result
+-                        else None
+-                    )
+-            if re is not None:
+-                try:
+-                    result = re.search(obj.result).group(1)
+-                except Exception:
+-                    pass
++    _TASK_TYPE_TO_V9_NAME = {
++        PaperlessTask.TaskType.SANITY_CHECK: "check_sanity",
++        PaperlessTask.TaskType.LLM_INDEX: "llmindex_update",
++    }
+ 
+-        return result
++    def get_result(self, obj: PaperlessTask) -> str | None:
++        """Reconstruct a human-readable result string from result_data for v9 clients."""
++        if not obj.result_data:
++            return None
++        if doc_id := obj.result_data.get("document_id"):
++            return f"Success. New document id {doc_id} created"
++        if reason := obj.result_data.get("reason"):
++            return reason
++        if dup_id := obj.result_data.get("duplicate_of"):
++            return f"Not consuming: It is a duplicate of document #{dup_id}"
++        if error := obj.result_data.get("error_message"):
++            return error
++        return None
++
++    def get_task_name(self, obj: PaperlessTask) -> str:
++        return self._TASK_TYPE_TO_V9_NAME.get(obj.task_type, obj.task_type)
++
++    def get_task_file_name(self, obj: PaperlessTask) -> str | None:
++        if not obj.input_data:
++            return None
++        return obj.input_data.get("filename")
++
++    _STATUS_TO_V9 = {
++        PaperlessTask.Status.PENDING: "PENDING",
++        PaperlessTask.Status.STARTED: "STARTED",
++        PaperlessTask.Status.SUCCESS: "SUCCESS",
++        PaperlessTask.Status.FAILURE: "FAILURE",
++        PaperlessTask.Status.REVOKED: "REVOKED",
++    }
+ 
+-    @extend_schema_field(DuplicateDocumentSummarySerializer(many=True))
+-    def get_duplicate_documents(self, obj):
+-        related_document = self.get_related_document(obj)
+-        request = self.context.get("request")
+-        user = request.user if request else None
+-        document = Document.global_objects.filter(pk=related_document).first()
+-        if not related_document or not user or not document:
+-            return []
+-        duplicates = _get_viewable_duplicates(document, user)
+-        return list(duplicates.values("id", "title", "deleted_at"))
++    def get_status(self, obj: PaperlessTask) -> str:
++        return self._STATUS_TO_V9.get(obj.status, obj.status.upper())
++
++    _TRIGGER_SOURCE_TO_V9_TYPE = {
++        PaperlessTask.TriggerSource.SCHEDULED: "scheduled_task",
++        PaperlessTask.TriggerSource.SYSTEM: "auto_task",
++        # Email and folder-consumer documents are system-initiated, not manually triggered
++        PaperlessTask.TriggerSource.EMAIL_CONSUME: "auto_task",
++        PaperlessTask.TriggerSource.FOLDER_CONSUME: "auto_task",
++    }
++
++    def get_type(self, obj: PaperlessTask) -> str:
++        return self._TRIGGER_SOURCE_TO_V9_TYPE.get(obj.trigger_source, "manual_task")
+ 
++    def get_related_document(self, obj: PaperlessTask) -> int | None:
++        ids = obj.related_document_ids
++        return ids[0] if ids else None
+ 
+-class RunTaskViewSerializer(serializers.Serializer[dict[str, Any]]):
+-    task_name = serializers.ChoiceField(
+-        choices=PaperlessTask.TaskName.choices,
+-        label="Task Name",
++    def get_duplicate_documents(
++        self,
++        obj: PaperlessTask,
++    ) -> list[dict[str, Any]]:
++        if not obj.result_data:
++            return []
++        dup_of = obj.result_data.get("duplicate_of")
++        if dup_of is None:
++            return []
++        request = self.context.get("request")
++        if request is None:
++            return []
++        user = request.user
++        qs = Document.global_objects.filter(pk=dup_of)
++        if not user.is_staff:
++            with_perms = get_objects_for_user(
++                user,
++                "documents.view_document",
++                qs,
++                accept_global_perms=False,
++            )
++            qs = with_perms | qs.filter(owner=user) | qs.filter(owner__isnull=True)
++        return list(qs.values("id", "title", "deleted_at"))
++
++
++class TaskSummarySerializer(serializers.Serializer):
++    task_type = serializers.CharField()
++    total_count = serializers.IntegerField()
++    pending_count = serializers.IntegerField()
++    success_count = serializers.IntegerField()
++    failure_count = serializers.IntegerField()
++    avg_duration_seconds = serializers.FloatField(allow_null=True)
++    avg_wait_time_seconds = serializers.FloatField(allow_null=True)
++    last_run = serializers.DateTimeField(allow_null=True)
++    last_success = serializers.DateTimeField(allow_null=True)
++    last_failure = serializers.DateTimeField(allow_null=True)
++
++
++class RunTaskSerializer(serializers.Serializer):
++    task_type = serializers.ChoiceField(
++        choices=PaperlessTask.TaskType.choices,
++        label="Task Type",
+         write_only=True,
+     )
+ 
+diff --git a/src/documents/signals/handlers.py b/src/documents/signals/handlers.py
+index dd49a718c..5b481b4ef 100644
+--- a/src/documents/signals/handlers.py
++++ b/src/documents/signals/handlers.py
+@@ -1,18 +1,20 @@
+ from __future__ import annotations
+ 
++import datetime
+ import hashlib
+ import logging
+ import shutil
++import traceback as _tb
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ from typing import Any
+ 
+ from celery import shared_task
+-from celery import states
+ from celery.signals import before_task_publish
+ from celery.signals import task_failure
+ from celery.signals import task_postrun
+ from celery.signals import task_prerun
++from celery.signals import task_revoked
+ from celery.signals import worker_process_init
+ from django.conf import settings
+ from django.contrib.auth.models import Group
+@@ -705,7 +707,7 @@ def check_paths_and_prune_custom_fields(
+         and instance.fields.count() > 0
+         and instance.extra_data
+     ):  # Only select fields, for now
+-        process_cf_select_update.delay(instance)
++        process_cf_select_update.apply_async(kwargs={"custom_field": instance})
+ 
+ 
+ @receiver(models.signals.post_delete, sender=CustomField)
+@@ -996,68 +998,168 @@ def run_workflows(
+         return overrides, "\n".join(messages)
+ 
+ 
++# ---------------------------------------------------------------------------
++# Task tracking -- Celery signal handlers
++# ---------------------------------------------------------------------------
++
++TRACKED_TASKS: dict[str, PaperlessTask.TaskType] = {
++    "documents.tasks.consume_file": PaperlessTask.TaskType.CONSUME_FILE,
++    "documents.tasks.train_classifier": PaperlessTask.TaskType.TRAIN_CLASSIFIER,
++    "documents.tasks.sanity_check": PaperlessTask.TaskType.SANITY_CHECK,
++    "documents.tasks.llmindex_index": PaperlessTask.TaskType.LLM_INDEX,
++    "documents.tasks.empty_trash": PaperlessTask.TaskType.EMPTY_TRASH,
++    "documents.tasks.check_scheduled_workflows": PaperlessTask.TaskType.CHECK_WORKFLOWS,
++    "paperless_mail.tasks.process_mail_accounts": PaperlessTask.TaskType.MAIL_FETCH,
++    "documents.tasks.bulk_update_documents": PaperlessTask.TaskType.BULK_UPDATE,
++    "documents.tasks.update_document_content_maybe_archive_file": PaperlessTask.TaskType.REPROCESS_DOCUMENT,
++    "documents.tasks.build_share_link_bundle": PaperlessTask.TaskType.BUILD_SHARE_LINK,
++    "documents.bulk_edit.delete": PaperlessTask.TaskType.BULK_DELETE,
++}
++
++_CELERY_STATE_TO_STATUS: dict[str, PaperlessTask.Status] = {
++    "SUCCESS": PaperlessTask.Status.SUCCESS,
++    "FAILURE": PaperlessTask.Status.FAILURE,
++    "REVOKED": PaperlessTask.Status.REVOKED,
++}
++
++
++def _extract_input_data(
++    task_type: PaperlessTask.TaskType,
++    task_kwargs: dict,
++) -> dict:
++    """Build the input_data dict stored on the PaperlessTask record.
++
++    For consume_file tasks this includes the filename, MIME type, and any
++    non-null overrides from the DocumentMetadataOverrides object.  For
++    mail_fetch tasks it captures the account_ids list.  All other task
++    types store no input data and return {}.
++    """
++    if task_type == PaperlessTask.TaskType.CONSUME_FILE:
++        input_doc = task_kwargs.get("input_doc")
++        overrides = task_kwargs.get("overrides")
++        if input_doc is None:
++            return {}
++        data: dict = {
++            "filename": input_doc.original_file.name,
++            "mime_type": input_doc.mime_type,
++        }
++        if input_doc.original_path:  # pragma: no cover
++            data["source_path"] = str(input_doc.original_path)
++        if input_doc.mailrule_id:  # pragma: no cover
++            data["mailrule_id"] = input_doc.mailrule_id
++        if overrides:
++            override_dict = {}
++            for k, v in vars(overrides).items():
++                if v is None or k.startswith("_"):
++                    continue
++                if isinstance(v, datetime.date):
++                    v = v.isoformat()
++                elif isinstance(v, Path):
++                    v = str(v)
++                override_dict[k] = v
++            if override_dict:
++                data["overrides"] = override_dict
++        return data
++
++    if task_type == PaperlessTask.TaskType.MAIL_FETCH:
++        account_ids = task_kwargs.get("account_ids")
++        if account_ids is not None:
++            return {"account_ids": account_ids}
++        return {}
++
++    return {}
++
++
++def _determine_trigger_source(
++    headers: dict,
++) -> PaperlessTask.TriggerSource:
++    """Resolve the TriggerSource for a task being published to the broker.
++
++    Reads the trigger_source header set by the caller; falls back to MANUAL
++    when the header is absent or contains an unrecognised value.
++    """
++    header_source = headers.get("trigger_source")
++    if header_source is not None:
++        try:
++            return PaperlessTask.TriggerSource(header_source)
++        except ValueError:
++            pass
++    return PaperlessTask.TriggerSource.MANUAL
++
++
++def _extract_owner_id(
++    task_type: PaperlessTask.TaskType,
++    task_kwargs: dict,
++) -> int | None:
++    """Return the owner_id from consume_file overrides, or None for all other task types."""
++    if task_type != PaperlessTask.TaskType.CONSUME_FILE:
++        return None
++    overrides = task_kwargs.get("overrides")
++    if overrides and hasattr(overrides, "owner_id"):
++        return overrides.owner_id
++    return None  # pragma: no cover
++
++
+ @before_task_publish.connect
+-def before_task_publish_handler(sender=None, headers=None, body=None, **kwargs) -> None:
++def before_task_publish_handler(
++    sender=None,
++    headers=None,
++    body=None,
++    **kwargs,
++) -> None:
+     """
+-    Creates the PaperlessTask object in a pending state.  This is sent before
+-    the task reaches the broker, but before it begins executing on a worker.
++    Creates the PaperlessTask record when the task is published to broker.
+ 
+     https://docs.celeryq.dev/en/stable/userguide/signals.html#before-task-publish
+-
+     https://docs.celeryq.dev/en/stable/internals/protocol.html#version-2
+-
+     """
+-    if "task" not in headers or headers["task"] != "documents.tasks.consume_file":
+-        # Assumption: this is only ever a v2 message
++    if headers is None or body is None:
++        return
++
++    task_name = headers.get("task", "")
++    task_type = TRACKED_TASKS.get(task_name)
++    if task_type is None:
+         return
+ 
+     try:
+         close_old_connections()
++        _, task_kwargs, _ = body
++        task_id = headers["id"]
+ 
+-        task_args = body[0]
+-        input_doc, overrides = task_args
+-
+-        task_file_name = input_doc.original_file.name
+-        user_id = overrides.owner_id if overrides else None
++        input_data = _extract_input_data(task_type, task_kwargs)
++        trigger_source = _determine_trigger_source(headers)
++        owner_id = _extract_owner_id(task_type, task_kwargs)
+ 
+         PaperlessTask.objects.create(
+-            type=PaperlessTask.TaskType.AUTO,
+-            task_id=headers["id"],
+-            status=states.PENDING,
+-            task_file_name=task_file_name,
+-            task_name=PaperlessTask.TaskName.CONSUME_FILE,
+-            result=None,
+-            date_created=timezone.now(),
+-            date_started=None,
+-            date_done=None,
+-            owner_id=user_id,
++            task_id=task_id,
++            task_type=task_type,
++            trigger_source=trigger_source,
++            status=PaperlessTask.Status.PENDING,
++            input_data=input_data,
++            owner_id=owner_id,
+         )
+     except Exception:  # pragma: no cover
+-        # Don't let an exception in the signal handlers prevent
+-        # a document from being consumed.
+         logger.exception("Creating PaperlessTask failed")
+ 
+ 
+ @task_prerun.connect
+ def task_prerun_handler(sender=None, task_id=None, task=None, **kwargs) -> None:
+     """
+-
+-    Updates the PaperlessTask to be started.  Sent before the task begins execution
+-    on a worker.
++    Marks the task STARTED when execution begins on a worker.
+ 
+     https://docs.celeryq.dev/en/stable/userguide/signals.html#task-prerun
+     """
++    if task_id is None:  # pragma: no cover
++        return
++    if task and task.name not in TRACKED_TASKS:
++        return
+     try:
+         close_old_connections()
+-        task_instance = PaperlessTask.objects.filter(task_id=task_id).first()
+-
+-        if task_instance is not None:
+-            task_instance.status = states.STARTED
+-            task_instance.date_started = timezone.now()
+-            task_instance.save()
++        PaperlessTask.objects.filter(task_id=task_id).update(
++            status=PaperlessTask.Status.STARTED,
++            date_started=timezone.now(),
++        )
+     except Exception:  # pragma: no cover
+-        # Don't let an exception in the signal handlers prevent
+-        # a document from being consumed.
+         logger.exception("Setting PaperlessTask started failed")
+ 
+ 
+@@ -1071,22 +1173,54 @@ def task_postrun_handler(
+     **kwargs,
+ ) -> None:
+     """
+-    Updates the result of the PaperlessTask.
++    Records task completion and result data for non-failure outcomes.
++
++    Skips FAILURE states entirely, since task_failure_handler fires first
++    and fully owns the failure path (status, date_done, duration, result_data).
+ 
+     https://docs.celeryq.dev/en/stable/userguide/signals.html#task-postrun
+     """
++    if task_id is None:  # pragma: no cover
++        return
++    if task and task.name not in TRACKED_TASKS:
++        return
+     try:
+         close_old_connections()
+-        task_instance = PaperlessTask.objects.filter(task_id=task_id).first()
+ 
+-        if task_instance is not None:
+-            task_instance.status = state or states.FAILURE
+-            task_instance.result = retval
+-            task_instance.date_done = timezone.now()
+-            task_instance.save()
++        new_status = _CELERY_STATE_TO_STATUS.get(state, PaperlessTask.Status.FAILURE)
++        if new_status == PaperlessTask.Status.FAILURE:
++            return
++
++        now = timezone.now()
++        try:
++            task_instance = PaperlessTask.objects.get(task_id=task_id)
++        except PaperlessTask.DoesNotExist:
++            return
++
++        task_instance.status = new_status
++        task_instance.date_done = now
++        changed_fields = ["status", "date_done"]
++
++        if task_instance.date_started:
++            task_instance.duration_seconds = (
++                now - task_instance.date_started
++            ).total_seconds()
++            changed_fields.append("duration_seconds")
++        if task_instance.date_started and task_instance.date_created:
++            task_instance.wait_time_seconds = (
++                task_instance.date_started - task_instance.date_created
++            ).total_seconds()
++            changed_fields.append("wait_time_seconds")
++
++        if isinstance(retval, dict):
++            task_instance.result_data = retval
++            changed_fields.append("result_data")
++            if "duplicate_of" in retval:
++                task_instance.status = PaperlessTask.Status.FAILURE
++                changed_fields.append("status")
++
++        task_instance.save(update_fields=changed_fields)
+     except Exception:  # pragma: no cover
+-        # Don't let an exception in the signal handlers prevent
+-        # a document from being consumed.
+         logger.exception("Updating PaperlessTask failed")
+ 
+ 
+@@ -1100,21 +1234,84 @@ def task_failure_handler(
+     **kwargs,
+ ) -> None:
+     """
+-    Updates the result of a failed PaperlessTask.
++    Records failure details when a task raises an exception.
++
++    Fully owns the FAILURE path. task_postrun_handler skips FAILURE
++    states so there is no overlap.
+ 
+     https://docs.celeryq.dev/en/stable/userguide/signals.html#task-failure
+     """
++    if task_id is None:  # pragma: no cover
++        return
++    if sender and sender.name not in TRACKED_TASKS:  # pragma: no cover
++        return
+     try:
+         close_old_connections()
+-        task_instance = PaperlessTask.objects.filter(task_id=task_id).first()
+ 
+-        if task_instance is not None and task_instance.result is None:
+-            task_instance.status = states.FAILURE
+-            task_instance.result = traceback
+-            task_instance.date_done = timezone.now()
+-            task_instance.save()
++        result_data: dict = {
++            "error_type": type(exception).__name__ if exception else "Unknown",
++            "error_message": str(exception) if exception else "Unknown error",
++        }
++        if traceback:
++            tb_str = "".join(_tb.format_tb(traceback))
++            result_data["traceback"] = tb_str[:5000]
++
++        now = timezone.now()
++        update_fields: dict = {
++            "status": PaperlessTask.Status.FAILURE,
++            "result_data": result_data,
++            "date_done": now,
++        }
++
++        task_qs = PaperlessTask.objects.filter(task_id=task_id)
++        task_instance = task_qs.values("date_started", "date_created").first()
++        if task_instance:
++            date_started = task_instance["date_started"]
++            if date_started:
++                update_fields["duration_seconds"] = (now - date_started).total_seconds()
++            date_created = task_instance["date_created"]
++            if date_started and date_created:
++                update_fields["wait_time_seconds"] = (
++                    date_started - date_created
++                ).total_seconds()
++            task_qs.update(**update_fields)
+     except Exception:  # pragma: no cover
+-        logger.exception("Updating PaperlessTask failed")
++        logger.exception("Updating PaperlessTask on failure failed")
++
++
++@task_revoked.connect
++def task_revoked_handler(
++    sender=None,
++    request=None,
++    *,
++    terminated: bool = False,
++    signum=None,
++    expired: bool = False,
++    **kwargs,
++) -> None:
++    """
++    Marks the task REVOKED when it is cancelled before or during execution.
++
++    This fires for tasks revoked while still queued (before task_prerun) as
++    well as for tasks terminated mid-run.  task_postrun does NOT fire for
++    pre-start revocations, so this handler is the only way to move those
++    records out of PENDING.
++
++    https://docs.celeryq.dev/en/stable/userguide/signals.html#task-revoked
++    """
++    task_id = request.id if request else None
++    if task_id is None:  # pragma: no cover
++        return
++    if sender and sender.name not in TRACKED_TASKS:  # pragma: no cover
++        return
++    try:
++        close_old_connections()
++        PaperlessTask.objects.filter(task_id=task_id).update(
++            status=PaperlessTask.Status.REVOKED,
++            date_done=timezone.now(),
++        )
++    except Exception:  # pragma: no cover
++        logger.exception("Updating PaperlessTask on revocation failed")
+ 
+ 
+ @worker_process_init.connect
+@@ -1140,7 +1337,7 @@ def add_or_update_document_in_llm_index(sender, document, **kwargs):
+     if ai_config.llm_index_enabled:
+         from documents.tasks import update_document_in_llm_index
+ 
+-        update_document_in_llm_index.delay(document)
++        update_document_in_llm_index.apply_async(kwargs={"document": document})
+ 
+ 
+ @receiver(models.signals.post_delete, sender=Document)
+@@ -1156,4 +1353,4 @@ def delete_document_from_llm_index(
+     if ai_config.llm_index_enabled:
+         from documents.tasks import remove_document_from_llm_index
+ 
+-        remove_document_from_llm_index.delay(instance)
++        remove_document_from_llm_index.apply_async(kwargs={"document": instance})
+diff --git a/src/documents/tasks.py b/src/documents/tasks.py
+index 57c819492..8f346e36c 100644
+--- a/src/documents/tasks.py
++++ b/src/documents/tasks.py
+@@ -10,7 +10,6 @@ from tempfile import mkstemp
+ 
+ from celery import Task
+ from celery import shared_task
+-from celery import states
+ from django.conf import settings
+ from django.contrib.contenttypes.models import ContentType
+ from django.db import models
+@@ -27,11 +26,15 @@ from documents.caching import clear_document_caches
+ from documents.classifier import DocumentClassifier
+ from documents.classifier import load_classifier
+ from documents.consumer import AsnCheckPlugin
++from documents.consumer import ConsumeFileDuplicateError
+ from documents.consumer import ConsumerPlugin
+ from documents.consumer import ConsumerPreflightPlugin
+ from documents.consumer import WorkflowTriggerPlugin
+ from documents.consumer import should_produce_archive
+ from documents.data_models import ConsumableDocument
++from documents.data_models import ConsumeFileDuplicateResult
++from documents.data_models import ConsumeFileStoppedResult
++from documents.data_models import ConsumeFileSuccessResult
+ from documents.data_models import DocumentMetadataOverrides
+ from documents.double_sided import CollatePlugin
+ from documents.file_handling import create_source_path_directory
+@@ -84,19 +87,8 @@ def index_optimize() -> None:
+ @shared_task
+ def train_classifier(
+     *,
+-    scheduled=True,
+     status_callback: Callable[[str], None] | None = None,
+-) -> None:
+-    task = PaperlessTask.objects.create(
+-        type=PaperlessTask.TaskType.SCHEDULED_TASK
+-        if scheduled
+-        else PaperlessTask.TaskType.MANUAL_TASK,
+-        task_id=uuid.uuid4(),
+-        task_name=PaperlessTask.TaskName.TRAIN_CLASSIFIER,
+-        status=states.STARTED,
+-        date_created=timezone.now(),
+-        date_started=timezone.now(),
+-    )
++) -> str:
+     if (
+         not Tag.objects.filter(matching_algorithm=Tag.MATCH_AUTO).exists()
+         and not DocumentType.objects.filter(matching_algorithm=Tag.MATCH_AUTO).exists()
+@@ -107,40 +99,25 @@ def train_classifier(
+         logger.info(result)
+         # Special case, items were once auto and trained, so remove the model
+         # and prevent its use again
+-        if settings.MODEL_FILE.exists():
++        if settings.MODEL_FILE.exists():  # pragma: no cover
+             logger.info(f"Removing {settings.MODEL_FILE} so it won't be used")
+             settings.MODEL_FILE.unlink()
+-        task.status = states.SUCCESS
+-        task.result = result
+-        task.date_done = timezone.now()
+-        task.save()
+-        return
++        return result
+ 
+     classifier = load_classifier()
+ 
+     if not classifier:
+         classifier = DocumentClassifier()
+ 
+-    try:
+-        if classifier.train(status_callback=status_callback):
+-            logger.info(
+-                f"Saving updated classifier model to {settings.MODEL_FILE}...",
+-            )
+-            classifier.save()
+-            task.result = "Training completed successfully"
+-        else:
+-            logger.debug("Training data unchanged.")
+-            task.result = "Training data unchanged"
+-
+-        task.status = states.SUCCESS
+-
+-    except Exception as e:
+-        logger.warning("Classifier error: " + str(e))
+-        task.status = states.FAILURE
+-        task.result = str(e)
+-
+-    task.date_done = timezone.now()
+-    task.save(update_fields=["status", "result", "date_done"])
++    if classifier.train(status_callback=status_callback):
++        logger.info(
++            f"Saving updated classifier model to {settings.MODEL_FILE}...",
++        )
++        classifier.save()
++        return "Training completed successfully"
++    else:
++        logger.debug("Training data unchanged.")
++        return "Training data unchanged"
+ 
+ 
+ @shared_task(bind=True)
+@@ -148,6 +125,11 @@ def consume_file(
+     self: Task,
+     input_doc: ConsumableDocument,
+     overrides: DocumentMetadataOverrides | None = None,
++) -> (
++    ConsumeFileSuccessResult
++    | ConsumeFileStoppedResult
++    | ConsumeFileDuplicateResult
++    | None
+ ):
+     token = consume_task_id.set((self.request.id or "")[:8])
+     try:
+@@ -180,6 +162,7 @@ def consume_file(
+             TemporaryDirectory(dir=settings.SCRATCH_DIR) as tmp_dir,
+         ):
+             tmp_dir = Path(tmp_dir)
++            msg = None
+             for plugin_class in plugins:
+                 plugin_name = plugin_class.NAME
+ 
+@@ -210,7 +193,14 @@ def consume_file(
+ 
+                 except StopConsumeTaskError as e:
+                     logger.info(f"{plugin_name} requested task exit: {e.message}")
+-                    return e.message
++                    return ConsumeFileStoppedResult(reason=e.message)
++
++                except ConsumeFileDuplicateError as e:
++                    logger.info(f"{plugin_name} rejected duplicate: {e}")
++                    return ConsumeFileDuplicateResult(
++                        duplicate_of=e.duplicate_id,
++                        duplicate_in_trash=e.in_trash,
++                    )
+ 
+                 except Exception as e:
+                     logger.exception(f"{plugin_name} failed: {e}")
+@@ -231,8 +221,8 @@ def consume_file(
+ 
+ 
+ @shared_task
+-def sanity_check(*, scheduled=True, raise_on_error=True):
+-    messages = sanity_checker.check_sanity(scheduled=scheduled)
++def sanity_check(*, raise_on_error: bool = True) -> str:
++    messages = sanity_checker.check_sanity()
+     messages.log_messages()
+ 
+     if not messages.has_error and not messages.has_warning and not messages.has_info:
+@@ -628,49 +618,29 @@ def update_document_parent_tags(tag: Tag, new_parent: Tag) -> None:
+         )
+ 
+     if affected:
+-        bulk_update_documents.delay(document_ids=list(affected))
++        bulk_update_documents.apply_async(
++            kwargs={"document_ids": list(affected)},
++            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
++        )
+ 
+ 
+ @shared_task
+ def llmindex_index(
+     *,
+     iter_wrapper: IterWrapper[Document] = identity,
+-    rebuild=False,
+-    scheduled=True,
+-    auto=False,
+-) -> None:
++    rebuild: bool = False,
++) -> str | None:
+     ai_config = AIConfig()
+-    if ai_config.llm_index_enabled:
+-        task = PaperlessTask.objects.create(
+-            type=PaperlessTask.TaskType.SCHEDULED_TASK
+-            if scheduled
+-            else PaperlessTask.TaskType.AUTO
+-            if auto
+-            else PaperlessTask.TaskType.MANUAL_TASK,
+-            task_id=uuid.uuid4(),
+-            task_name=PaperlessTask.TaskName.LLMINDEX_UPDATE,
+-            status=states.STARTED,
+-            date_created=timezone.now(),
+-            date_started=timezone.now(),
+-        )
+-        from paperless_ai.indexing import update_llm_index
+-
+-        try:
+-            result = update_llm_index(
+-                iter_wrapper=iter_wrapper,
+-                rebuild=rebuild,
+-            )
+-            task.status = states.SUCCESS
+-            task.result = result
+-        except Exception as e:
+-            logger.error("LLM index error: " + str(e))
+-            task.status = states.FAILURE
+-            task.result = str(e)
+-
+-        task.date_done = timezone.now()
+-        task.save(update_fields=["status", "result", "date_done"])
+-    else:
++    if not ai_config.llm_index_enabled:  # pragma: no cover
+         logger.info("LLM index is disabled, skipping update.")
++        return None
++
++    from paperless_ai.indexing import update_llm_index
++
++    return update_llm_index(
++        iter_wrapper=iter_wrapper,
++        rebuild=rebuild,
++    )
+ 
+ 
+ @shared_task
+diff --git a/src/documents/views.py b/src/documents/views.py
+index c57e43b35..602a07251 100644
+--- a/src/documents/views.py
++++ b/src/documents/views.py
+@@ -8,6 +8,8 @@ import zipfile
+ from collections import defaultdict
+ from collections import deque
+ from datetime import datetime
++from datetime import timedelta
++from http import HTTPStatus
+ from pathlib import Path
+ from time import mktime
+ from typing import TYPE_CHECKING
+@@ -20,7 +22,6 @@ from urllib.parse import urlparse
+ import httpx
+ import magic
+ import pathvalidate
+-from celery import states
+ from django.conf import settings
+ from django.contrib.auth.models import Group
+ from django.contrib.auth.models import User
+@@ -29,6 +30,7 @@ from django.core.cache import cache
+ from django.db import connections
+ from django.db.migrations.loader import MigrationLoader
+ from django.db.migrations.recorder import MigrationRecorder
++from django.db.models import Avg
+ from django.db.models import Case
+ from django.db.models import Count
+ from django.db.models import F
+@@ -67,6 +69,7 @@ from django.views.decorators.http import condition
+ from django.views.decorators.http import last_modified
+ from django.views.generic import TemplateView
+ from django_filters.rest_framework import DjangoFilterBackend
++from drf_spectacular.openapi import AutoSchema
+ from drf_spectacular.types import OpenApiTypes
+ from drf_spectacular.utils import OpenApiParameter
+ from drf_spectacular.utils import extend_schema
+@@ -193,7 +196,7 @@ from documents.serialisers import PostDocumentSerializer
+ from documents.serialisers import RemovePasswordDocumentsSerializer
+ from documents.serialisers import ReprocessDocumentsSerializer
+ from documents.serialisers import RotateDocumentsSerializer
+-from documents.serialisers import RunTaskViewSerializer
++from documents.serialisers import RunTaskSerializer
+ from documents.serialisers import SavedViewSerializer
+ from documents.serialisers import SearchResultSerializer
+ from documents.serialisers import SerializerWithPerms
+@@ -202,7 +205,9 @@ from documents.serialisers import ShareLinkSerializer
+ from documents.serialisers import StoragePathSerializer
+ from documents.serialisers import StoragePathTestSerializer
+ from documents.serialisers import TagSerializer
+-from documents.serialisers import TasksViewSerializer
++from documents.serialisers import TaskSerializerV9
++from documents.serialisers import TaskSerializerV10
++from documents.serialisers import TaskSummarySerializer
+ from documents.serialisers import TrashSerializer
+ from documents.serialisers import UiSettingsViewSerializer
+ from documents.serialisers import WorkflowActionSerializer
+@@ -212,7 +217,6 @@ from documents.signals import document_updated
+ from documents.tasks import build_share_link_bundle
+ from documents.tasks import consume_file
+ from documents.tasks import empty_trash
+-from documents.tasks import index_optimize
+ from documents.tasks import llmindex_index
+ from documents.tasks import sanity_check
+ from documents.tasks import train_classifier
+@@ -687,18 +691,49 @@ class EmailDocumentDetailSchema(EmailSerializer):
+                     "original_mime_type": serializers.CharField(),
+                     "media_filename": serializers.CharField(),
+                     "has_archive_version": serializers.BooleanField(),
+-                    "original_metadata": serializers.DictField(),
+-                    "archive_checksum": serializers.CharField(),
+-                    "archive_media_filename": serializers.CharField(),
++                    "original_metadata": serializers.ListField(
++                        child=inline_serializer(
++                            name="OriginalMetadataEntry",
++                            fields={
++                                "namespace": serializers.CharField(),
++                                "prefix": serializers.CharField(),
++                                "key": serializers.CharField(),
++                                "value": serializers.CharField(),
++                            },
++                        ),
++                    ),
++                    "archive_checksum": serializers.CharField(
++                        allow_null=True,
++                        required=False,
++                    ),
++                    "archive_media_filename": serializers.CharField(
++                        allow_null=True,
++                        required=False,
++                    ),
+                     "original_filename": serializers.CharField(),
+-                    "archive_size": serializers.IntegerField(),
+-                    "archive_metadata": serializers.DictField(),
++                    "archive_size": serializers.IntegerField(
++                        allow_null=True,
++                        required=False,
++                    ),
++                    "archive_metadata": serializers.ListField(
++                        child=inline_serializer(
++                            name="ArchiveMetadataEntry",
++                            fields={
++                                "namespace": serializers.CharField(),
++                                "prefix": serializers.CharField(),
++                                "key": serializers.CharField(),
++                                "value": serializers.CharField(),
++                            },
++                        ),
++                        allow_null=True,
++                        required=False,
++                    ),
+                     "lang": serializers.CharField(),
+                 },
+             ),
+-            400: None,
+-            403: None,
+-            404: None,
++            HTTPStatus.BAD_REQUEST: None,
++            HTTPStatus.FORBIDDEN: None,
++            HTTPStatus.NOT_FOUND: None,
+         },
+     ),
+     notes=extend_schema(
+@@ -1768,9 +1803,9 @@ class DocumentViewSet(
+             if request.user is not None:
+                 overrides.actor_id = request.user.id
+ 
+-            async_task = consume_file.delay(
+-                input_doc,
+-                overrides,
++            async_task = consume_file.apply_async(
++                kwargs={"input_doc": input_doc, "overrides": overrides},
++                headers={"trigger_source": PaperlessTask.TriggerSource.WEB_UI},
+             )
+             logger.debug(
+                 f"Updated document {root_doc.id} with new version",
+@@ -2447,6 +2482,7 @@ class DocumentOperationPermissionMixin(PassUserMixin, DocumentSelectionMixin):
+         "edit_pdf",
+         "remove_password",
+     }
++    METHOD_NAMES_REQUIRING_TRIGGER_SOURCE = METHOD_NAMES_REQUIRING_USER
+ 
+     def _has_document_permissions(
+         self,
+@@ -2537,12 +2573,19 @@ class DocumentOperationPermissionMixin(PassUserMixin, DocumentSelectionMixin):
+         parameters = {
+             k: v
+             for k, v in validated_data.items()
+-            if k not in {"documents", "all", "filters"}
++            if k not in {"documents", "all", "filters", "from_webui"}
+         }
+         user = self.request.user
++        from_webui = validated_data.get("from_webui", False)
+ 
+         if method.__name__ in self.METHOD_NAMES_REQUIRING_USER:
+             parameters["user"] = user
++        if method.__name__ in self.METHOD_NAMES_REQUIRING_TRIGGER_SOURCE:
++            parameters["trigger_source"] = (
++                PaperlessTask.TriggerSource.WEB_UI
++                if from_webui
++                else PaperlessTask.TriggerSource.API_UPLOAD
++            )
+ 
+         if not self._has_document_permissions(
+             user=user,
+@@ -2626,12 +2669,19 @@ class BulkEditView(DocumentOperationPermissionMixin):
+         user = self.request.user
+         method = serializer.validated_data.get("method")
+         parameters = serializer.validated_data.get("parameters")
++        from_webui = serializer.validated_data.get("from_webui", False)
+         documents = self._resolve_document_ids(
+             user=user,
+             validated_data=serializer.validated_data,
+         )
+         if method.__name__ in self.METHOD_NAMES_REQUIRING_USER:
+             parameters["user"] = user
++        if method.__name__ in self.METHOD_NAMES_REQUIRING_TRIGGER_SOURCE:
++            parameters["trigger_source"] = (
++                PaperlessTask.TriggerSource.WEB_UI
++                if from_webui
++                else PaperlessTask.TriggerSource.API_UPLOAD
++            )
+         if not self._has_document_permissions(
+             user=user,
+             documents=documents,
+@@ -2925,9 +2975,15 @@ class PostDocumentView(GenericAPIView[Any]):
+             custom_fields=custom_fields,
+         )
+ 
+-        async_task = consume_file.delay(
+-            input_doc,
+-            input_doc_overrides,
++        async_task = consume_file.apply_async(
++            kwargs={"input_doc": input_doc, "overrides": input_doc_overrides},
++            headers={
++                "trigger_source": (
++                    PaperlessTask.TriggerSource.WEB_UI
++                    if from_webui
++                    else PaperlessTask.TriggerSource.API_UPLOAD
++                ),
++            },
+         )
+ 
+         return Response(async_task.id)
+@@ -3526,7 +3582,17 @@ class BulkDownloadView(DocumentSelectionMixin, GenericAPIView[Any]):
+             return response
+ 
+ 
+-@extend_schema_view(**generate_object_with_permissions_schema(StoragePathSerializer))
++@extend_schema_view(
++    **generate_object_with_permissions_schema(StoragePathSerializer),
++    test=extend_schema(
++        operation_id="storage_paths_test",
++        description="Test a storage path template against a document.",
++        request=StoragePathTestSerializer,
++        responses={
++            (HTTPStatus.OK, "application/json"): OpenApiTypes.STR,
++        },
++    ),
++)
+ class StoragePathViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet[StoragePath]):
+     model = StoragePath
+ 
+@@ -3563,7 +3629,10 @@ class StoragePathViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet[Storag
+         response = super().destroy(request, *args, **kwargs)
+ 
+         if doc_ids:
+-            bulk_edit.bulk_update_documents.delay(doc_ids)
++            bulk_edit.bulk_update_documents.apply_async(
++                kwargs={"document_ids": doc_ids},
++                headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
++            )
+ 
+         return response
+ 
+@@ -3728,22 +3797,31 @@ class RemoteVersionView(GenericAPIView[Any]):
+         )
+ 
+ 
++class _TasksViewSetSchema(AutoSchema):
++    _UNPAGINATED_ACTIONS = frozenset({"summary", "active"})
++
++    def _get_paginator(self):
++        if getattr(self.view, "action", None) in self._UNPAGINATED_ACTIONS:
++            return None
++        return super()._get_paginator()
++
++
+ @extend_schema_view(
++    list=extend_schema(
++        parameters=[
++            OpenApiParameter(
++                name="task_id",
++                type=str,
++                location=OpenApiParameter.QUERY,
++                required=False,
++                description="Filter tasks by Celery UUID",
++            ),
++        ],
++    ),
+     acknowledge=extend_schema(
+         operation_id="acknowledge_tasks",
+         description="Acknowledge a list of tasks",
+-        request={
+-            "application/json": {
+-                "type": "object",
+-                "properties": {
+-                    "tasks": {
+-                        "type": "array",
+-                        "items": {"type": "integer"},
+-                    },
+-                },
+-                "required": ["tasks"],
+-            },
+-        },
++        request=AcknowledgeTasksViewSerializer,
+         responses={
+             (200, "application/json"): inline_serializer(
+                 name="AcknowledgeTasks",
+@@ -3751,52 +3829,126 @@ class RemoteVersionView(GenericAPIView[Any]):
+                     "result": serializers.IntegerField(),
+                 },
+             ),
+-            (400, "application/json"): None,
+         },
+     ),
+-)
+-@extend_schema(
+-    parameters=[
+-        OpenApiParameter(
+-            name="task_id",
+-            type=str,
+-            location=OpenApiParameter.QUERY,
+-            required=False,
+-            description="Filter tasks by Celery UUID",
+-        ),
+-    ],
++    run=extend_schema(
++        operation_id="run_task",
++        description="Manually dispatch a background task. Superuser only.",
++        request=RunTaskSerializer,
++        responses={
++            (200, "application/json"): inline_serializer(
++                name="RunTask",
++                fields={"task_id": serializers.CharField()},
++            ),
++            (400, "application/json"): inline_serializer(
++                name="RunTaskError",
++                fields={"error": serializers.CharField()},
++            ),
++        },
++    ),
++    summary=extend_schema(
++        responses={200: TaskSummarySerializer(many=True)},
++        parameters=[
++            OpenApiParameter(
++                name="days",
++                type={"type": "integer", "minimum": 1, "maximum": 365, "default": 30},
++                location=OpenApiParameter.QUERY,
++                required=False,
++                description="Number of days to include in aggregation (default 30, min 1, max 365)",
++            ),
++        ],
++    ),
++    active=extend_schema(
++        description="Currently pending and running tasks (capped at 50).",
++        responses={200: TaskSerializerV10(many=True)},
++    ),
+ )
+ class TasksViewSet(ReadOnlyModelViewSet[PaperlessTask]):
++    schema = _TasksViewSetSchema()
+     permission_classes = (IsAuthenticated, PaperlessObjectPermissions)
+-    serializer_class = TasksViewSerializer
++    pagination_class = StandardPagination
+     filter_backends = (
+         DjangoFilterBackend,
+         OrderingFilter,
+-        ObjectOwnedOrGrantedPermissionsFilter,
+     )
+     filterset_class = PaperlessTaskFilterSet
++    ordering_fields = [
++        "date_created",
++        "date_done",
++        "status",
++        "task_type",
++        "duration_seconds",
++        "wait_time_seconds",
++    ]
++    ordering = ["-date_created"]
++    # Needed for drf-spectacular schema generation (get_queryset touches request.user)
++    queryset = PaperlessTask.objects.none()
++
++    # v9 backwards compat: maps old task_name values to new task_type values
++    _V9_TASK_NAME_TO_TYPE = {
++        "check_sanity": PaperlessTask.TaskType.SANITY_CHECK,
++        "llmindex_update": PaperlessTask.TaskType.LLM_INDEX,
++    }
+ 
+-    TASK_AND_ARGS_BY_NAME = {
+-        PaperlessTask.TaskName.INDEX_OPTIMIZE: (index_optimize, {}),
+-        PaperlessTask.TaskName.TRAIN_CLASSIFIER: (
+-            train_classifier,
+-            {"scheduled": False},
+-        ),
+-        PaperlessTask.TaskName.CHECK_SANITY: (
+-            sanity_check,
+-            {"scheduled": False, "raise_on_error": False},
+-        ),
+-        PaperlessTask.TaskName.LLMINDEX_UPDATE: (
+-            llmindex_index,
+-            {"scheduled": False, "rebuild": False},
+-        ),
++    # v9 backwards compat: maps old "type" query param values to new TriggerSource.
++    # Must match the reverse of TaskSerializerV9._TRIGGER_SOURCE_TO_V9_TYPE.
++    _V9_TYPE_TO_TRIGGER_SOURCES = {
++        "auto_task": [
++            PaperlessTask.TriggerSource.SYSTEM,
++            PaperlessTask.TriggerSource.EMAIL_CONSUME,
++            PaperlessTask.TriggerSource.FOLDER_CONSUME,
++        ],
++        "scheduled_task": [PaperlessTask.TriggerSource.SCHEDULED],
++        "manual_task": [
++            PaperlessTask.TriggerSource.MANUAL,
++            PaperlessTask.TriggerSource.WEB_UI,
++            PaperlessTask.TriggerSource.API_UPLOAD,
++        ],
++    }
++
++    _RUNNABLE_TASKS = {
++        PaperlessTask.TaskType.TRAIN_CLASSIFIER: (train_classifier, {}),
++        PaperlessTask.TaskType.SANITY_CHECK: (sanity_check, {"raise_on_error": False}),
++        PaperlessTask.TaskType.LLM_INDEX: (llmindex_index, {"rebuild": False}),
+     }
+ 
++    def get_serializer_class(self):
++        # v9: use backwards-compatible serializer with old field names
++        if self.request.version and int(self.request.version) < 10:
++            return TaskSerializerV9
++        return TaskSerializerV10
++
++    def paginate_queryset(self, queryset):
++        # v9: tasks endpoint was not paginated; preserve plain-list response
++        if self.request.version and int(self.request.version) < 10:
++            return None
++        return super().paginate_queryset(queryset)
++
+     def get_queryset(self):
+-        queryset = PaperlessTask.objects.all().order_by("-date_created")
++        is_v9 = self.request.version and int(self.request.version) < 10
++        if self.request.user.is_staff:
++            queryset = PaperlessTask.objects.all()
++        else:
++            # Own tasks + unowned (system/scheduled) tasks. Tasks owned by other
++            # users are never visible to non-staff regardless of API version.
++            queryset = PaperlessTask.objects.filter(
++                Q(owner=self.request.user) | Q(owner__isnull=True),
++            )
++        # v9 backwards compat: map old query params to new field names
++        if is_v9:
++            task_name = self.request.query_params.get("task_name")
++            if task_name is not None:
++                mapped = self._V9_TASK_NAME_TO_TYPE.get(task_name, task_name)
++                queryset = queryset.filter(task_type=mapped)
++            task_type_old = self.request.query_params.get("type")
++            if task_type_old is not None:
++                sources = self._V9_TYPE_TO_TRIGGER_SOURCES.get(task_type_old)
++                if sources:
++                    queryset = queryset.filter(trigger_source__in=sources)
++        # v10+: direct task_id param for backwards compat
+         task_id = self.request.query_params.get("task_id")
+         if task_id is not None:
+-            queryset = PaperlessTask.objects.filter(task_id=task_id)
++            queryset = queryset.filter(task_id=task_id)
+         return queryset
+ 
+     @action(
+@@ -3808,33 +3960,96 @@ class TasksViewSet(ReadOnlyModelViewSet[PaperlessTask]):
+         serializer = AcknowledgeTasksViewSerializer(data=request.data)
+         serializer.is_valid(raise_exception=True)
+         task_ids = serializer.validated_data.get("tasks")
++        tasks = self.get_queryset().filter(id__in=task_ids)
++        count = tasks.update(acknowledged=True)
++        return Response({"result": count})
++
++    def get_permissions(self):
++        if self.action == "summary" and has_system_status_permission(
++            getattr(self.request, "user", None),
++        ):
++            return [IsAuthenticated()]
++        return super().get_permissions()
+ 
++    @action(methods=["get"], detail=False)
++    def summary(self, request):
++        """Aggregated task statistics per task_type over the last N days (default 30)."""
+         try:
+-            tasks = PaperlessTask.objects.filter(id__in=task_ids)
+-            if request.user is not None and not request.user.is_superuser:
+-                tasks = tasks.filter(owner=request.user) | tasks.filter(owner=None)
+-            result = tasks.update(
+-                acknowledged=True,
++            days = min(365, max(1, int(request.query_params.get("days", 30))))
++        except (TypeError, ValueError):
++            return Response(
++                {"days": "Must be a positive integer."},
++                status=status.HTTP_400_BAD_REQUEST,
+             )
+-            return Response({"result": result})
+-        except Exception:
+-            return HttpResponseBadRequest()
++        cutoff = timezone.now() - timedelta(days=days)
++        if has_system_status_permission(request.user):
++            queryset = PaperlessTask.objects.filter(date_created__gte=cutoff)
++        else:
++            queryset = self.get_queryset().filter(date_created__gte=cutoff)
++
++        data = queryset.values("task_type").annotate(
++            total_count=Count("id"),
++            pending_count=Count("id", filter=Q(status=PaperlessTask.Status.PENDING)),
++            success_count=Count("id", filter=Q(status=PaperlessTask.Status.SUCCESS)),
++            failure_count=Count("id", filter=Q(status=PaperlessTask.Status.FAILURE)),
++            avg_duration_seconds=Avg(
++                "duration_seconds",
++                filter=Q(duration_seconds__isnull=False),
++            ),
++            avg_wait_time_seconds=Avg(
++                "wait_time_seconds",
++                filter=Q(wait_time_seconds__isnull=False),
++            ),
++            last_run=Max("date_created"),
++            last_success=Max(
++                "date_done",
++                filter=Q(status=PaperlessTask.Status.SUCCESS),
++            ),
++            last_failure=Max(
++                "date_done",
++                filter=Q(status=PaperlessTask.Status.FAILURE),
++            ),
++        )
++        serializer = TaskSummarySerializer(data, many=True)
++        return Response(serializer.data)
++
++    @action(methods=["get"], detail=False)
++    def active(self, request):
++        """Currently pending and running tasks (capped at 50)."""
++        queryset = (
++            self.get_queryset()
++            .filter(
++                status__in=[PaperlessTask.Status.PENDING, PaperlessTask.Status.STARTED],
++            )
++            .order_by("-date_created")[:50]
++        )
++        serializer = self.get_serializer(queryset, many=True)
++        return Response(serializer.data)
+ 
+     @action(methods=["post"], detail=False)
+     def run(self, request):
+-        serializer = RunTaskViewSerializer(data=request.data)
+-        serializer.is_valid(raise_exception=True)
+-        task_name = serializer.validated_data.get("task_name")
+-
++        """Manually dispatch a background task. Superuser only."""
+         if not request.user.is_superuser:
+             return HttpResponseForbidden("Insufficient permissions")
++        serializer = RunTaskSerializer(data=request.data)
++        serializer.is_valid(raise_exception=True)
++        task_type = serializer.validated_data.get("task_type")
++
++        if task_type not in self._RUNNABLE_TASKS:
++            return Response(
++                {"error": f"Task type '{task_type}' cannot be manually triggered"},
++                status=status.HTTP_400_BAD_REQUEST,
++            )
+ 
+         try:
+-            task_func, task_args = self.TASK_AND_ARGS_BY_NAME[task_name]
+-            result = task_func(**task_args)
+-            return Response({"result": result})
++            task_func, task_kwargs = self._RUNNABLE_TASKS[task_type]
++            async_result = task_func.apply_async(
++                kwargs=task_kwargs,
++                headers={"trigger_source": PaperlessTask.TriggerSource.MANUAL},
++            )
++            return Response({"task_id": async_result.id})
+         except Exception as e:
+-            logger.warning(f"An error occurred running task: {e!s}")
++            logger.warning(f"Error running task: {e!s}")
+             return HttpResponseServerError(
+                 "Error running task, check logs for more detail.",
+             )
+@@ -3864,6 +4079,19 @@ class ShareLinkViewSet(
+     ordering_fields = ("created", "expiration", "document")
+ 
+ 
++@extend_schema_view(
++    rebuild=extend_schema(
++        operation_id="share_link_bundles_rebuild",
++        description="Reset and re-queue a share link bundle for processing.",
++        responses={
++            HTTPStatus.OK: ShareLinkBundleSerializer,
++            (HTTPStatus.BAD_REQUEST, "application/json"): inline_serializer(
++                name="RebuildBundleError",
++                fields={"detail": serializers.CharField()},
++            ),
++        },
++    ),
++)
+ class ShareLinkBundleViewSet(PassUserMixin, ModelViewSet[ShareLinkBundle]):
+     model = ShareLinkBundle
+ 
+@@ -3941,7 +4169,10 @@ class ShareLinkBundleViewSet(PassUserMixin, ModelViewSet[ShareLinkBundle]):
+                 "file_path",
+             ],
+         )
+-        build_share_link_bundle.delay(bundle.pk)
++        build_share_link_bundle.apply_async(
++            kwargs={"bundle_id": bundle.pk},
++            headers={"trigger_source": PaperlessTask.TriggerSource.MANUAL},
++        )
+         bundle.document_total = len(ordered_documents)
+         response_serializer = self.get_serializer(bundle)
+         headers = self.get_success_headers(response_serializer.data)
+@@ -3974,7 +4205,10 @@ class ShareLinkBundleViewSet(PassUserMixin, ModelViewSet[ShareLinkBundle]):
+                 "file_path",
+             ],
+         )
+-        build_share_link_bundle.delay(bundle.pk)
++        build_share_link_bundle.apply_async(
++            kwargs={"bundle_id": bundle.pk},
++            headers={"trigger_source": PaperlessTask.TriggerSource.MANUAL},
++        )
+         bundle.document_total = (
+             getattr(bundle, "document_total", None) or bundle.documents.count()
+         )
+@@ -4342,6 +4576,16 @@ class CustomFieldViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet[Custom
+                             "redis_status": serializers.CharField(),
+                             "redis_error": serializers.CharField(),
+                             "celery_status": serializers.CharField(),
++                            "summary": inline_serializer(
++                                name="TasksSummaryOverview",
++                                fields={
++                                    "days": serializers.IntegerField(),
++                                    "total_count": serializers.IntegerField(),
++                                    "pending_count": serializers.IntegerField(),
++                                    "success_count": serializers.IntegerField(),
++                                    "failure_count": serializers.IntegerField(),
++                                },
++                            ),
+                         },
+                     ),
+                     "index": inline_serializer(
+@@ -4375,6 +4619,7 @@ class CustomFieldViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet[Custom
+ )
+ class SystemStatusView(PassUserMixin):
+     permission_classes = (IsAuthenticated,)
++    TASK_SUMMARY_DAYS = 30
+ 
+     def get(self, request, format=None):
+         if not has_system_status_permission(request.user):
+@@ -4466,12 +4711,8 @@ class SystemStatusView(PassUserMixin):
+ 
+         last_trained_task = (
+             PaperlessTask.objects.filter(
+-                task_name=PaperlessTask.TaskName.TRAIN_CLASSIFIER,
+-                status__in=[
+-                    states.SUCCESS,
+-                    states.FAILURE,
+-                    states.REVOKED,
+-                ],  # ignore running tasks
++                task_type=PaperlessTask.TaskType.TRAIN_CLASSIFIER,
++                status__in=PaperlessTask.COMPLETE_STATUSES,  # ignore running tasks
+             )
+             .order_by("-date_done")
+             .first()
+@@ -4481,21 +4722,21 @@ class SystemStatusView(PassUserMixin):
+         if last_trained_task is None:
+             classifier_status = "WARNING"
+             classifier_error = "No classifier training tasks found"
+-        elif last_trained_task and last_trained_task.status != states.SUCCESS:
++        elif last_trained_task.status != PaperlessTask.Status.SUCCESS:
+             classifier_status = "ERROR"
+-            classifier_error = last_trained_task.result
++            classifier_error = (
++                last_trained_task.result_data.get("error_message")
++                if last_trained_task.result_data
++                else None
++            )
+         classifier_last_trained = (
+             last_trained_task.date_done if last_trained_task else None
+         )
+ 
+         last_sanity_check = (
+             PaperlessTask.objects.filter(
+-                task_name=PaperlessTask.TaskName.CHECK_SANITY,
+-                status__in=[
+-                    states.SUCCESS,
+-                    states.FAILURE,
+-                    states.REVOKED,
+-                ],  # ignore running tasks
++                task_type=PaperlessTask.TaskType.SANITY_CHECK,
++                status__in=PaperlessTask.COMPLETE_STATUSES,  # ignore running tasks
+             )
+             .order_by("-date_done")
+             .first()
+@@ -4505,9 +4746,13 @@ class SystemStatusView(PassUserMixin):
+         if last_sanity_check is None:
+             sanity_check_status = "WARNING"
+             sanity_check_error = "No sanity check tasks found"
+-        elif last_sanity_check and last_sanity_check.status != states.SUCCESS:
++        elif last_sanity_check.status != PaperlessTask.Status.SUCCESS:
+             sanity_check_status = "ERROR"
+-            sanity_check_error = last_sanity_check.result
++            sanity_check_error = (
++                last_sanity_check.result_data.get("error_message")
++                if last_sanity_check.result_data
++                else None
++            )
+         sanity_check_last_run = (
+             last_sanity_check.date_done if last_sanity_check else None
+         )
+@@ -4520,7 +4765,7 @@ class SystemStatusView(PassUserMixin):
+         else:
+             last_llmindex_update = (
+                 PaperlessTask.objects.filter(
+-                    task_name=PaperlessTask.TaskName.LLMINDEX_UPDATE,
++                    task_type=PaperlessTask.TaskType.LLM_INDEX,
+                 )
+                 .order_by("-date_done")
+                 .first()
+@@ -4530,13 +4775,40 @@ class SystemStatusView(PassUserMixin):
+             if last_llmindex_update is None:
+                 llmindex_status = "WARNING"
+                 llmindex_error = "No LLM index update tasks found"
+-            elif last_llmindex_update and last_llmindex_update.status == states.FAILURE:
++            elif last_llmindex_update.status == PaperlessTask.Status.FAILURE:
+                 llmindex_status = "ERROR"
+-                llmindex_error = last_llmindex_update.result
++                llmindex_error = (
++                    last_llmindex_update.result_data.get("error_message")
++                    if last_llmindex_update.result_data
++                    else None
++                )
+             llmindex_last_modified = (
+                 last_llmindex_update.date_done if last_llmindex_update else None
+             )
+ 
++        summary_cutoff = timezone.now() - timedelta(days=self.TASK_SUMMARY_DAYS)
++        task_summary_agg = PaperlessTask.objects.filter(
++            date_created__gte=summary_cutoff,
++        ).aggregate(
++            total_count=Count("id"),
++            pending_count=Count(
++                "id",
++                filter=Q(status=PaperlessTask.Status.PENDING),
++            ),
++            success_count=Count(
++                "id",
++                filter=Q(status=PaperlessTask.Status.SUCCESS),
++            ),
++            failure_count=Count(
++                "id",
++                filter=Q(status=PaperlessTask.Status.FAILURE),
++            ),
++        )
++        task_summary = {
++            "days": self.TASK_SUMMARY_DAYS,
++            **task_summary_agg,
++        }
++
+         return Response(
+             {
+                 "pngx_version": current_version,
+@@ -4577,6 +4849,7 @@ class SystemStatusView(PassUserMixin):
+                     "llmindex_status": llmindex_status,
+                     "llmindex_last_modified": llmindex_last_modified,
+                     "llmindex_error": llmindex_error,
++                    "summary": task_summary,
+                 },
+             },
+         )
+diff --git a/src/documents/workflows/actions.py b/src/documents/workflows/actions.py
+index 9744048e5..9089c6dd8 100644
+--- a/src/documents/workflows/actions.py
++++ b/src/documents/workflows/actions.py
+@@ -253,12 +253,14 @@ def execute_webhook_action(
+                         document.mime_type,
+                     ),
+                 }
+-        send_webhook.delay(
+-            url=action.webhook.url,
+-            data=data,
+-            headers=headers,
+-            files=files,
+-            as_json=action.webhook.as_json,
++        send_webhook.apply_async(
++            kwargs={
++                "url": action.webhook.url,
++                "data": data,
++                "headers": headers,
++                "files": files,
++                "as_json": action.webhook.as_json,
++            },
+         )
+         logger.debug(
+             f"Webhook to {action.webhook.url} queued",
+diff --git a/src/paperless/migrations/0009_alter_applicationconfiguration_options.py b/src/paperless/migrations/0009_alter_applicationconfiguration_options.py
+index ae2b5b88c..4a374f23d 100644
+--- a/src/paperless/migrations/0009_alter_applicationconfiguration_options.py
++++ b/src/paperless/migrations/0009_alter_applicationconfiguration_options.py
+@@ -14,7 +14,7 @@ class Migration(migrations.Migration):
+             options={
+                 "permissions": [
+                     ("view_global_statistics", "Can view global object counts"),
+-                    ("view_system_status", "Can view system status information"),
++                    ("view_system_monitoring", "Can view system status information"),
+                 ],
+                 "verbose_name": "paperless application settings",
+             },
+diff --git a/src/paperless/models.py b/src/paperless/models.py
+index 6a38d28ac..07fe9207a 100644
+--- a/src/paperless/models.py
++++ b/src/paperless/models.py
+@@ -343,7 +343,7 @@ class ApplicationConfiguration(AbstractSingletonModel):
+         verbose_name = _("paperless application settings")
+         permissions = [
+             ("view_global_statistics", "Can view global object counts"),
+-            ("view_system_status", "Can view system status information"),
++            ("view_system_monitoring", "Can view system status information"),
+         ]
+ 
+     def __str__(self) -> str:  # pragma: no cover
+diff --git a/src/paperless/settings/__init__.py b/src/paperless/settings/__init__.py
+index bace016cf..6f76d3499 100644
+--- a/src/paperless/settings/__init__.py
++++ b/src/paperless/settings/__init__.py
+@@ -133,7 +133,6 @@ INSTALLED_APPS = [
+     "rest_framework",
+     "rest_framework.authtoken",
+     "django_filters",
+-    "django_celery_results",
+     "guardian",
+     "allauth",
+     "allauth.account",
+@@ -669,8 +668,6 @@ CELERY_BROKER_TRANSPORT_OPTIONS = {
+ CELERY_TASK_TRACK_STARTED = True
+ CELERY_TASK_TIME_LIMIT: Final[int] = get_int_from_env("PAPERLESS_WORKER_TIMEOUT", 1800)
+ 
+-CELERY_RESULT_EXTENDED = True
+-CELERY_RESULT_BACKEND = "django-db"
+ CELERY_CACHE_BACKEND = "default"
+ 
+ # https://docs.celeryq.dev/en/stable/userguide/configuration.html#task-serializer
+diff --git a/src/paperless/settings/custom.py b/src/paperless/settings/custom.py
+index 9e9468e21..1c66376a4 100644
+--- a/src/paperless/settings/custom.py
++++ b/src/paperless/settings/custom.py
+@@ -181,7 +181,11 @@ def parse_beat_schedule() -> dict:
+         schedule[task["name"]] = {
+             "task": task["task"],
+             "schedule": crontab(minute, hour, day_week, day_month, month),
+-            "options": task["options"],
++            "options": {
++                **task["options"],
++                # PaperlessTask.TriggerSource.SCHEDULED -- models can't be imported here
++                "headers": {"trigger_source": "scheduled"},
++            },
+         }
+ 
+     return schedule
+diff --git a/src/paperless/views.py b/src/paperless/views.py
+index 9c0c99e5a..4d056ba68 100644
+--- a/src/paperless/views.py
++++ b/src/paperless/views.py
+@@ -38,6 +38,7 @@ from rest_framework.response import Response
+ from rest_framework.throttling import ScopedRateThrottle
+ from rest_framework.viewsets import ModelViewSet
+ 
++from documents.models import PaperlessTask
+ from documents.permissions import PaperlessObjectPermissions
+ from documents.tasks import llmindex_index
+ from paperless.filters import GroupFilterSet
+@@ -427,10 +428,9 @@ class ApplicationConfigurationViewSet(ModelViewSet[ApplicationConfiguration]):
+             and not vector_store_file_exists()
+         ):
+             # AI index was just enabled and vector store file does not exist
+-            llmindex_index.delay(
+-                rebuild=True,
+-                scheduled=False,
+-                auto=True,
++            llmindex_index.apply_async(
++                kwargs={"rebuild": True},
++                headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+             )
+ 
+ 
+diff --git a/src/paperless_ai/indexing.py b/src/paperless_ai/indexing.py
+index a54492f1f..b8c865214 100644
+--- a/src/paperless_ai/indexing.py
++++ b/src/paperless_ai/indexing.py
+@@ -4,7 +4,6 @@ from datetime import timedelta
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+-from celery import states
+ from django.conf import settings
+ from django.utils import timezone
+ 
+@@ -28,17 +27,20 @@ def queue_llm_index_update_if_needed(*, rebuild: bool, reason: str) -> bool:
+     from documents.tasks import llmindex_index
+ 
+     has_running = PaperlessTask.objects.filter(
+-        task_name=PaperlessTask.TaskName.LLMINDEX_UPDATE,
+-        status__in=[states.PENDING, states.STARTED],
++        task_type=PaperlessTask.TaskType.LLM_INDEX,
++        status__in=[PaperlessTask.Status.PENDING, PaperlessTask.Status.STARTED],
+     ).exists()
+     has_recent = PaperlessTask.objects.filter(
+-        task_name=PaperlessTask.TaskName.LLMINDEX_UPDATE,
++        task_type=PaperlessTask.TaskType.LLM_INDEX,
+         date_created__gte=(timezone.now() - timedelta(minutes=5)),
+     ).exists()
+     if has_running or has_recent:
+         return False
+ 
+-    llmindex_index.delay(rebuild=rebuild, scheduled=False, auto=True)
++    llmindex_index.apply_async(
++        kwargs={"rebuild": rebuild},
++        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
++    )
+     logger.warning(
+         "Queued LLM index update%s: %s",
+         " (rebuild)" if rebuild else "",
+diff --git a/src/paperless_mail/mail.py b/src/paperless_mail/mail.py
+index 75bb7b134..d551cc8cd 100644
+--- a/src/paperless_mail/mail.py
++++ b/src/paperless_mail/mail.py
+@@ -37,6 +37,7 @@ from documents.data_models import DocumentMetadataOverrides
+ from documents.data_models import DocumentSource
+ from documents.loggers import LoggingMixin
+ from documents.models import Correspondent
++from documents.models import PaperlessTask
+ from documents.parsers import is_mime_type_supported
+ from documents.tasks import consume_file
+ from paperless.network import is_public_ip
+@@ -238,7 +239,7 @@ def mailbox_login(mailbox: MailBox, account: MailAccount) -> None:
+ 
+ @shared_task
+ def apply_mail_action(
+-    result: list[str],
++    result: list,
+     rule_id: int,
+     message_uid: str,
+     message_subject: str,
+@@ -893,8 +894,12 @@ class MailAccountHandler(LoggingMixin):
+                 )
+ 
+                 consume_task = consume_file.s(
+-                    input_doc,
+-                    doc_overrides,
++                    input_doc=input_doc,
++                    overrides=doc_overrides,
++                ).set(
++                    headers={
++                        "trigger_source": PaperlessTask.TriggerSource.EMAIL_CONSUME,
++                    },
+                 )
+ 
+                 consume_tasks.append(consume_task)
+@@ -991,9 +996,9 @@ class MailAccountHandler(LoggingMixin):
+         )
+ 
+         consume_task = consume_file.s(
+-            input_doc,
+-            doc_overrides,
+-        )
++            input_doc=input_doc,
++            overrides=doc_overrides,
++        ).set(headers={"trigger_source": PaperlessTask.TriggerSource.EMAIL_CONSUME})
+ 
+         queue_consumption_tasks(
+             consume_tasks=[consume_task],
+diff --git a/src/paperless_mail/views.py b/src/paperless_mail/views.py
+index c4ec2da40..2e36f1b03 100644
+--- a/src/paperless_mail/views.py
++++ b/src/paperless_mail/views.py
+@@ -1,6 +1,7 @@
+ import datetime
+ import logging
+ from datetime import timedelta
++from http import HTTPStatus
+ from typing import Any
+ 
+ from django.http import HttpResponseBadRequest
+@@ -23,6 +24,7 @@ from rest_framework.viewsets import ModelViewSet
+ from rest_framework.viewsets import ReadOnlyModelViewSet
+ 
+ from documents.filters import ObjectOwnedOrGrantedPermissionsFilter
++from documents.models import PaperlessTask
+ from documents.permissions import PaperlessObjectPermissions
+ from documents.permissions import has_perms_owner_aware
+ from documents.views import PassUserMixin
+@@ -155,11 +157,39 @@ class MailAccountViewSet(PassUserMixin, ModelViewSet[MailAccount]):
+     @action(methods=["post"], detail=True)
+     def process(self, request, pk=None):
+         account = self.get_object()
+-        process_mail_accounts.delay([account.pk])
++        process_mail_accounts.apply_async(
++            kwargs={"account_ids": [account.pk]},
++            headers={"trigger_source": PaperlessTask.TriggerSource.MANUAL},
++        )
+ 
+         return Response({"result": "OK"})
+ 
+ 
++@extend_schema_view(
++    bulk_delete=extend_schema(
++        operation_id="processed_mail_bulk_delete",
++        description="Delete multiple processed mail records by ID.",
++        request=inline_serializer(
++            name="BulkDeleteMailRequest",
++            fields={
++                "mail_ids": serializers.ListField(child=serializers.IntegerField()),
++            },
++        ),
++        responses={
++            (HTTPStatus.OK, "application/json"): inline_serializer(
++                name="BulkDeleteMailResponse",
++                fields={
++                    "result": serializers.CharField(),
++                    "deleted_mail_ids": serializers.ListField(
++                        child=serializers.IntegerField(),
++                    ),
++                },
++            ),
++            HTTPStatus.BAD_REQUEST: None,
++            HTTPStatus.FORBIDDEN: None,
++        },
++    ),
++)
+ class ProcessedMailViewSet(PassUserMixin, ReadOnlyModelViewSet[ProcessedMail]):
+     permission_classes = (IsAuthenticated, PaperlessObjectPermissions)
+     serializer_class = ProcessedMailSerializer

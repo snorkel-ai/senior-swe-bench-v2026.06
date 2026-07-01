@@ -1,0 +1,657 @@
+# Validation spec for paperless-ngx-enhancement-saved-view-sharing.
+#
+# Stories cover two stacks:
+#   - Python service (API behaviour) — DRF endpoints
+#   - TypeScript frontend (Angular Jest TestBed)
+#
+# All HTTP stories test through pre-existing stable URLs
+# (``/api/saved_views/``, ``/api/search/``).
+
+instructions = """
+This task tests a full-stack feature spanning a Django REST API
+backend and an Angular frontend service. The implementing agent has
+refactored saved views to be shareable via django-guardian object-level
+permissions and moved per-view visibility (dashboard/sidebar) into
+per-user settings.
+
+## Harness — read /tests/validate/test_harness.py
+
+- ``api_client(user)`` / ``make_user(...)`` — DRF APIClient and User
+  factories with model-level permissions support.
+- ``grant_object_perm(codename, user, obj)`` — Guardian object perm
+  shortcut (re-export of ``guardian.shortcuts.assign_perm``).
+
+## Pre-existing interfaces this task tests through
+
+All HTTP stories test through pre-existing, stable URLs (none of these
+are introduced by this task):
+- ``GET /api/saved_views/`` — list saved views visible to the requester
+- ``GET /api/saved_views/<id>/`` — retrieve one saved view
+- ``POST /api/saved_views/`` — create a saved view
+- ``PATCH /api/saved_views/<id>/`` — update a saved view
+- ``DELETE /api/saved_views/<id>/`` — delete a saved view
+- ``GET /api/search/?query=<q>`` — global search
+
+## Permissions
+
+Per repo notes Gotcha #1, non-superuser test users need BOTH a
+Django model-level Permission (granted via ``user.user_permissions``)
+AND any guardian object-level permission to see/edit a saved view
+they don't own. Use the harness ``make_user(model_perms=[...])`` to
+grant model perms cleanly; use ``grant_object_perm(...)`` for
+object-level grants.
+
+## Frontend story
+
+The frontend story runs Angular's TestBed under Jest. The procedure tells the validation agent to
+discover paperless's existing ``SavedViewService`` and
+``SettingsService`` classes from ``src-ui/src/app/services/``,
+configure a TestBed providers list that swaps the real
+``SettingsService`` for a stub whose ``get(key)`` returns the
+input-supplied dashboard/sidebar ID lists for the agent's new
+visibility settings keys (the exact constant name is NOT
+prescribed — match by substring on the key string, since the agent
+chooses the SETTINGS_KEYS name). Then exercise the saved-view list
+loading and read back the public ``dashboardViews`` / ``sidebarViews``
+collections. The exact collection names are pre-existing on the
+service class.
+"""
+
+[settings.pytest]
+# Run pytest inside paperless's uv-managed venv so Django, DRF,
+# guardian, factory_boy etc. all resolve.
+python = "uv run --frozen --no-sync python"
+django_settings = "paperless.settings"
+extra_pythonpath = ["src"]
+
+[settings.jest]
+config_dir = "src-ui"
+test_parent = "src-ui/src/app"
+command = "pnpm exec jest"
+test_path_flag = "--testPathPatterns"
+
+
+# =============================================================================
+# sharing list visibility (basic functionality)
+# =============================================================================
+
+[[story]]
+id = "owner_grants_view_perm_then_recipient_sees_it"
+driver = "pytest"
+description = """
+Saved views can be shared between users. When the owner grants another
+user object-level view permission on a saved view, that user can see
+the view in their saved-views list and retrieve it by id.
+"""
+procedure = """
+Single ``test_*(inputs, expected)`` function. The fixtures and the
+harness are imported via:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    from test_harness import api_client, make_user, grant_object_perm
+    from documents.models import SavedView
+
+The test function:
+
+1. Creates three users via ``make_user`` with model perms
+   ``["view_savedview", "change_savedview", "add_savedview", "delete_savedview"]``:
+   ``owner_<inputs["case_label"]>``, ``recipient_<inputs["case_label"]>``,
+   ``stranger_<inputs["case_label"]>``. Distinctive usernames keep
+   parametrized cases isolated even when the per-case rollback misses
+   something.
+2. Creates one ``SavedView`` owned by ``owner`` with
+   ``name=inputs["view_name"]``, ``sort_field=""``.
+3. If ``inputs["grant_view_to_recipient"]`` is true, calls
+   ``grant_object_perm("view_savedview", recipient, view)``.
+4. Authenticates an ``api_client`` as ``inputs["actor"]`` (one of
+   ``"owner"``, ``"recipient"``, ``"stranger"``).
+5. ``GET /api/saved_views/`` — read ``response.status_code`` and record whether ``inputs["view_name"]`` is in ``[v["name"] for v in response.data["results"]]``.
+   - EXPECTED: response.status_code equals expected["list_status"].
+   - EXPECTED: whether ``inputs["view_name"]`` appears in the returned names equals expected["view_visible_in_list"] (boolean compare).
+6. ``GET /api/saved_views/<view_id>/`` — read ``response.status_code``.
+   - EXPECTED: response.status_code equals expected["retrieve_status"].
+
+Use ``assert`` for each EXPECTED line, with descriptive messages.
+``view_visible_in_list`` is a SYSTEM-DERIVED boolean (the view either
+appears in the response list or it doesn't); paired with ``list_status``
+and ``retrieve_status`` it forms a concrete signature, not a vacuous
+``has_feature`` flag.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "owner"
+actor = "owner"
+view_name = "owner_only_view"
+grant_view_to_recipient = false
+[story.test_case.expected]
+list_status = 200
+retrieve_status = 200
+view_visible_in_list = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "recipient"
+actor = "recipient"
+view_name = "shared_with_recipient"
+grant_view_to_recipient = true
+[story.test_case.expected]
+list_status = 200
+retrieve_status = 200
+view_visible_in_list = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+case_label = "stranger"
+actor = "stranger"
+view_name = "not_shared_with_stranger"
+grant_view_to_recipient = false
+[story.test_case.expected]
+list_status = 200
+retrieve_status = 404
+view_visible_in_list = false
+
+
+# =============================================================================
+# set_permissions authorization matrix (senior-engineer nuance)
+# =============================================================================
+
+[[story]]
+id = "set_permissions_authorization_matrix"
+driver = "pytest"
+description = """
+The saved-views API write surface accepts in the payload a setting
+that grants view/change permissions to specific users and groups, but
+only the owner (or a superuser) is allowed to use it.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    from test_harness import api_client, make_user, grant_object_perm
+    from documents.models import SavedView
+
+Steps:
+
+1. Create three users via ``make_user`` with model perms
+   ``["view_savedview", "change_savedview", "add_savedview", "delete_savedview"]``:
+   ``owner_<inputs["case_label"]>``,
+   ``actor_<inputs["case_label"]>``, ``target_<inputs["case_label"]>``.
+2. Create one ``SavedView`` owned by ``owner``, name
+   ``view_<inputs["case_label"]>``.
+3. Grant Guardian object perms to ``actor`` based on inputs:
+   - if ``inputs["actor_can_change"]`` is true: grant both
+     ``view_savedview`` and ``change_savedview``.
+   - else if ``inputs["actor_can_view"]`` is true: grant
+     ``view_savedview`` only.
+   - else: grant nothing.
+4. Authenticate ``api_client`` as the user named by
+   ``inputs["actor_role"]`` (``"owner"`` or ``"actor"``).
+5. Build a PATCH body keyed on ``inputs["patch_kind"]``:
+   - ``"set_permissions"``:
+     ``{"set_permissions": {"view": {"users": [target.id], "groups": []},
+       "change": {"users": [], "groups": []}}}``
+   - ``"transfer_owner"``: ``{"owner": target.id}``
+   - ``"sort_field"``: ``{"sort_field": "added"}``
+6. PATCH ``/api/saved_views/<view_id>/`` with this body and
+   ``format="json"``. Read ``response.status_code``.
+   - EXPECTED: equals ``expected["patch_status"]``.
+7. Re-authenticate ``api_client`` as ``target``. GET
+   ``/api/saved_views/<view_id>/`` and read its status code.
+   - EXPECTED: equals ``expected["target_retrieve_status"]``.
+
+Reasoning: the ``patch_status`` + ``target_retrieve_status`` pair
+distinguishes "permission granted" from "rejected" — neither is a
+boolean flag; they're concrete HTTP outcomes that follow directly
+from the authorization rule under test.
+"""
+
+[[story.test_case]]
+# Owner grants view perm to a third party — succeeds.
+[story.test_case.inputs]
+case_label = "owner_grants"
+actor_role = "owner"
+actor_can_view = false
+actor_can_change = false
+patch_kind = "set_permissions"
+[story.test_case.expected]
+patch_status = 200
+target_retrieve_status = 200
+
+[[story.test_case]]
+# Non-owner with view+change perm STILL cannot grant permissions.
+[story.test_case.inputs]
+case_label = "non_owner_grant_perms"
+actor_role = "actor"
+actor_can_view = true
+actor_can_change = true
+patch_kind = "set_permissions"
+[story.test_case.expected]
+patch_status = 403
+target_retrieve_status = 404
+
+[[story.test_case]]
+# Non-owner with view+change perm cannot transfer ownership.
+[story.test_case.inputs]
+case_label = "non_owner_transfer"
+actor_role = "actor"
+actor_can_view = true
+actor_can_change = true
+patch_kind = "transfer_owner"
+[story.test_case.expected]
+patch_status = 403
+target_retrieve_status = 404
+
+[[story.test_case]]
+# View-only non-owner cannot edit content.
+[story.test_case.inputs]
+case_label = "view_only_edit"
+actor_role = "actor"
+actor_can_view = true
+actor_can_change = false
+patch_kind = "sort_field"
+[story.test_case.expected]
+patch_status = 403
+target_retrieve_status = 404
+
+
+# =============================================================================
+# global search returns shared saved views
+# =============================================================================
+
+[[story]]
+id = "global_search_includes_shared_saved_views"
+driver = "pytest"
+description = """
+Querying global search returns saved views shared with the requester.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    from test_harness import api_client, make_user, grant_object_perm
+    from documents.models import SavedView
+
+Steps:
+
+1. Create two users via ``make_user`` with model perms
+   ``["view_savedview", "view_document", "view_tag", "view_correspondent",
+       "view_documenttype", "view_storagepath", "view_customfield",
+       "view_workflow"]``:
+   ``owner_<inputs["case_label"]>``,
+   ``recipient_<inputs["case_label"]>``.
+2. Create two ``SavedView`` rows owned by ``owner``:
+   - ``shared_view`` with ``name=inputs["shared_view_name"]``,
+     ``sort_field=""``.
+   - ``private_view`` with ``name=inputs["private_view_name"]``,
+     ``sort_field=""``.
+3. Grant ``recipient`` ``view_savedview`` perm on ``shared_view``
+   only.
+4. Authenticate ``api_client`` as ``recipient``.
+5. ``GET /api/search/?query=<inputs["query"]>``. Read ``response.data["saved_views"]`` and extract the sorted list of ``name`` values.
+   - EXPECTED: ``response.status_code`` is 200 (implicit; assert it).
+   - EXPECTED: the sorted name list equals expected["matching_saved_view_names"].
+"""
+
+[[story.test_case]]
+# Query matches the shared view's name → recipient sees it.
+[story.test_case.inputs]
+case_label = "shared_match"
+shared_view_name = "alpha_shared_view"
+private_view_name = "beta_private_view"
+query = "alpha"
+[story.test_case.expected]
+matching_saved_view_names = ["alpha_shared_view"]
+
+[[story.test_case]]
+# Query matches the private view's name → recipient sees nothing
+# (no perm on private view).
+[story.test_case.inputs]
+case_label = "private_no_match"
+shared_view_name = "gamma_shared_view"
+private_view_name = "delta_private_view"
+query = "delta"
+[story.test_case.expected]
+matching_saved_view_names = []
+
+[[story.test_case]]
+# Query matches neither view's name → empty list.
+[story.test_case.inputs]
+case_label = "negative_lookup"
+shared_view_name = "epsilon_shared_view"
+private_view_name = "zeta_private_view"
+query = "no_such_view_name_xyz"
+[story.test_case.expected]
+matching_saved_view_names = []
+
+
+# =============================================================================
+# service computes visibility from settings (Angular Jest)
+# =============================================================================
+
+[[story]]
+id = "frontend_savedview_visibility_from_user_settings"
+driver = "jest"
+script_extension = ".spec.ts"
+description = """
+On the frontend, the dashboard / sidebar visibility of a saved view
+respects the current user's settings.
+"""
+procedure = """
+Write a Jest test that exercises Angular's TestBed against the
+agent's saved-view + settings services.
+
+Top of file:
+
+    // @ts-nocheck
+    import { getTestCases } from './validationParams';
+    import { TestBed } from '@angular/core/testing';
+    import {
+      provideHttpClient,
+      withInterceptorsFromDi,
+    } from '@angular/common/http';
+    import {
+      provideHttpClientTesting,
+      HttpTestingController,
+    } from '@angular/common/http/testing';
+
+Imports the agent must add (read the agent's diff to find the
+exact paths — these classes are pre-existing under
+``src-ui/src/app/services/``; only the visibility logic inside
+``SavedViewService`` is rewritten by the agent):
+
+    import { SavedViewService } from 'src/app/services/rest/saved-view.service';
+    import { SettingsService } from 'src/app/services/settings.service';
+
+Use ``test.each(getTestCases())`` so every case runs as a separate
+Jest test. Per case:
+
+1. Build a stub ``SettingsService`` whose ``get(key)`` matches the
+   key string by substring (the agent introduces new SETTINGS_KEYS
+   constants for view visibility; the exact constant name is not
+   prescribed — use substring match):
+   - return ``inputs.dashboard_visible_ids`` when ``key`` (lowercased)
+     contains both ``"dashboard"`` and ``"visible"``;
+   - return ``inputs.sidebar_visible_ids`` when ``key`` (lowercased)
+     contains both ``"sidebar"`` and ``"visible"``;
+   - return ``[]`` when ``key`` (lowercased) contains ``"sort"`` or
+     ``"order"`` (covers the pre-existing
+     ``DASHBOARD_VIEWS_SORT_ORDER`` / ``SIDEBAR_VIEWS_SORT_ORDER``
+     constants the service also reads);
+   - return sensible defaults (empty array, ``false``, etc.) for any
+     other key.
+   The stub also has a writable boolean property
+   ``dashboardIsEmpty`` (the real service exposes it).
+2. Configure TestBed with providers:
+       providers: [
+         provideHttpClient(withInterceptorsFromDi()),
+         provideHttpClientTesting(),
+         { provide: SettingsService, useValue: stubSettings },
+       ]
+3. Inject ``service = TestBed.inject(SavedViewService)`` and
+   ``http = TestBed.inject(HttpTestingController)``.
+4. Call ``service.list()`` (the pre-existing public list method) and
+   subscribe to it. Then expect ONE outstanding HTTP request matching
+   the saved-views API path; flush it with a Results envelope:
+
+       {
+         count: inputs.api_response_views.length,
+         results: inputs.api_response_views,
+         all: inputs.api_response_views.map((v) => v.id),
+       }
+
+   The fed objects contain ``{id, name, sort_field}`` — neither
+   ``show_on_dashboard`` NOR ``show_in_sidebar`` is present on the
+   API payload. Call ``http.verify()`` afterwards.
+5. Read ``service.dashboardViews`` and ``service.sidebarViews``
+   (pre-existing public getters). Map each to its array of ids,
+   sorted ascending: ``service.dashboardViews.map(v => v.id).sort()``.
+
+EXPECTED checks:
+- EXPECTED: the sorted dashboard id list equals expected.dashboard_view_ids.
+- EXPECTED: the sorted sidebar id list equals expected.sidebar_view_ids.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+api_response_views = [
+    { id = 7,  name = "v_seven"  },
+    { id = 11, name = "v_eleven" },
+    { id = 13, name = "v_thirteen" },
+]
+dashboard_visible_ids = [7, 11]
+sidebar_visible_ids = [13]
+[story.test_case.expected]
+dashboard_view_ids = [7, 11]
+sidebar_view_ids = [13]
+
+[[story.test_case]]
+[story.test_case.inputs]
+api_response_views = [
+    { id = 7,  name = "v_seven"  },
+    { id = 11, name = "v_eleven" },
+    { id = 13, name = "v_thirteen" },
+]
+dashboard_visible_ids = []
+sidebar_visible_ids = [7, 11, 13]
+[story.test_case.expected]
+dashboard_view_ids = []
+sidebar_view_ids = [7, 11, 13]
+
+[[story.test_case]]
+[story.test_case.inputs]
+api_response_views = [
+    { id = 4,  name = "v_four"  },
+    { id = 9,  name = "v_nine"  },
+]
+dashboard_visible_ids = [4]
+sidebar_visible_ids = [9]
+[story.test_case.expected]
+dashboard_view_ids = [4]
+sidebar_view_ids = [9]
+
+
+# =============================================================================
+# pass_to_pass: owner-only CRUD continues to work
+# =============================================================================
+
+[[story]]
+id = "owner_crud_round_trip_still_works"
+driver = "pytest"
+description = """
+Existing owner-only saved-view CRUD continues to work.
+"""
+procedure = """
+Imports:
+
+    import sys
+    sys.path.insert(0, "/tests/validate")
+    from test_harness import api_client, make_user
+
+Steps:
+
+1. Create one ``owner`` via
+   ``make_user(f"owner_{inputs['name']}", model_perms=["view_savedview", "change_savedview", "add_savedview", "delete_savedview"])``.
+   Using ``inputs["name"]`` in the username ensures uniqueness across
+   parameterised test cases (avoids UNIQUE constraint violations).
+2. Authenticate ``api_client`` as ``owner``.
+3. POST to ``/api/saved_views/`` with body:
+       {"name": inputs["name"],
+        "sort_field": inputs["sort_field"],
+        "filter_rules": [{"rule_type": 4,
+                          "value": inputs["filter_value"]}],
+        "show_on_dashboard": false,
+        "show_in_sidebar": false}
+   The ``show_on_dashboard`` and ``show_in_sidebar`` keys are included
+   so the POST succeeds on pre-fix code (where both are required
+   BooleanFields). Oracle code ignores these extra keys silently since
+   those fields are removed from the serializer post-refactor.
+   Use ``format="json"``. Read ``response.status_code`` and the new
+   ``id`` from ``response.data["id"]``.
+   - EXPECTED: response.status_code equals ``expected["create_status"]``.
+4. GET ``/api/saved_views/`` and read ``response.data["count"]``.
+   - EXPECTED: equals ``expected["list_count"]``.
+5. GET ``/api/saved_views/<id>/`` and read the response body.
+   - EXPECTED: ``response.data["name"]`` equals expected["expected_name"].
+   - EXPECTED: ``response.data["sort_field"]`` equals expected["expected_sort_field"].
+   - EXPECTED: ``len(response.data["filter_rules"])`` equals expected["expected_rule_count"].
+6. PATCH ``/api/saved_views/<id>/`` with ``{"sort_reverse": true}`` and
+   read ``response.status_code``.
+   - EXPECTED: equals ``expected["patch_status"]``.
+7. DELETE ``/api/saved_views/<id>/`` and read ``response.status_code``.
+   - EXPECTED: equals ``expected["delete_status"]``.
+8. GET ``/api/saved_views/`` again and read ``response.data["count"]``.
+   - EXPECTED: equals ``expected["post_delete_count"]``.
+
+This story is pass_to_pass — the agent must NOT break owner-only CRUD
+while introducing sharing. (It also doubles as a positive control on
+the sharing changes since any malformed serializer would break this.)
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "alpha_view"
+sort_field = "created"
+filter_value = "alpha"
+[story.test_case.expected]
+create_status = 201
+list_count = 1
+expected_name = "alpha_view"
+expected_sort_field = "created"
+expected_rule_count = 1
+patch_status = 200
+delete_status = 204
+post_delete_count = 0
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "beta_view"
+sort_field = "added"
+filter_value = "beta"
+[story.test_case.expected]
+create_status = 201
+list_count = 1
+expected_name = "beta_view"
+expected_sort_field = "added"
+expected_rule_count = 1
+patch_status = 200
+delete_status = 204
+post_delete_count = 0
+
+[[story.test_case]]
+[story.test_case.inputs]
+name = "gamma_view"
+sort_field = "title"
+filter_value = "gamma"
+[story.test_case.expected]
+create_status = 201
+list_count = 1
+expected_name = "gamma_view"
+expected_sort_field = "title"
+expected_rule_count = 1
+patch_status = 200
+delete_status = 204
+post_delete_count = 0
+
+
+# =============================================================================
+# migration data-preservation (senior nuance: the upgrade must MOVE visibility
+# data into per-user settings, not just drop the boolean columns; downgrade
+# restores it). Gated here behaviorally because the verifier only checks that
+# SOME migration exists, and a RemoveField-only migration would pass that.
+# =============================================================================
+
+[[story]]
+id = "migration_preserves_view_visibility_through_upgrade_and_downgrade"
+driver = "pytest"
+description = """
+Upgrading preserves each user's existing dashboard/sidebar saved-view
+visibility: a view a user had pinned to their dashboard before the upgrade
+stays pinned afterwards (visibility is now carried per user, so the upgrade
+must migrate the existing data rather than drop it), and downgrading restores
+the original per-view state.
+"""
+procedure = """
+A Django data-migration story. Read /tests/validate/test_harness.py and use its
+migration helpers (framework mechanics — none pin task-introduced names):
+- ``setup_django()``
+- ``PRE_VISIBILITY_MIGRATION`` — the documents migration BEFORE the visibility move.
+- ``discover_visibility_migration()`` — returns the implementing agent's NEW documents
+  migration (the one immediately after ``PRE_VISIBILITY_MIGRATION``); do NOT hardcode it.
+- ``migrate_documents_to(target)`` — migrate the ``documents`` app to ``target`` and
+  return the historical ``apps`` registry for that state (use ``apps.get_model(...)``).
+
+Mark the test ``@pytest.mark.django_db(transaction=True, databases="__all__")`` (a data
+migration cannot run inside the default atomic test wrapper).
+
+Steps:
+1. ``target = discover_visibility_migration()``.
+2. Migrate DOWN to the pre-visibility state and build pre-upgrade data through the
+   HISTORICAL models, where the boolean visibility fields still exist::
+
+       apps = migrate_documents_to(PRE_VISIBILITY_MIGRATION)
+       User = apps.get_model("auth", "User")
+       SavedView = apps.get_model("documents", "SavedView")
+       owner = User.objects.create(username=inputs["owner"])
+       dash = SavedView.objects.create(owner=owner, name=inputs["dashboard_view"],
+                                       show_on_dashboard=True, show_in_sidebar=False)
+       side = SavedView.objects.create(owner=owner, name=inputs["sidebar_view"],
+                                       show_on_dashboard=False, show_in_sidebar=True)
+
+   Set any OTHER not-null columns the historical SavedView requires (read the model;
+   ``name``, ``owner`` and the two boolean flags are the ones this story asserts on).
+   Record ``owner_id``, ``dash_id = dash.id``, ``side_id = side.id``.
+3. Migrate UP to the agent's migration: ``migrate_documents_to(target)``. The boolean
+   columns are now gone; visibility lives in per-user UiSettings.
+4. Read the owner's persisted UiSettings through the post-migration historical model and
+   DISCOVER the visibility lists WITHOUT pinning the agent's key names::
+
+       apps2 = migrate_documents_to(target)
+       UiSettings = apps2.get_model("documents", "UiSettings")
+       settings = UiSettings.objects.get(user_id=owner_id).settings  # a JSON dict
+
+   Recursively walk ``settings`` and collect, from every (key, list-value) pair,
+   the integer ids under any KEY whose name contains the substring "dashboard"
+   (case-insensitive) into ``dashboard_ids`` and likewise "sidebar" into ``sidebar_ids``.
+   (The agent chooses the settings key names — match by the dashboard/sidebar substring,
+   the same way the frontend story discovers them.)
+5. Migrate DOWN again to ``PRE_VISIBILITY_MIGRATION`` and read the restored boolean::
+
+       apps3 = migrate_documents_to(PRE_VISIBILITY_MIGRATION)
+       restored_dash = apps3.get_model("documents", "SavedView").objects.get(
+           id=dash_id).show_on_dashboard
+
+Assert:
+- EXPECTED: ``(dash_id in dashboard_ids)`` equals expected["dashboard_view_preserved"]
+  (the dashboard-pinned view's id survived into the per-user dashboard visibility list).
+- EXPECTED: ``(dash_id in sidebar_ids)`` equals expected["dashboard_view_in_sidebar"]
+  (the dashboard-only view must NOT have leaked into the sidebar list).
+- EXPECTED: ``(side_id in sidebar_ids)`` equals expected["sidebar_view_preserved"].
+- EXPECTED: ``restored_dash`` equals expected["downgrade_restores_dashboard_boolean"]
+  (the reverse migration restored the original show_on_dashboard=True).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+owner = "mig_owner_1"
+dashboard_view = "Q1 Dashboard"
+sidebar_view = "Inbox Sidebar"
+[story.test_case.expected]
+dashboard_view_preserved = true
+dashboard_view_in_sidebar = false
+sidebar_view_preserved = true
+downgrade_restores_dashboard_boolean = true
+
+[[story.test_case]]
+[story.test_case.inputs]
+owner = "mig_owner_2"
+dashboard_view = "Monthly Reports"
+sidebar_view = "Starred Docs"
+[story.test_case.expected]
+dashboard_view_preserved = true
+dashboard_view_in_sidebar = false
+sidebar_view_preserved = true
+downgrade_restores_dashboard_boolean = true

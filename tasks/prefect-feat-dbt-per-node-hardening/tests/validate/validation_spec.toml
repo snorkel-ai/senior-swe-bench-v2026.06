@@ -1,0 +1,442 @@
+stack_profile = "python-library"
+
+instructions = """
+General environment for every story in this task.
+
+ENVIRONMENT
+- The Prefect repo is at /repo/prefect. The prefect-dbt integration package
+  lives at /repo/prefect/src/integrations/prefect-dbt with its own venv at
+  /repo/prefect/src/integrations/prefect-dbt/.venv.
+- validation-setup.sh has already activated the venv and installed
+  prefect-dbt in editable mode plus pytest, pytest-asyncio, dbt-duckdb and
+  duckdb. Tests can `import prefect`, `import prefect_dbt`, etc. directly.
+- conftest_override.py opens an autouse session-scoped Prefect ephemeral
+  server (via prefect.testing.utilities.prefect_test_harness). Every @flow
+  invocation inside a story runs against that server — no further fixture
+  argument is needed. The same server backs the flow-run / task-run reads
+  the graph-edge story performs.
+
+TEST HARNESS
+- A test_harness module is available at /tests/validate/test_harness.py and is
+  on PYTHONPATH automatically. Each story should `import test_harness as th`.
+- Available helpers (full docstrings in the file):
+    * make_mock_executor_per_node(success=True, fail_nodes=None, artifacts=None)
+        MagicMock whose `execute_node` is counted. Wraps the prefect-dbt
+        repo's pre-existing `_make_mock_executor_per_node`.
+    * make_mock_settings(project_dir)  -> mock PrefectDbtSettings.
+    * write_manifest(project_dir, data) -> Path to manifest.json.
+    * write_sql_files(project_dir, file_map) -> materialise SQL/macro files.
+    * build_per_node_orchestrator(*, project_dir, manifest_path, executor,
+        cache=None, test_strategy=None, **extra)
+        Construct a PER_NODE PrefectDbtOrchestrator with a
+        ThreadPoolTaskRunner. `**extra` forwards extra pre-existing ctor
+        kwargs (e.g. a discovered failure opt-out parameter).
+    * make_cache_config(result_storage, key_storage) -> pre-existing
+        CacheConfig with persistent file storage (result_storage as Path,
+        key_storage as str).
+    * immediate_test_strategy() -> the pre-existing TestStrategy.IMMEDIATE.
+    * build_real_dbt_orchestrator(tmp_path, **kwargs) -> orchestrator over a
+        real copy of the bundled DuckDB project (real settings + parsed
+        manifest); defaults to TestStrategy.SKIP.
+    * run_in_flow(orchestrator, **run_kwargs) -> run_build() inside a @flow.
+    * run_twice_in_flow(orchestrator) -> (r1, r2) from two run_build() calls
+        in one @flow.
+    * run_build_capturing_flow_id(orchestrator, **run_kwargs)
+        -> (result, flow_run_id) — runs inside a @flow and records the active
+        flow run id.
+    * fetch_task_runs(flow_run_id) -> list of TaskRun objects for that flow.
+    * wait_for_upstream_names(task_runs) -> dict mapping each task-run name to
+        the sorted names of its `wait_for` upstream task runs.
+    * count_task_runs_with_wait_for(task_runs) -> int.
+    * discover_failure_optout(orch_cls) -> (param_name, non_raising_value) or
+        None. Substring discovery of the boolean fail-on-error opt-out
+        parameter; the non-raising value is `not default`.
+    * exception_haystack(exc) -> a broad searchable string built from an
+        exception's message and string/collection attributes.
+    * capture_prefect_dbt_logs() -> context manager that captures WARN/ERROR
+        log records emitted anywhere in the block (used to check that a
+        silenced preview still surfaces genuine warnings via logging).
+    * surfaced_messages(records, substring=None) -> messages of the captured
+        WARN/ERROR records, optionally filtered to those containing `substring`
+        (e.g. the selector value the test itself supplied).
+
+DISCOVERY
+- The implementation owns the NAME of the failure opt-out parameter and the
+  NAME/type of the failure exception class. Stories never hard-code these:
+  use `discover_failure_optout` for the opt-out, and catch a broad
+  `Exception` for the raise (then assert the failed node id is referenced via
+  `exception_haystack`).
+- The graph-edge behaviour is observable only through Prefect's persisted
+  task-run metadata (`task_inputs["wait_for"]`); stories read it through the
+  Prefect client, never through orchestrator internals.
+
+TEST AUTHORING CONVENTION
+- Each story's procedure defines exactly one pytest test function that takes
+  `inputs` and `expected` as fixture arguments (the driver parametrizes them
+  from the story's test cases).
+- Wrap orchestrator runs in `th.run_in_flow(orch)` (or a helper that does) —
+  PER_NODE execution requires an active flow context.
+- Use a fresh tmp_path-style directory for each test case to avoid cross-case
+  storage interference.
+- Run only the assertions described in the procedure — do not add extra
+  exploratory assertions that may differ across implementations.
+
+DO NOT MODIFY /repo/prefect. The validation orchestrator zeros the score if
+the source tree changes between setup and verification.
+"""
+
+[settings]
+va_max_turns = 70
+va_timeout_sec = 1800
+script_timeout_sec = 900
+
+[settings.pytest]
+python = "/repo/prefect/src/integrations/prefect-dbt/.venv/bin/python"
+
+
+# =============================================================================
+# Story 1: failure_raises_and_fails_flow (basic, fail-to-pass)
+# =============================================================================
+
+[[story]]
+id = "failure_raises_and_fails_flow"
+driver = "pytest"
+description = """
+A per-node dbt build where a node errors should fail the flow by default.
+"""
+procedure = """
+- import tempfile, pathlib
+- import test_harness as th
+- Build a linear chain a -> b -> c (3 model nodes):
+    nodes:
+      model.test.a: depends_on nodes [], config materialized "table",
+                    original_file_path "models/a.sql"
+      model.test.b: depends_on nodes ["model.test.a"], same shape,
+                    original_file_path "models/b.sql"
+      model.test.c: depends_on nodes ["model.test.b"], same shape,
+                    original_file_path "models/c.sql"
+    sources: {}
+- Use tempfile.TemporaryDirectory() as project_dir. Write the SQL files via
+  th.write_sql_files(project_dir, {"models/a.sql": "select 1",
+  "models/b.sql": "select 2", "models/c.sql": "select 3"}) and write the
+  manifest with th.write_manifest(project_dir, manifest_data).
+- Build the orchestrator with DEFAULT failure behaviour (do NOT pass any
+  opt-out kwarg), forcing node inputs["fail_node"] to fail:
+    executor = th.make_mock_executor_per_node(
+        fail_nodes={inputs["fail_node"]})
+    orch = th.build_per_node_orchestrator(
+        project_dir=project_dir, manifest_path=manifest, executor=executor,
+        write_run_results=True)
+    # write_run_results is a pre-existing constructor option; enabling it makes
+    # the post-run artifact step write a run_results.json, so the test can
+    # observe whether artifacts were created before any failure escalated.
+- Run the build and observe the outcome:
+    observed_outcome = None
+    haystack = ""
+    try:
+        th.run_in_flow(orch)
+        observed_outcome = "returned"
+    except Exception as exc:        # any exception type is acceptable
+        observed_outcome = "raised"
+        haystack = th.exception_haystack(exc)
+- After observing the outcome, count the post-run artifacts left on disk:
+    observed_artifact_files = len(
+        list(pathlib.Path(project_dir).rglob("run_results.json")))
+- EXPECTED: observed_outcome equals expected["outcome"] (which is "raised") —
+  the default build escalates a node error into an exception rather than
+  returning a dict. A no-op implementation returns the dict, so
+  observed_outcome would be "returned".
+- EXPECTED: the failed node id expected["failed_node_referenced"] appears in
+  `haystack` — the raised failure makes the failed node identifiable. Assert
+  `expected["failed_node_referenced"] in haystack` only when
+  observed_outcome == "raised".
+- EXPECTED: observed_artifact_files is at least expected["min_artifact_files"]
+  (1); assert observed_artifact_files >= expected["min_artifact_files"]. The
+  build still wrote its post-run artifacts before escalating the failure. An
+  implementation that raises before creating artifacts leaves no
+  run_results.json, so observed_artifact_files would be 0.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+fail_node = "model.test.a"
+[story.test_case.expected]
+outcome = "raised"
+failed_node_referenced = "model.test.a"
+min_artifact_files = 1
+
+[[story.test_case]]
+[story.test_case.inputs]
+fail_node = "model.test.b"
+[story.test_case.expected]
+outcome = "raised"
+failed_node_referenced = "model.test.b"
+min_artifact_files = 1
+
+
+# =============================================================================
+# Story 2: failure_returns_dict_when_opted_out (fail-to-pass)
+# =============================================================================
+
+[[story]]
+id = "failure_returns_dict_when_opted_out"
+driver = "pytest"
+description = """
+Callers should be able to opt out and inspect a partial-failure build instead
+of having it raise. It should return the legacy results map vs. error when the
+opt-out is enabled.
+"""
+procedure = """
+- import tempfile, pathlib, pytest
+- import test_harness as th
+- from prefect_dbt.core._orchestrator import PrefectDbtOrchestrator
+- Discover the opt-out parameter:
+    optout = th.discover_failure_optout(PrefectDbtOrchestrator)
+    if optout is None:
+        pytest.skip("no failure opt-out parameter exposed")
+    optout_name, non_raising_value = optout
+- Build the same linear chain a -> b -> c as in
+  failure_raises_and_fails_flow (3 model nodes; b depends on a, c depends on
+  b). Use a tempfile.TemporaryDirectory project_dir; write the SQL files and
+  the manifest.
+- Build the orchestrator with the opt-out set to the non-raising value and
+  node inputs["fail_node"] forced to fail:
+    executor = th.make_mock_executor_per_node(
+        fail_nodes={inputs["fail_node"]})
+    orch = th.build_per_node_orchestrator(
+        project_dir=project_dir, manifest_path=manifest, executor=executor,
+        **{optout_name: non_raising_value})
+- result = th.run_in_flow(orch)   # must NOT raise
+- Compute observed_fail_status = result[inputs["fail_node"]]["status"] and
+  observed_downstream_status =
+  result[inputs["downstream_node"]]["status"].
+- EXPECTED: observed_fail_status equals expected["fail_status"] ("error") —
+  the failed node is reported, not raised.
+- EXPECTED: observed_downstream_status equals
+  expected["downstream_status"] ("skipped") — the downstream dependent is
+  skipped as a consequence of the upstream failure.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+fail_node = "model.test.a"
+downstream_node = "model.test.b"
+[story.test_case.expected]
+fail_status = "error"
+downstream_status = "skipped"
+
+[[story.test_case]]
+[story.test_case.inputs]
+fail_node = "model.test.b"
+downstream_node = "model.test.c"
+[story.test_case.expected]
+fail_status = "error"
+downstream_status = "skipped"
+
+
+# =============================================================================
+# Story 3: immediate_test_edge_model_caches (basic, fail-to-pass)
+# =============================================================================
+
+[[story]]
+id = "immediate_test_edge_model_caches"
+driver = "pytest"
+description = """
+Under per-node cross-run caching with the immediate test strategy, a model
+that has an upstream data test never gets treated as cached on an identical
+second run. It re-executes every time, unlike any other unchanged model. Need
+to fix that.
+"""
+procedure = """
+- import tempfile, pathlib
+- import test_harness as th
+- Build a chain root -> mid -> leaf plus a data test on root:
+    nodes:
+      model.test.root: depends_on nodes [], config materialized "table",
+                       original_file_path "models/root.sql"
+      model.test.mid:  depends_on nodes ["model.test.root"], same shape,
+                       original_file_path "models/mid.sql"
+      model.test.leaf: depends_on nodes ["model.test.mid"], same shape,
+                       original_file_path "models/leaf.sql"
+      test.test.not_null_root_id: resource_type "test",
+                       depends_on nodes ["model.test.root"], config {},
+                       original_file_path "tests/not_null_root.sql"
+    sources: {}
+- Use a tempfile.TemporaryDirectory project_dir. Write SQL files:
+    {"models/root.sql": "SELECT 1 AS id",
+     "models/mid.sql": "SELECT * FROM {{ ref('root') }}",
+     "models/leaf.sql": "SELECT * FROM {{ ref('mid') }}",
+     "tests/not_null_root.sql":
+        "SELECT id FROM {{ ref('root') }} WHERE id IS NULL"}
+  and write the manifest.
+- Inside project_dir, create two persistent storage directories
+  (e.g. project_dir/"results" and project_dir/"keys", via mkdir) and build a
+  cache config: cache = th.make_cache_config(results_dir, keys_dir).
+- Build the orchestrator with caching and the immediate test strategy:
+    executor = th.make_mock_executor_per_node()
+    orch = th.build_per_node_orchestrator(
+        project_dir=project_dir, manifest_path=manifest, executor=executor,
+        cache=cache, test_strategy=th.immediate_test_strategy())
+- Run the build twice in one flow: r1, r2 = th.run_twice_in_flow(orch).
+- For node id `model.test.mid`, compute observed_mid_run1 =
+  r1["model.test.mid"]["status"] and observed_mid_run2 =
+  r2["model.test.mid"]["status"]. Also compute observed_leaf_run2 =
+  r2["model.test.leaf"]["status"] and observed_root_run2 =
+  r2["model.test.root"]["status"], and observed_test_run2 =
+  r2["test.test.not_null_root_id"]["status"].
+- EXPECTED: observed_mid_run1 equals expected["mid_run1"] ("success").
+- EXPECTED: observed_mid_run2 equals expected["mid_run2"] ("cached") — the
+  test-dependent model becomes cached on the identical second run. A no-op
+  implementation leaves mid at "success" on run 2 (it re-executes forever).
+- EXPECTED: observed_root_run2 equals expected["root_run2"] ("cached") — the
+  upstream model caches normally.
+- EXPECTED: observed_leaf_run2 equals expected["leaf_run2"] ("cached") — the
+  downstream model caches normally.
+- EXPECTED: observed_test_run2 equals expected["test_run2"] ("success") —
+  test nodes are excluded from caching and still run.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+graph = "root_mid_leaf_plus_root_test"
+[story.test_case.expected]
+mid_run1 = "success"
+mid_run2 = "cached"
+root_run2 = "cached"
+leaf_run2 = "cached"
+test_run2 = "success"
+
+
+# =============================================================================
+# Story 4: per_node_graph_edges_persisted (basic, fail-to-pass)
+# =============================================================================
+
+[[story]]
+id = "per_node_graph_edges_persisted"
+driver = "pytest"
+description = """
+In per-node mode the flow-run graph should show the real dependency edges for
+dbt nodes (like normal DAG does).
+"""
+procedure = """
+- import tempfile, pathlib, json
+- import test_harness as th
+- Build a manifest of model nodes according to inputs["graph"]. Each node is
+  config materialized "table"; sources: {}. Two shapes:
+    * "diamond_plus_independent": root -> {left, right} -> leaf, plus one fully
+      independent node `lonely` with no upstreams (5 model nodes):
+        model.test.root: depends_on nodes []
+        model.test.left: depends_on nodes ["model.test.root"]
+        model.test.right: depends_on nodes ["model.test.root"]
+        model.test.leaf: depends_on nodes ["model.test.left","model.test.right"]
+        model.test.lonely: depends_on nodes []
+    * "three_independent": three fully independent nodes, each depends_on []:
+        model.test.a, model.test.b, model.test.c
+- Use a tempfile.TemporaryDirectory project_dir; write the manifest (SQL files
+  are not required for this mock-executor run).
+- executor = th.make_mock_executor_per_node()
+  orch = th.build_per_node_orchestrator(
+      project_dir=project_dir, manifest_path=manifest, executor=executor)
+- result, flow_run_id = th.run_build_capturing_flow_id(orch)
+- task_runs = th.fetch_task_runs(flow_run_id)
+- edges = th.wait_for_upstream_names(task_runs)
+  # edges maps a task-run NAME -> sorted list of upstream task-run NAMES.
+  # The orchestrator names each task run "<command> <node name>", e.g.
+  # "model root", "model left", "model lonely", "model a".
+- EXPECTED: parse expected["edges_json"] as JSON into expected_edges, then build
+  observed_edges = {name: sorted(edges.get(name, [])) for name in expected_edges}
+  and assert observed_edges == expected_edges — every node's persisted upstream
+  task-run names match its real dbt upstreams. The diamond's leaf has both branch
+  nodes; root and any independent node (`lonely`, or all of a/b/c) have NONE. A
+  no-op implementation persists no dependencies (every list empty, so the diamond
+  case fails); an implementation that over-adds edges gives an independent node a
+  non-empty list (so the three_independent case fails).
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+graph = "diamond_plus_independent"
+[story.test_case.expected]
+edges_json = '{"model root": [], "model left": ["model root"], "model right": ["model root"], "model leaf": ["model left", "model right"], "model lonely": []}'
+
+[[story.test_case]]
+[story.test_case.inputs]
+graph = "three_independent"
+[story.test_case.expected]
+edges_json = '{"model a": [], "model b": [], "model c": []}'
+
+
+# =============================================================================
+# Story 5: plan_stdout_is_clean (fail-to-pass, real dbt-duckdb)
+# =============================================================================
+
+[[story]]
+id = "plan_stdout_is_clean"
+driver = "pytest"
+description = """
+Previewing a build (dry-run plan) shouldn't leak dbt's console progress
+output to the caller's stdout.
+"""
+procedure = """
+- import test_harness as th
+- This story uses a REAL dbt-duckdb project, so dbt actually emits its console
+  output unless it is silenced.
+- Build a real orchestrator over the bundled DuckDB project (this copies the
+  project, writes a DuckDB profiles.yml, and runs `dbt parse`):
+    orch = th.build_real_dbt_orchestrator(tmp_path)
+  (use pytest's `tmp_path` fixture for the per-test directory).
+- Drain anything fixtures/setup may have written to the captured streams:
+    capfd.readouterr()
+- Call the preview so selector resolution (internal `dbt ls`) actually runs,
+  while capturing any WARN/ERROR the orchestrator re-surfaces through logging.
+  Branch on the case's selector:
+    selector = inputs["selector"]
+    with th.capture_prefect_dbt_logs() as records:
+        try:
+            if inputs["selector_kind"] == "exclude":
+                orch.plan(exclude=selector)
+            else:
+                orch.plan(select=selector)
+        except Exception:
+            pass   # an empty selection may or may not raise; visibility is
+                   # judged from what was surfaced before any raise
+- Capture output: captured = capfd.readouterr()
+- The markers that dbt's console logger emits at info level are:
+    markers = ["Found ", "Registered adapter", "Running with dbt=",
+               "Concurrency:"]
+- Compute observed_leaked = sorted([m for m in markers
+    if m in captured.out or m in captured.err]).
+- Compute observed_surfaced — the number of captured WARN/ERROR records that
+  mention the selector value THIS test supplied (not any guessed wording of
+  dbt's message): observed_surfaced =
+    len(th.surfaced_messages(records, substring=inputs["selector"])).
+  (dbt echoes the offending selector verbatim in its "selection matched no
+  nodes" event, so filtering by the test's own input ties the surfaced warning
+  to its cause without coupling to dbt's phrasing.)
+- EXPECTED: len(observed_leaked) equals expected["leaked_marker_count"] (0) —
+  no dbt console progress output reaches the caller's stdout or stderr in
+  either case. A no-op implementation leaks at least one marker (e.g. "Found ").
+- EXPECTED: observed_surfaced is at least expected["min_surfaced_warnings"];
+  assert observed_surfaced >= expected["min_surfaced_warnings"]. For the clean
+  case this is 0 (a matching selector has nothing to surface). For the no-match
+  case this is 1 — the warning about the selector that matched nothing is still
+  surfaced to the caller even though the console is silenced. A solution that
+  silences the console by discarding all dbt output, genuine warnings included,
+  surfaces 0 and fails the no-match case.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+selector_kind = "exclude"
+selector = "resource_type:seed"
+[story.test_case.expected]
+leaked_marker_count = 0
+min_surfaced_warnings = 0
+
+[[story.test_case]]
+[story.test_case.inputs]
+selector_kind = "select"
+selector = "model_does_not_exist_zzz"
+[story.test_case.expected]
+leaked_marker_count = 0
+min_surfaced_warnings = 1

@@ -1,0 +1,24 @@
+{
+  "files": [
+    "packages/sync-service/lib/electric/replication/shape_log_collector.ex",
+    "packages/sync-service/lib/electric/replication/shape_log_collector/flush_tracker.ex",
+    "packages/sync-service/lib/electric/shapes/consumer.ex",
+    "packages/sync-service/lib/electric/shapes/consumer/state.ex"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "flush_acknowledgement_deferred_during_pending_txn",
+      "description": "The Consumer defers storage-flush acknowledgements while a multi-fragment transaction is in flight. Concretely: when `{ShapeCache.Storage, :flushed, offset}` (or equivalent) arrives at a Consumer process whose state indicates a pending transaction (e.g. `state.pending_txn` is non-nil), the Consumer does NOT call `ShapeLogCollector.notify_flushed/3` immediately. Instead it holds the offset until the commit fragment is processed, then emits the notification at the commit fragment's offset (aligned via `align_offset_to_txn_boundary/2` or equivalent). A diff that continues to call `notify_flushed/3` immediately on every storage-flush message — regardless of pending-txn state — does NOT satisfy this criterion."
+    },
+    {
+      "name": "all_terminal_txn_paths_emit_deferred_flush",
+      "description": "All three terminal paths for a pending multi-fragment transaction emit any deferred flush notification — none is silently dropped. The three terminal paths are: (1) commit fragment with relevant changes for this shape, (2) transaction dropped/skipped entirely (already covered by snapshot or filtered out), (3) commit fragment with no relevant changes for this shape. A fix that only handles path (1) — and leaves paths (2) and (3) without the deferred-emit logic — still allows the flush boundary to freeze in those paths. Each terminal path must clear the deferred flush offset and call `notify_flushed/3` if a deferred offset was recorded."
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "single_fragment_flush_not_regressed",
+      "description": "For single-fragment transactions (begin + commit in one fragment), the Consumer continues to report storage-flush notifications immediately, exactly as before. The new deferral path must be gated on a genuine in-flight multi-fragment transaction (e.g. `state.pending_txn != nil`) and must not trigger for single-fragment or already-committed transactions. A diff that introduces an unconditional deferral — or a deferral that fires on single-fragment transactions because the gating condition is too broad — regresses the flush boundary for the common case and is rejected by this criterion."
+    }
+  ]
+}

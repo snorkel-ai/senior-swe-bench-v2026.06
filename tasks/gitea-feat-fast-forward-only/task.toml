@@ -1,0 +1,159 @@
+version = "1.0"
+
+[environment]
+base_image = "gitea-feat-fast-forward-only:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1200.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "gitea"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "gitea"
+
+[metadata]
+family = "gitea-feat-fast-forward-only"
+variant = "hard"
+segment = "design"
+repo = "gitea"
+tags = ["gitea", "go"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Gitea lets a repository require signed commits on a protected branch. With
+that protection on, every pull-request merge style is currently refused
+unless the Gitea instance itself has a signing key configured — the merge
+pre-check insists that Gitea will be able to sign the resulting commit.
+
+That is wrong for the fast-forward-only merge style. A fast-forward-only
+merge does not create any new Gitea commit; it simply advances the base
+branch pointer to the pull request's head commits. There is nothing for
+Gitea to sign. As long as the head commits the user is bringing in are
+already verified, a fast-forward-only merge should be allowed even when the
+instance has no signing key.
+
+Make fast-forward-only merges work under "require signed commits", while
+keeping the protection meaningful: the head commits being fast-forwarded
+must themselves be verified.
+"""
+context = """The merge pre-check lives in `services/pull/check.go`:
+`CheckPullMergeable` runs the full gate (branch protection, mergeable state,
+signing, dependencies) before a merge is performed by either the web merge
+handler (`routers/web/repo/pull.go`) or the API merge handler
+(`routers/api/v1/repo/pull.go`), and also by the scheduled auto-merge path
+(`services/automerge/automerge.go`).
+
+The signing portion of that gate currently calls a helper that asks
+`asymkey_service.SignMerge` whether the merge can be signed. When the
+protected branch has `RequireSignedCommits` enabled and the instance has no
+signing key (`[repository.signing] SIGNING_KEY = none`), `SignMerge` returns
+an `ErrWontSign{nokey}` error whose message is `wont sign: nokey`, and the
+merge is refused — for *all* styles, including fast-forward-only.
+
+`SignMerge` already contains the logic to walk a pull request's head commits
+and confirm each one is verified (its `commitssigned` rule). That commit-walk
+is the piece that matters for fast-forward-only: the only signing-related
+requirement that genuinely applies to a fast-forward is that the head commits
+are verified.
+
+Merge styles available: `merge`, `rebase`, `rebase-merge`, `squash`,
+`fast-forward-only` (constants on `repo_model.MergeStyle`). Rebase/squash
+rewrite the user's commits and have Gitea re-sign them, so they genuinely
+need Gitea to be able to sign. A regular `merge` creates a Gitea merge commit
+*and* keeps the user's head commits on the branch.
+"""
+solution = """Canonical fix (PR #37335, 6 source files):
+
+1. `services/pull/check.go` — give `CheckPullMergeable` a new
+   `mergeStyle repo_model.MergeStyle` parameter. Replace `isSignedIfRequired`
+   with `checkSigningRequirements(ctx, pr, doer, mergeStyle)`. When the base
+   branch requires signed commits:
+     - for `fast-forward-only` and `merge`: require that all head commits are
+       verified, else return a new sentinel error
+       `ErrHeadCommitsNotAllVerified`;
+     - for every style EXCEPT `fast-forward-only`: also require that Gitea can
+       sign the merge commit (call `SignMerge`, propagate its error).
+   Add `ErrHeadCommitsNotAllVerified` to the package error set.
+
+2. `services/asymkey/sign.go` — extract the head-commit verification walk out
+   of `SignMerge`'s `commitssigned` case into an exported helper
+   `AllHeadCommitsVerified(ctx, pr, gitRepo) (bool, error)` and have the
+   `commitssigned` case call it.
+
+3. `routers/web/repo/pull.go` — pass `repo_model.MergeStyle(form.Do)` into
+   `CheckPullMergeable`; map `ErrHeadCommitsNotAllVerified` to a localized
+   JSON error using a new locale key.
+
+4. `routers/api/v1/repo/pull.go` — pass `repo_model.MergeStyle(form.Do)` into
+   `CheckPullMergeable`; map `ErrHeadCommitsNotAllVerified` to HTTP 405.
+
+5. `services/automerge/automerge.go` — pass the scheduled merge's style into
+   `CheckPullMergeable`.
+
+6. `options/locale/locale_en-US.json` — add
+   `repo.pulls.require_signed_head_commits_unverified`.
+
+Net observable behavior under require-signed-commits + no instance signing key:
+  - fast-forward-only with all head commits verified -> merge succeeds
+    (pre-fix it failed with "wont sign: nokey").
+  - fast-forward-only / merge with an unverified head commit -> rejected with
+    the new "head commits not verified" reason (NOT "wont sign: nokey").
+  - rebase / rebase-merge / squash -> still rejected with "wont sign: nokey".
+
+Alternative valid implementations the verifier accepts:
+  - The per-style branching may live in the router, in CheckPullMergeable, or
+    inside a style-aware variant of SignMerge.
+  - The new error and the user-facing message may be named/worded differently
+    (including non-English), and the locale key may differ.
+  - The head-verification helper may be named differently or kept private.
+
+Worse implementations the verifier rejects:
+  - Simply skipping the signing check for fast-forward-only WITHOUT verifying
+    the head commits: a fast-forward-only merge with an unverified head commit
+    would be allowed through the pre-check, only to be rejected later by the
+    pre-receive hook. The verifier requires that case to still be refused.
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["go"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "framework-fluency", "api-contract-design", "security-reasoning", "logic-fix"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 98
+files = 6
+hunks = 11
+scope = "broad"
+
+[metadata.origin]
+repo = "go-gitea/gitea"
+pr_numbers = [37335]
+base_commit = "899ede1d55f5333d379d1f7ab745a437d2fb79e2"
+base_commit_date = "2026-04-23"
+merged_at = "2026-04-24"
+
+
+
+

@@ -1,0 +1,10 @@
+# verify.py runs under harbor's own uv-managed venv (the image pre-runs
+# `uv sync`, and tests/test-setup.sh prepends /repo/harbor/.venv/bin to PATH).
+# Invoke pytest via that venv's interpreter directly (not via `uv run`) so the
+# timeout kill is a clean single-process kill with no orphaned uv child.
+# cwd is /repo/harbor (set by run_verify.py), so `import harbor...` resolves
+# to the editable install.
+
+[pytest]
+command = "/repo/harbor/.venv/bin/python -m pytest"
+timeout = 600

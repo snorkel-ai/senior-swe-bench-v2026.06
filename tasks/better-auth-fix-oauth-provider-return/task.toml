@@ -1,0 +1,250 @@
+version = "1.0"
+
+[environment]
+base_image = "better-auth-fix-oauth-provider-return:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "better-auth"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "better-auth"
+
+[metadata]
+family = "better-auth-fix-oauth-provider-return"
+variant = "hard"
+segment = "investigate"
+repo = "better-auth"
+tags = ["better-auth", "typescript-lib"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Multiple OAuth/OIDC interoperability reports landed against the OAuth
+provider plugin (`@better-auth/oauth-provider`) on the auth server,
+and they share one root area: how the provider reports *malformed*
+requests. (1) RFC-compliant relying parties branch on a top-level
+`error` code in the response body, but the provider returns Better
+Auth's generic validation envelope (a `{ message, code:
+"VALIDATION_ERROR" }`-shaped object with no `error` field) when a
+request fails schema validation — so compliant clients cannot classify
+the failure and treat every malformed request as an opaque error. (2)
+When the *authorize* request itself is malformed (bad `response_type`,
+a duplicated parameter, a missing field), the relying party never
+receives the error at its redirect URI the way the OAuth spec
+requires — the error is returned as a JSON 400 instead of being
+delivered to the registered `redirect_uri`. (3) Clients that send a
+`token_type_hint` value the server does not recognize (e.g.
+`id_token`) get their otherwise-valid revoke / introspect request
+rejected outright, even though the hint is advisory.
+"""
+context = """Setting:
+- `@better-auth/oauth-provider` is the OAuth2/OIDC server-side plugin
+  (distinct from `oauth-proxy`, the social-provider client). Its
+  endpoints are mounted under `/api/auth/oauth2/*`. The package lives
+  in `packages/oauth-provider/`.
+- The endpoints are declared in `packages/oauth-provider/src/oauth.ts`
+  using the repo's `createAuthEndpoint` helper from `better-auth/api`,
+  each with a Zod `body`/`query` schema. When a request fails the Zod
+  schema, `createAuthEndpoint`'s default behavior throws better-call's
+  generic `VALIDATION_ERROR` `APIError`. The response body is therefore
+  `{ message, code }`-shaped — there is no top-level `error` /
+  `error_description` pair, which is what RFC 6749 §5.2 (and 7009 /
+  7662 / 7591) require.
+- The six error-emitting endpoints are `/oauth2/token` (POST),
+  `/oauth2/authorize` (GET), `/oauth2/revoke` (POST),
+  `/oauth2/introspect` (POST), `/oauth2/register` (POST, dynamic client
+  registration), and `/oauth2/end-session` (GET).
+- The authorize endpoint already has redirect machinery
+  (`packages/oauth-provider/src/authorize.ts`: `formatErrorURL`,
+  `handleRedirect`, `getErrorURL`, `getIssuer`) for *handler-level*
+  errors, but schema-validation failures short-circuit before the
+  handler runs, so they never reach that machinery.
+- `token_type_hint` on `/oauth2/revoke` and `/oauth2/introspect` is
+  declared as `z.enum(["access_token", "refresh_token"]).optional()`,
+  so any other value fails validation and the request is rejected.
+
+Investigation evidence:
+- The PR cites RFC 6749 §5.2 (token error envelope), §4.1.2.1 (errors
+  delivered to the RP redirect), §4.2.2.1 (fragment delivery for
+  implicit responses) and §3.1 (a parameter appearing more than once
+  is `invalid_request`); RFC 7009 §2.2.1 and RFC 7662 §2.1 (a
+  `token_type_hint` is advisory; `unsupported_token_type` is reserved
+  for the token type, not the hint); RFC 7591 §3.2.2 (DCR uses
+  `invalid_redirect_uri` / `invalid_client_metadata`); RFC 9207 (the
+  `iss` parameter on the error redirect); and OIDC Core 1.0 §5
+  (response modes).
+- All behaviors are observable end-to-end through the existing HTTP
+  endpoints via the repo's `getTestInstance()` test harness — no
+  external services. A malformed POST to `/oauth2/token` returns the
+  envelope; a malformed `/oauth2/authorize` returns a 3xx redirect to
+  the RP whose `Location` carries the error; a revoke/introspect with
+  an unknown `token_type_hint` succeeds instead of 400-ing.
+
+Hidden subtleties:
+- Three failure classes must map to different codes: a *missing*
+  required parameter is `invalid_request` (RFC 6749 §5.2), an
+  *unsupported value* for an enum is `unsupported_grant_type` /
+  `unsupported_response_type`, and a structurally *malformed* request
+  (wrong type, a scalar sent more than once) is `invalid_request` per
+  §3.1 — even when the field has an "unsupported value" mapping. A
+  naive fix that maps any enum failure to `unsupported_*` mislabels a
+  duplicated `response_type` as `unsupported_response_type`.
+- The authorize error redirect carries an open-redirect risk: the
+  error may only be delivered to a `redirect_uri` that resolves
+  against a *registered, enabled* client. A missing/unregistered
+  `client_id` or an unregistered `redirect_uri` must fall back to the
+  server error page — never the attacker-supplied URI.
+- The error-redirect channel depends on the response type: OIDC Core
+  §5 / RFC 6749 §4.2.2.1 deliver implicit / hybrid errors
+  (`response_type` containing `token` or `id_token`) in the URL
+  *fragment*; `code` and ambiguous/duplicated shapes use the query; an
+  explicit `response_mode=query` overrides the fragment default.
+- The DCR endpoint defaults to a *different* fallback code
+  (`invalid_client_metadata`, RFC 7591) than the token-family
+  endpoints (`invalid_request`).
+
+Note on patch scope:
+- The PR also touches an OpenAPI metadata block (description-only) and
+  `knip.jsonc` (a lint-ignore for the new module's exports). Those are
+  non-behavioral and are excluded from the reference example. The reference fix
+  introduces a `createOAuthEndpoint` wrapper module, but the wrapper is
+  an implementation detail — see "Alternative valid fixes".
+"""
+solution = """Canonical fix (reference example, PR #9277):
+
+(1) An internal endpoint wrapper (`packages/oauth-provider/src/oauth-endpoint.ts`,
+new) wraps `createAuthEndpoint` so the Zod schema stays the source of
+truth while validation failures serialize as `{ error, error_description }`:
+- `mapIssuesToOAuthError(issues, errorCodesByField, defaultError)`
+  routes the first Zod issue by its first path segment. A missing
+  required value (`invalid_type` whose message ends "received
+  undefined") → `errorCodesByField[field].missing` or `defaultError`;
+  an `invalid_value` (unknown enum member) → `.invalid` or
+  `defaultError`; anything else (wrong type, a duplicated scalar that
+  Zod sees as an array, bad format, failed refinement) → `defaultError`.
+- Required enums are recomposed as `z.string().pipe(z.enum([...]))` so
+  a duplicated param fails the outer `z.string()` as `invalid_type`
+  (→ `invalid_request`) rather than masquerading as an unsupported
+  enum value.
+- Each endpoint passes an `errorCodesByField` table and an optional
+  `defaultError`. Token: `grant_type → { missing: "invalid_request",
+  invalid: "unsupported_grant_type" }`. Authorize: `response_type → {
+  invalid: "unsupported_response_type" }`. Register: `redirect_uris /
+  post_logout_redirect_uris → "invalid_redirect_uri"`,
+  `software_statement → "invalid_software_statement"`, `defaultError =
+  "invalid_client_metadata"`.
+
+(2) Authorize redirect-mode delivery (`authorize.ts`):
+- The authorize endpoint provides a `redirectOnError` callback
+  (`authorizeRedirectOnError(opts)`). When validation fails, the
+  wrapper invokes it instead of throwing JSON. The callback resolves
+  the requested `client_id` + `redirect_uri` against the registered
+  client (`resolveTrustedRedirectUri`); only on a match does it
+  redirect to that URI with `error`, `error_description`, echoed
+  `state`, and `iss` (`getIssuer`). Otherwise it falls back to the
+  server error page (`getErrorURL`).
+- `formatErrorURL` gains a `mode: "query" | "fragment"` parameter;
+  `deriveResponseMode(raw)` picks fragment for `response_type`
+  containing `token`/`id_token`, query for `code`/ambiguous, and
+  honors an explicit `response_mode`.
+- `findRegisteredRedirectUri` centralizes redirect-URI matching
+  (preserving the existing RFC 8252 loopback behavior).
+
+(3) `token_type_hint` (`revoke.ts`, `introspect.ts` + their schemas in
+`oauth.ts`): the schema is loosened to `z.string().optional()`, and the
+handler coerces any value other than `access_token`/`refresh_token` to
+`undefined`, so the server ignores an unknown hint and searches across
+token types.
+
+(4) `token.ts` simplification: because the schema now guarantees a
+valid `grant_type`, the `undefined`/`default` arms of the grant-type
+switch are removed.
+
+Why this approach works:
+- Routing by Zod issue class gives RFC-correct codes without
+  per-endpoint hand-rolled validation, and the `z.string().pipe(z.enum)`
+  recomposition keeps "missing" / "unsupported value" / "duplicated"
+  distinguishable at the Zod layer.
+- Gating the redirect on a registered+enabled client closes the
+  open-redirect hole that a blanket "redirect errors to redirect_uri"
+  fix would open.
+- Treating `token_type_hint` as advisory matches RFC 7009/7662 and
+  stops rejecting valid requests.
+
+Alternative valid fixes:
+1. The `createOAuthEndpoint` wrapper is one way to centralize the
+   mapping; per-endpoint inline handling, a custom Zod error map, or
+   `onValidationError` hooks wired per endpoint all reach the same
+   observable envelope.
+2. Helper / module / type names (`mapIssuesToOAuthError`,
+   `authorizeRedirectOnError`, `deriveResponseMode`, `OAuthErrorCode`,
+   etc.) are free to differ — including non-English identifiers. The
+   verifier never imports them.
+3. The fragment-vs-query decision and the open-redirect guard can be
+   implemented inline in `authorizeEndpoint` or a `beforeHook` rather
+   than a dedicated callback.
+4. The `token_type_hint` coercion can live in the schema (transform) or
+   the handler. Either passes.
+
+Non-optimal "fixes" the verifier rejects:
+- Returning a 400 JSON body for authorize validation errors instead of
+  redirecting to the RP (the approach of the rejected competing PR
+  #9279). RFC 6749 §4.1.2.1 requires the error to reach the RP's
+  redirect_uri.
+- Mapping every authorize error to the requested `redirect_uri`
+  without checking it resolves against a registered client — an
+  open-redirect bypass; the verifier asserts an unregistered
+  `redirect_uri` and a missing `client_id` both fall back to the
+  server error page.
+- Collapsing missing-required and unsupported-value into a single code
+  (so a missing `grant_type` returns `unsupported_grant_type`, or a
+  duplicated `response_type` returns `unsupported_response_type`).
+- Rejecting an unknown `token_type_hint` (keeping the enum schema).
+- Migrating only `/oauth2/token` and leaving the other endpoints on the
+  generic envelope.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["typescript-lib"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "framework-fluency", "interface-design", "logic-fix", "security-reasoning", "test-execution"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 563
+files = 7
+hunks = 26
+scope = "extensive"
+
+[metadata.origin]
+repo = "better-auth/better-auth"
+pr_numbers = [9277]
+base_commit = "954b664f4f251f8dd028451dab3ab43067dbf890"
+base_commit_date = "2026-04-21"
+merged_at = "2026-04-22"
+
+
+
+

@@ -1,0 +1,30 @@
+# Runner config for `turborepo-perf-reuse-input-hashes`.
+#
+# Two verifiers run from this dir:
+#   - verify_perf_test.rs  → Rust integration test (rust runner)
+#   - verify.py            → Python pytest (cargo subprocess regression guards)
+#
+# `crate` is the path of the package WITHIN the workspace whose
+# integration tests we inject the verify*_test.rs file into. The runner:
+#   - copies verify_perf_test.rs into {repo_dir}/{crate}/tests/
+#   - cwd to {repo_dir}
+#   - runs: cargo test --test verify_perf_test -v --manifest-path={crate}/Cargo.toml
+# We use turborepo-scm (not turborepo) because the public API we test
+# (`SCM::get_package_file_hashes`, `RepoGitIndex`) lives in turborepo-scm.
+# Building only this crate's test target keeps the cold compile to ~30s
+# vs ~10 minutes for the full `turbo` binary.
+[rust]
+crate = "crates/turborepo-scm"
+# 1500s is generous: cold compile of turborepo-scm's test binary is
+# ~30s, the test setup (200 file creates + git init + commit) is ~2s,
+# and the 3-iteration measurement loop is sub-second on warm cache.
+# tests/test-setup.sh additionally pre-warms via `cargo test --lib --no-run`.
+timeout = 1500
+
+# Pytest config governs verify.py (the cargo-subprocess regression guards).
+[pytest]
+# `cargo test -p turborepo-scm --lib` is fast on a warm cache (the
+# test-setup pre-warms it) but can take a couple of minutes from cold.
+# `cargo test -p turborepo-lockfiles --lib` is similar. 900s covers
+# both runs with margin.
+timeout = 900

@@ -1,0 +1,5 @@
+{
+  "files": ["lib/plausible_web/controllers/api/stats_controller.ex"],
+  "fail_to_pass": [],
+  "pass_to_pass": []
+}

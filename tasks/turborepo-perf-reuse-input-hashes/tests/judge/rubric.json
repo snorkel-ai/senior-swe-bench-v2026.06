@@ -1,0 +1,24 @@
+{
+  "files": [
+    "crates/turborepo-scm/src/repo_index.rs",
+    "crates/turborepo-scm/src/package_deps.rs",
+    "crates/turborepo-scm/src/hash_object.rs",
+    "crates/turborepo-lockfiles/src/pnpm/data.rs"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "agent_addressed_redundant_input_hashing",
+      "description": "The diff substantively addresses the redundant input-file hashing on the explicit-`inputs` path by reusing OIDs already known to the repo-wide git index (RepoGitIndex's ls_tree_hashes) for clean tracked files, instead of unconditionally streaming every matched file through the blob-hash routine. Acceptable mechanisms include: a partition helper on RepoGitIndex that splits paths into (known_oid, needs_hashing); an inline binary-search check inside get_package_file_hashes_from_inputs; a hash_objects skip-list / pre-resolved-hashes parameter; reuse of the existing RepoGitIndex::get_package_hashes followed by an explicit-input intersection; or any equivalent restructuring that achieves 'don't read the file if we already know its OID for clean tracked files.' Identifier names, module placement, and helper extraction style are immaterial — the structural property is what counts. Bumping rayon thread counts, increasing the file-read BUF_SIZE, caching hash_objects results across calls, or other micro-optimizations that still read every matched file's contents do NOT satisfy this — they leave the redundant work in place. The behavioral verifier's rchar check on the with-index explicit-input path is the deterministic cross-check; this rubric criterion targets the structural intent in the diff."
+    },
+    {
+      "name": "agent_addressed_lockfile_allocator_churn",
+      "description": "The diff identifies and reduces allocator churn in pnpm lockfile parsing — specifically by presizing one or more HashMap (or equivalent dependency-map) allocations in PnpmLockfile's parsing path, where the upper bound on size is already known from the parsed input's snapshot/package/dependency counts. Acceptable mechanisms include HashMap::with_capacity(snapshots.len() + packages.len()) for the workspace dependency index, HashMap::with_capacity(dependencies.len() + optional_dependencies.len()) for the per-snapshot combined map, or any reasonable upper-bound estimate. The exact formula does not matter — saturating arithmetic, small constant headroom, or a pessimistic upper bound all satisfy the criterion. A diff that doesn't touch the lockfile crate at all does NOT satisfy this. Note: the input-hashing fix (criterion `agent_addressed_redundant_input_hashing`) is the higher-impact half of this task; an agent that addresses only the input-hashing fix and skips this lockfile presize is a partial solve, not a regression."
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "optimization_does_not_break_status_or_dirty_handling",
+      "description": "The optimization correctly distinguishes clean tracked files from modified, deleted, or untracked files. Files in the input match set that are status-modified, status-deleted, or absent from the index continue to be hashed via the file-content path — they do NOT silently inherit stale ls-tree OIDs. The diff's partition logic gives status entries precedence over ls-tree entries, or otherwise routes dirty/deleted/untracked files through real hashing. The behavioral verifier's `with_index_matches_without_index_for_explicit_inputs` test reinforces this with a small repo containing a tracked-clean file, an untracked file, and a parent-directory file; this rubric criterion is the structural reading of the same property in the agent's diff. A fix that, for example, reuses ls-tree OIDs unconditionally without consulting status_entries first would silently corrupt cache keys for any modified file."
+    }
+  ]
+}

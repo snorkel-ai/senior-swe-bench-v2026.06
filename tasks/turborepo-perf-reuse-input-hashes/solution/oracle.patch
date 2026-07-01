@@ -1,0 +1,246 @@
+diff --git a/crates/turborepo-lockfiles/src/pnpm/data.rs b/crates/turborepo-lockfiles/src/pnpm/data.rs
+index d7a0a553e8..93bee69e1d 100644
+--- a/crates/turborepo-lockfiles/src/pnpm/data.rs
++++ b/crates/turborepo-lockfiles/src/pnpm/data.rs
+@@ -279,7 +279,9 @@ impl PnpmLockfile {
+     }
+ 
+     fn build_dependency_index(&mut self) {
+-        let mut index = HashMap::new();
++        let snapshot_count = self.snapshots.as_ref().map_or(0, HashMap::len);
++        let package_count = self.packages.as_ref().map_or(0, HashMap::len);
++        let mut index = HashMap::with_capacity(snapshot_count + package_count);
+         if let Some(snapshots) = &self.snapshots {
+             for (key, snapshot) in snapshots {
+                 index.insert(key.clone(), snapshot.dependencies());
+@@ -827,12 +829,27 @@ impl Dependency {
+ 
+ impl PackageSnapshotV7 {
+     pub fn dependencies(&self) -> HashMap<String, String> {
+-        self.dependencies
+-            .iter()
+-            .flatten()
+-            .chain(self.optional_dependencies.iter().flatten())
+-            .map(|(k, v)| (k.clone(), v.clone()))
+-            .collect()
++        let dependency_count = self.dependencies.as_ref().map_or(0, Map::len)
++            + self.optional_dependencies.as_ref().map_or(0, Map::len);
++        let mut combined = HashMap::with_capacity(dependency_count);
++
++        if let Some(dependencies) = &self.dependencies {
++            combined.extend(
++                dependencies
++                    .iter()
++                    .map(|(name, version)| (name.clone(), version.clone())),
++            );
++        }
++
++        if let Some(optional_dependencies) = &self.optional_dependencies {
++            combined.extend(
++                optional_dependencies
++                    .iter()
++                    .map(|(name, version)| (name.clone(), version.clone())),
++            );
++        }
++
++        combined
+     }
+ }
+ 
+diff --git a/crates/turborepo-scm/src/package_deps.rs b/crates/turborepo-scm/src/package_deps.rs
+index f57ac39ad1..5f537e0291 100644
+--- a/crates/turborepo-scm/src/package_deps.rs
++++ b/crates/turborepo-scm/src/package_deps.rs
+@@ -2,7 +2,7 @@ use std::str::FromStr;
+ 
+ use globwalk::ValidatedGlob;
+ use tracing::{debug, warn};
+-use turbopath::{AbsoluteSystemPath, AnchoredSystemPath, PathError};
++use turbopath::{AbsoluteSystemPath, AnchoredSystemPath, AnchoredSystemPathBuf, PathError};
+ use turborepo_telemetry::events::task::{FileHashMethod, PackageTaskEventBuilder};
+ 
+ use crate::{Error, GitHashes, GitRepo, RepoGitIndex, SCM, hash_object::hash_objects};
+@@ -131,6 +131,7 @@ impl GitRepo {
+                 package_path,
+                 inputs,
+                 true,
++                repo_index,
+             );
+         }
+ 
+@@ -185,16 +186,68 @@ impl GitRepo {
+         Ok(hashes)
+     }
+ 
+-    #[tracing::instrument(skip(self, turbo_root, inputs))]
++    fn git_relative_to_package_relative(
++        &self,
++        full_pkg_path: &AbsoluteSystemPath,
++        pkg_prefix: &turbopath::RelativeUnixPathBuf,
++        git_relative: &turbopath::RelativeUnixPathBuf,
++    ) -> turbopath::RelativeUnixPathBuf {
++        turbopath::RelativeUnixPath::strip_prefix(git_relative, pkg_prefix)
++            .ok()
++            .map(|stripped| stripped.to_owned())
++            .unwrap_or_else(|| {
++                let full_file_path = self.root.join_unix_path(git_relative);
++                AnchoredSystemPathBuf::relative_path_between(full_pkg_path, &full_file_path)
++                    .to_unix()
++            })
++    }
++
++    fn extend_hashes_from_candidates(
++        &self,
++        full_pkg_path: &AbsoluteSystemPath,
++        pkg_prefix: &turbopath::RelativeUnixPathBuf,
++        repo_index: Option<&RepoGitIndex>,
++        candidate_paths: Vec<turbopath::RelativeUnixPathBuf>,
++        hashes: &mut GitHashes,
++    ) -> Result<(), Error> {
++        if candidate_paths.is_empty() {
++            return Ok(());
++        }
++
++        let (known_hashes, to_hash) = if let Some(index) = repo_index {
++            index.partition_existing_paths_for_hashing(candidate_paths)
++        } else {
++            (Vec::new(), candidate_paths)
++        };
++
++        hashes.reserve(known_hashes.len() + to_hash.len());
++        for (git_relative, oid) in known_hashes {
++            let package_relative =
++                self.git_relative_to_package_relative(full_pkg_path, pkg_prefix, &git_relative);
++            hashes.insert(package_relative, oid);
++        }
++
++        if !to_hash.is_empty() {
++            let mut new_hashes = GitHashes::with_capacity(to_hash.len());
++            hash_objects(&self.root, full_pkg_path, to_hash, &mut new_hashes)?;
++            hashes.extend(new_hashes);
++        }
++
++        Ok(())
++    }
++
++    #[tracing::instrument(skip(self, turbo_root, inputs, repo_index))]
+     fn get_package_file_hashes_from_inputs<S: AsRef<str>>(
+         &self,
+         turbo_root: &AbsoluteSystemPath,
+         package_path: &AnchoredSystemPath,
+         inputs: &[S],
+         include_configs: bool,
++        repo_index: Option<&RepoGitIndex>,
+     ) -> Result<GitHashes, Error> {
+         let full_pkg_path = turbo_root.resolve(package_path);
+         let package_unix_path_buf = package_path.to_unix();
++        let pkg_prefix = self.root.anchor(&full_pkg_path)?.to_unix();
+         let package_unix_path = package_unix_path_buf.as_str();
+ 
+         static CONFIG_FILES: &[&str] = &["package.json", "turbo.json", "turbo.jsonc"];
+@@ -229,12 +282,18 @@ impl GitRepo {
+             &exclusions,
+             globwalk::WalkType::Files,
+         )?;
+-        let mut to_hash = Vec::with_capacity(files.len());
++        let mut candidate_paths = Vec::with_capacity(files.len());
+         for entry in &files {
+-            to_hash.push(self.root.anchor(entry)?.to_unix());
++            candidate_paths.push(self.root.anchor(entry)?.to_unix());
+         }
+         let mut hashes = GitHashes::with_capacity(files.len());
+-        hash_objects(&self.root, &full_pkg_path, to_hash, &mut hashes)?;
++        self.extend_hashes_from_candidates(
++            &full_pkg_path,
++            &pkg_prefix,
++            repo_index,
++            candidate_paths,
++            &mut hashes,
++        )?;
+         Ok(hashes)
+     }
+ 
+@@ -318,9 +377,13 @@ impl GitRepo {
+ 
+             // Hash any literal files discovered via direct stat.
+             if !literal_to_hash.is_empty() {
+-                let mut new_hashes = GitHashes::with_capacity(literal_to_hash.len());
+-                hash_objects(&self.root, &full_pkg_path, literal_to_hash, &mut new_hashes)?;
+-                hashes.extend(new_hashes);
++                self.extend_hashes_from_candidates(
++                    &full_pkg_path,
++                    &pkg_prefix,
++                    repo_index,
++                    literal_to_hash,
++                    &mut hashes,
++                )?;
+             }
+ 
+             // Only do the expensive glob walk for patterns that are actual globs.
+@@ -348,9 +411,13 @@ impl GitRepo {
+                 }
+ 
+                 if !to_hash.is_empty() {
+-                    let mut new_hashes = GitHashes::with_capacity(to_hash.len());
+-                    hash_objects(&self.root, &full_pkg_path, to_hash, &mut new_hashes)?;
+-                    hashes.extend(new_hashes);
++                    self.extend_hashes_from_candidates(
++                        &full_pkg_path,
++                        &pkg_prefix,
++                        repo_index,
++                        to_hash,
++                        &mut hashes,
++                    )?;
+                 }
+             }
+         }
+diff --git a/crates/turborepo-scm/src/repo_index.rs b/crates/turborepo-scm/src/repo_index.rs
+index 3daf679070..04c5a76326 100644
+--- a/crates/turborepo-scm/src/repo_index.rs
++++ b/crates/turborepo-scm/src/repo_index.rs
+@@ -304,6 +304,45 @@ impl RepoGitIndex {
+ 
+         Ok((hashes, to_hash))
+     }
++
++    /// Partition a set of existing git-root-relative file paths into:
++    /// - clean tracked files whose blob OIDs can be reused immediately
++    /// - files that still need content hashing because they are dirty,
++    ///   untracked, or absent from the tracked index
++    ///
++    /// Status entries always win over ls-tree entries so modified tracked files
++    /// are conservatively re-hashed instead of reusing stale blob IDs.
++    pub fn partition_existing_paths_for_hashing(
++        &self,
++        paths: impl IntoIterator<Item = RelativeUnixPathBuf>,
++    ) -> (
++        Vec<(RelativeUnixPathBuf, OidHash)>,
++        Vec<RelativeUnixPathBuf>,
++    ) {
++        let mut known_hashes = Vec::new();
++        let mut to_hash = Vec::new();
++
++        for path in paths {
++            let in_status = self
++                .status_entries
++                .binary_search_by(|entry| entry.path.as_str().cmp(path.as_str()))
++                .is_ok();
++            if in_status {
++                to_hash.push(path);
++                continue;
++            }
++
++            match self
++                .ls_tree_hashes
++                .binary_search_by(|(entry_path, _)| entry_path.as_str().cmp(path.as_str()))
++            {
++                Ok(idx) => known_hashes.push((path, self.ls_tree_hashes[idx].1)),
++                Err(_) => to_hash.push(path),
++            }
++        }
++
++        (known_hashes, to_hash)
++    }
+ }
+ 
+ /// Walk the working tree to find untracked files (files on disk that are

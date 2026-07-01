@@ -1,0 +1,269 @@
+diff --git a/src/harbor/cli/jobs.py b/src/harbor/cli/jobs.py
+index a3f5e20cb..4d2fbe0cd 100644
+--- a/src/harbor/cli/jobs.py
++++ b/src/harbor/cli/jobs.py
+@@ -24,6 +24,7 @@ from harbor.models.registry import LocalRegistryInfo, RemoteRegistryInfo
+ from harbor.models.task.paths import TaskPaths
+ from harbor.models.trial.config import (
+     AgentConfig,
++    AgentFileRetention,
+     EnvironmentConfig,
+     TaskConfig,
+ )
+@@ -452,6 +453,16 @@ def start(
+             show_default=False,
+         ),
+     ] = None,
++    agent_file_retention: Annotated[
++        AgentFileRetention | None,
++        Option(
++            "--agent-file-retention",
++            help=f"Which agent files to retain after trial (default: {AgentFileRetention.ALL.value}). "
++            "'trajectories_only' keeps only trajectory JSON files for trace export.",
++            rich_help_panel="Environment",
++            show_default=False,
++        ),
++    ] = None,
+     environment_kwargs: Annotated[
+         list[str] | None,
+         Option(
+@@ -766,6 +777,8 @@ def start(
+         config.environment.override_gpus = override_gpus
+     if mounts_json is not None:
+         config.environment.mounts_json = json.loads(mounts_json)
++    if agent_file_retention is not None:
++        config.environment.agent_file_retention = agent_file_retention
+     if environment_kwargs is not None:
+         config.environment.kwargs.update(parse_kwargs(environment_kwargs))
+     if environment_env is not None:
+diff --git a/src/harbor/environments/base.py b/src/harbor/environments/base.py
+index f1c8cdf49..2103800fc 100644
+--- a/src/harbor/environments/base.py
++++ b/src/harbor/environments/base.py
+@@ -1,7 +1,9 @@
+ import logging
++import re
+ import shlex
+ from abc import ABC, abstractmethod
+ from pathlib import Path
++from typing import Callable
+ 
+ from pydantic import BaseModel
+ 
+@@ -13,6 +15,23 @@ from harbor.utils.logger import logger as global_logger
+ 
+ _LOGGED_OVERRIDE_WARNINGS: set[str] = set()
+ 
++# Patterns for trajectory files that should be retained for trace export.
++# These match the files discovered by traces_utils.py:
++#   - trajectory.json (base trajectory)
++#   - trajectory.cont-{n}.json (continuation files)
++#   - trajectory.summarization-{n}-(summary|questions|answers).json
++_TRAJECTORY_PATTERNS = [
++    re.compile(r"^trajectory\.json$"),
++    re.compile(r"^trajectory\.cont-\d+\.json$"),
++    re.compile(r"^trajectory\.summarization-\d+-(summary|questions|answers)\.json$"),
++]
++
++
++def is_trajectory_file(filename: str) -> bool:
++    """Check if a filename matches a trajectory file pattern."""
++    return any(pattern.match(filename) for pattern in _TRAJECTORY_PATTERNS)
++
++
+ class SandboxBuildFailedError(Exception):
+     """Raised when a sandbox fails to build (e.g., empty or invalid Dockerfile).
+ 
+@@ -261,6 +280,47 @@ class BaseEnvironment(ABC):
+             target_dir: The local path to which to copy the directory.
+         """
+ 
++    async def download_files_matching(
++        self,
++        source_dir: str,
++        target_dir: Path | str,
++        match_func: Callable[[str], bool],
++    ):
++        """
++        Downloads only files matching a predicate from the environment.
++
++        Default implementation downloads all files and then removes non-matching ones.
++        Only files in the ROOT of target_dir are checked against match_func - all
++        subdirectories are removed entirely.
++
++        Subclasses may override this for more efficient implementations that only
++        download matching files.
++
++        Args:
++            source_dir: The path to the source directory in the environment.
++            target_dir: The local path to which to copy matching files.
++            match_func: A function that takes a filename and returns True if it should
++                be kept, False otherwise. Only applied to files in the root directory.
++        """
++        import shutil
++
++        target_path = Path(target_dir)
++
++        # Default: download everything, then remove non-matching files
++        await self.download_dir(source_dir, target_path)
++
++        # Clean up: only keep matching files in the ROOT directory
++        if target_path.exists():
++            # First, remove all subdirectories entirely
++            for item in list(target_path.iterdir()):
++                if item.is_dir():
++                    shutil.rmtree(item, ignore_errors=True)
++
++            # Then, remove non-matching files from the root
++            for file_path in list(target_path.iterdir()):
++                if file_path.is_file() and not match_func(file_path.name):
++                    file_path.unlink()
++
+     @abstractmethod
+     async def exec(
+         self,
+diff --git a/src/harbor/models/trial/config.py b/src/harbor/models/trial/config.py
+index db44e29d7..84ed2a781 100644
+--- a/src/harbor/models/trial/config.py
++++ b/src/harbor/models/trial/config.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++from enum import Enum
+ from pathlib import Path
+ from typing import Any, Literal, NotRequired, TypedDict
+ from uuid import UUID
+@@ -44,6 +45,19 @@ class ArtifactConfig(BaseModel):
+     destination: str | None = None
+ 
+ 
++class AgentFileRetention(str, Enum):
++    """Controls which agent files are retained after a trial completes.
++
++    ALL: Keep all agent files (default, current behavior)
++    TRAJECTORIES_ONLY: Keep only trajectory JSON files needed for trace export
++    NONE: Don't keep any agent files
++    """
++
++    ALL = "all"
++    TRAJECTORIES_ONLY = "trajectories_only"
++    NONE = "none"
++
++
+ class AgentConfig(BaseModel):
+     name: str | None = None
+     import_path: str | None = None
+@@ -78,6 +92,7 @@ class EnvironmentConfig(BaseModel):
+     suppress_override_warnings: bool = False
+     mounts_json: list[ServiceVolumeConfig] | None = None
+     env: dict[str, str] = Field(default_factory=dict)
++    agent_file_retention: AgentFileRetention = AgentFileRetention.ALL
+     kwargs: dict[str, Any] = Field(default_factory=dict)
+ 
+     @model_validator(mode="after")
+diff --git a/src/harbor/trial/trial.py b/src/harbor/trial/trial.py
+index f821cd1db..18b358009 100644
+--- a/src/harbor/trial/trial.py
++++ b/src/harbor/trial/trial.py
+@@ -1,6 +1,7 @@
+ import asyncio
+ import json
+ import logging
++import shutil
+ import sys
+ import traceback
+ import urllib.request
+@@ -22,6 +23,7 @@ from tenacity import (
+ 
+ from harbor.agents.factory import AgentFactory
+ from harbor.agents.installed.base import BaseInstalledAgent, NonZeroAgentExitCodeError
++from harbor.environments.base import is_trajectory_file
+ from harbor.environments.factory import EnvironmentFactory
+ from harbor.llms.base import (
+     AgentEnvironmentTimeoutError,
+@@ -33,7 +35,7 @@ from harbor.llms.base import (
+ from harbor.models.agent.context import AgentContext
+ from harbor.models.agent.name import AgentName
+ from harbor.models.task.task import Task
+-from harbor.models.trial.config import ArtifactConfig, TrialConfig
++from harbor.models.trial.config import AgentFileRetention, ArtifactConfig, TrialConfig
+ from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
+ from harbor.models.trial.result import (
+     ExceptionInfo,
+@@ -502,6 +504,9 @@ class Trial:
+             ) from e
+ 
+     async def _cleanup_and_finalize(self) -> None:
++        # Clean up agent directory based on retention policy (for mounted environments)
++        self._cleanup_agent_dir_if_needed()
++
+         try:
+             if self._environment_ready:
+                 await self._environment.stop(delete=self.config.environment.delete)
+@@ -542,16 +547,62 @@ class Trial:
+         if self._environment.is_mounted or self._are_agent_logs_downloaded:
+             return
+ 
++        retention = self.config.environment.agent_file_retention
++
+         try:
+-            await self._environment.download_dir(
+-                source_dir=source_dir,
+-                target_dir=target_dir,
+-            )
++            if retention == AgentFileRetention.ALL:
++                await self._environment.download_dir(
++                    source_dir=source_dir,
++                    target_dir=target_dir,
++                )
++            elif retention == AgentFileRetention.TRAJECTORIES_ONLY:
++                await self._environment.download_files_matching(
++                    source_dir=source_dir,
++                    target_dir=target_dir,
++                    match_func=is_trajectory_file,
++                )
++            # NONE: don't download anything
+         except Exception as e:
+             self._logger.debug(f"Failed to download logs to {target_dir}, error: {e}")
+ 
+         self._are_agent_logs_downloaded = True
+ 
++    def _cleanup_agent_dir_if_needed(self) -> None:
++        """Clean up agent directory based on retention policy for mounted environments.
++
++        For non-mounted environments, cleanup happens during download. For mounted
++        environments, we need to clean up the agent directory after the trial.
++        """
++        retention = self.config.environment.agent_file_retention
++        if not self._environment.is_mounted or retention == AgentFileRetention.ALL:
++            return
++
++        agent_dir = self._trial_paths.agent_dir
++        if not agent_dir.exists():
++            return
++
++        if retention == AgentFileRetention.NONE:
++            # Remove everything and recreate empty directory
++            shutil.rmtree(agent_dir, ignore_errors=True)
++            agent_dir.mkdir(parents=True, exist_ok=True)
++            return
++
++        # TRAJECTORIES_ONLY: keep only trajectory files in the ROOT of agent_dir
++        # (traces_utils.py only looks for trajectories in the root, not subdirs)
++
++        # First, remove all subdirectories entirely
++        for item in list(agent_dir.iterdir()):
++            if item.is_dir():
++                shutil.rmtree(item, ignore_errors=True)
++
++        # Then, remove non-trajectory files from the root
++        for file_path in list(agent_dir.iterdir()):
++            if file_path.is_file() and not is_trajectory_file(file_path.name):
++                try:
++                    file_path.unlink()
++                except OSError as e:
++                    self._logger.warning(f"Failed to remove file {file_path}: {e}")
++
+     def _maybe_populate_agent_context(self) -> None:
+         if (
+             self.result.agent_result is not None

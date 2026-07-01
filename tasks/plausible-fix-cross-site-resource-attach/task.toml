@@ -1,0 +1,160 @@
+version = "1.0"
+
+[environment]
+base_image = "plausible-fix-cross-site-resource-attach:latest"
+build_timeout_sec = 1500.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1200.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "plausible"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "plausible"
+
+[metadata]
+family = "plausible-fix-cross-site-resource-attach"
+variant = "hard"
+segment = "investigate"
+repo = "plausible"
+tags = ["plausible", "elixir"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """A security review of Plausible's provisioning flows surfaced a cross-site
+access problem. When a user creates or edits certain per-site resources,
+a carefully crafted request can cause the resource to be attached to — or
+read from — a site other than the one the user is operating on. A user
+acting on their own site can reach across into another site's data simply
+by including an extra ownership field (or a foreign identifier) in the
+request body. The fix must ensure resource ownership is always determined
+by the site the user is acting on, never by anything carried in the
+incoming request, across every affected provisioning path.
+"""
+context = """This is an Ecto mass-assignment / parameter-injection (IDOR) class of
+defect. Several `changeset/2` functions cast a `site_id` (or accept a
+caller-supplied slug without scoping it to the current site), so a value
+in the user-controlled params can override the server's intended site
+association. The provisioning layer pre-populates the owning struct with
+the correct `site_id` but then `cast/3` lets the request param clobber it.
+
+Affected surfaces (all PRE-EXISTING, STABLE public interfaces — the fix
+changes behavior at these interfaces without changing their signatures):
+
+1. `Plausible.Goals.update/2` — calls `Goal.changeset(goal, params)`
+   directly. `Plausible.Goal`'s changeset casts `:site_id` (and `:id`)
+   and does `cast_assoc(:site)`, so `params["site_id"]` moves the goal to
+   another site. (Note: `Goals.create/2` is already protected — its
+   `insert_goal` path does `Map.delete(params, "site_id")` — so only the
+   UPDATE path is vulnerable.)
+
+2. `Plausible.Shields.add_country_rule/2`, `add_hostname_rule/2`,
+   `add_ip_rule/2`, `add_page_rule/2` — `Shields.add/4` pre-populates
+   `struct(site_id: site_id)` then `schema.changeset(params)`. Each
+   shield rule changeset casts `:site_id`, so a `"site_id"` in params
+   overrides the struct and the rule is created under the victim site.
+
+3. `PATCH /api/:domain/segments/:segment_id` → `Segments.update_one/5` —
+   calls `Segment.changeset(segment, Map.merge(params, %{"owner_id" =>
+   user_id}))` (no `site_id` forced in the merge). `Segment`'s changeset
+   casts `:site_id`, so `params["site_id"]` moves the segment to another
+   site. (The `insert_one` path already force-merges `site_id`, so it is
+   not vulnerable — the refactor there is behavior-preserving.)
+
+4. `edit-shared-link` LiveView event in
+   `PlausibleWeb.Live.SharedLinkSettings` — `Repo.get_by(slug: slug)` is
+   not scoped to the current site, so passing another site's shared-link
+   slug loads that link into the edit form. The sibling
+   `delete-shared-link` handler already scopes by `site_id`; the edit
+   handler does not.
+
+The canonical fix removes `site_id` from the cast field list in each
+schema (and removes `cast_assoc(:site)` / `validate_required([:site_id])`
+in `Goal`), pre-populating ownership on the struct (or via `put_assoc`),
+and scopes the shared-link lookup with `site_id: socket.assigns.site.id`.
+
+All four surfaces are independent files/modules — the breadth (finding
+and closing every injection point) is the core difficulty, not any single
+fix.
+"""
+solution = """Canonical fix (PR #6402, behavior preserved at every public interface):
+
+1. `lib/plausible/goal.ex` — drop `:id` and `:site_id` from `@fields`,
+   and remove `|> validate_required([:site_id]) |> cast_assoc(:site)`
+   from `changeset/2`.
+   `lib/plausible/goals/goals.ex` — in the create path, build the
+   changeset as
+   `%Goal{} |> Goal.changeset(params) |> Ecto.Changeset.put_assoc(:site, site)`
+   instead of `Goal.changeset(%Goal{site_id: site.id}, params)`.
+
+2. `lib/plausible/segments/segment.ex` — remove `:site_id` from the
+   `cast/3` field list (keep it in `validate_required`).
+   `lib/plausible/segments/segments.ex` — in `insert_one`, pre-populate
+   `%Segment{site_id: site.id}` and drop `"site_id"` from the merged map.
+
+3. The four `lib/plausible/shield/*_rule.ex` modules — remove `:site_id`
+   from both the `cast/3` list and `validate_required/2`.
+
+4. `lib/plausible_web/live/shared_link_settings.ex` — scope the lookup:
+   `Repo.get_by(slug: slug, site_id: socket.assigns.site.id)`, and guard
+   the `nil` case (do not open the edit modal when the link isn't found).
+
+Alternative valid fixes the reward stage should accept:
+- Forcing the correct `site_id` via `Map.put`/`Map.merge` AFTER cast, or
+  overriding it post-cast with `put_change(:site_id, site.id)`, instead
+  of removing it from the cast list — as long as a foreign `site_id` in
+  params cannot change the persisted association.
+- Validating `params["site_id"]` against the current site and rejecting
+  mismatches.
+- For shared links, any approach that prevents loading a link owned by a
+  different site (scoped query, post-fetch ownership check) — the exact
+  flash message text or modal-handling style does not matter.
+
+Non-valid fixes the reward stage should reject:
+- Fixing only one or some of the four surfaces (breadth must be complete).
+- Frontend-only changes (hiding the field in a form) — the API/business
+  layer remains exploitable.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["elixir"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "framework-fluency", "logic-fix", "security-reasoning"]
+skill_breadth = "moderate"
+
+[metadata.oracle_scope]
+sloc = 42
+files = 9
+hunks = 11
+scope = "spread"
+
+[metadata.origin]
+repo = "plausible/analytics"
+pr_numbers = [6402]
+base_commit = "7bb9b00471a20c6f1232284842e7142c2cd58bd9"
+base_commit_date = "2026-05-26"
+merged_at = "2026-05-26"
+
+
+
+

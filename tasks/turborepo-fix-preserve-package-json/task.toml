@@ -1,0 +1,251 @@
+version = "1.0"
+
+[environment]
+base_image = "turborepo-fix-preserve-package-json:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "30G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1800.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "turborepo"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "turborepo"
+
+[metadata]
+family = "turborepo-fix-preserve-package-json"
+variant = "hard"
+segment = "investigate"
+repo = "turborepo"
+tags = ["turborepo", "rust", "cli"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Customers running `turbo prune` on monorepos that use pnpm patches are
+reporting that builds inside the pruned output never re-use the upstream
+cache: every `turbo build --cwd=pruned --cache-dir=...` is a cold
+rebuild, even when nothing about the package's dependencies has changed.
+The symptom is consistent and only reproduces when the monorepo has
+pnpm patches — projects without patches get FULL TURBO as expected.
+The bug surfaces both in shared-cache CI setups (where the same cache
+dir is used inside and outside the pruned output) and in
+docker-based deploys that use `turbo prune --docker` to ship a smaller
+image.
+"""
+context = """The bug lives at the intersection of two things turbo prune does when
+producing the pruned output for a monorepo with pnpm patches:
+
+1. `crates/turborepo-lib/src/commands/prune.rs` — when the lockfile
+   reports any patches, prune deserializes the root `package.json` into
+   its strongly-typed `PackageJson` struct, drops dependency entries
+   the pruned subgraph doesn't need, and re-serializes. The
+   re-serialization step is `serde_json::to_string_pretty(&pruned_json)`
+   on the struct directly. `serde_json`'s default `Map`
+   implementation is a `BTreeMap`, which keeps keys in lexical order
+   — so the output is alphabetized regardless of what the input
+   ordering was. The original `package.json` for `monorepo_with_root_dep`
+   has keys in the order `name, packageManager, devDependencies, pnpm`;
+   pre-fix prune writes them as `devDependencies, name, packageManager,
+   pnpm`. Different bytes → different SHA → cache miss.
+
+2. `crates/turborepo-repository/src/package_manager/pnpm.rs` —
+   `prune_patches()` filters the `pnpm.patchedDependencies` map in the
+   `PackageJson` struct, then ALSO reads `pnpm-workspace.yaml`
+   (the pnpm 9+ convention for declaring patches at the workspace
+   level). For each entry in the workspace yaml's `patchedDependencies`
+   map, prune migrates that entry into `package.json`'s
+   `pnpm.patchedDependencies`. This was added when pnpm 9 introduced
+   the workspace-level patches convention, intended to "normalize"
+   patches into a single location for downstream consumers. But
+   `pnpm-workspace.yaml` is the *source of truth* — pnpm 9+ resolves
+   patches from there, not from `package.json`. The migration adds a
+   `pnpm` key (and its `patchedDependencies` subtree) to the pruned
+   `package.json` even when the original had NO `pnpm` key at all (as
+   in `lockfile-tests/fixtures/pnpm-10-patch`). Different content →
+   different hash. Worse, the migration doesn't remove the workspace
+   yaml's entries, so the patches are now declared in two places.
+
+Investigation evidence available in the merged PR (#12376 body):
+- The reproduction is straightforward via shared cache:
+
+      turbo build --force                     # populate cache
+      turbo prune @repo/web --out-dir pruned
+      diff package.json pruned/package.json   # bytes differ
+      turbo build --cwd=pruned --cache-dir="$(pwd)/.turbo/cache"
+      # → cold rebuild instead of FULL TURBO
+
+  The PR explicitly calls out two distinct issues: key ordering and
+  workspace-yaml migration, both of which contribute to byte-level
+  differences in the pruned `package.json`.
+- `serde_json` has an off-by-default `preserve_order` feature flag that
+  swaps the underlying map type from `BTreeMap` to `IndexMap`, retaining
+  insertion order. Without that flag, even a `Value`-based round-trip
+  loses ordering.
+- `cargo build --dry=json` exposes the `globalHash` field directly,
+  which is what the cache lookup keys on. Comparing the global hash of
+  the original monorepo vs. the pruned output is the most direct way
+  to confirm the symptom: if `globalHash` differs and the only thing
+  that changed is `package.json`'s bytes, the bug is in the pruned
+  rewrite.
+
+Red herrings the agent will likely investigate first:
+1. The lockfile parsers (`turborepo-lockfiles`). The pruned subgraph
+   lockfile is correct; pruning does narrow the lockfile to the right
+   transitive closure.
+2. The hashing code (`turborepo-task-hash`). The hash function reads the
+   file bytes — it's not lying about what it sees, the file content
+   really is different.
+3. The global dependency copying (`copy_global_dependencies`). It only
+   runs when the future-flag `prune_includes_global_files` is set, and
+   it doesn't touch `package.json` or the workspace yaml regardless.
+4. The recent migration to pnpm 9+. The PR predates that migration; the
+   workspace-yaml convention has been around for a year. The agent may
+   be tempted to "revert" the workspace-yaml support, but that would
+   break monorepos that rely on it.
+5. The `.npmrc` and `.pnpm-store` paths. Prune doesn't write either.
+
+The actual root causes:
+- For Issue 1: `serde_json` defaults to lexical key ordering on
+  `to_string_pretty` of a struct. The fix is to enable the
+  `preserve_order` feature on the workspace-wide `serde_json` dep and
+  treat the original `package.json` as the source of truth — read it as
+  a `Value`, serialize the pruned `PackageJson` struct as a `Value`,
+  and merge the pruned values into the original tree (the merge keeps
+  the original key ordering, drops keys the pruned version doesn't
+  have, and appends any new keys the pruned version added).
+- For Issue 2: stop migrating `pnpm-workspace.yaml`'s
+  `patchedDependencies` into `package.json`'s `pnpm.patchedDependencies`.
+  Instead, after copying the workspace yaml into the pruned output,
+  filter its `patchedDependencies` map in place to retain only patches
+  whose path is in the pruned subgraph's patches set. The
+  pnpm-workspace.yaml stays as the source of truth; package.json stays
+  untouched if it never had a `pnpm` key.
+
+The shipped image installs the workspace's pinned nightly Rust
+toolchain (nightly-2026-01-16, set via `rust-toolchain.toml`),
+Node.js 22 + corepack (for fixture monorepos that drive pnpm),
+`protoc` and `capnp` (for the daemon and telemetry crates), `lld` (the
+configured linker on Linux), and pre-warms the cargo registry via
+`cargo fetch`. Building the `turbo` binary from a cold cache takes
+roughly 10 minutes; subsequent rebuilds are fast.
+"""
+solution = """Canonical fix (the merged PR):
+1. In `Cargo.toml`, enable the `preserve_order` feature on the
+   workspace `serde_json` dependency. This swaps `serde_json::Map`
+   from `BTreeMap` to `IndexMap`, so a `Value`-based round-trip
+   preserves insertion (i.e. file) order.
+2. In `crates/turborepo-lib/src/commands/prune.rs`:
+   - Read the original `package.json` as `serde_json::Value`. Serialize
+     the pruned `PackageJson` struct as a `Value` too.
+   - Merge: traverse keys in the original order, keep entries that
+     also appear in the pruned value (recursively merging objects),
+     drop entries the pruned value doesn't have, append any keys the
+     pruned value added. Write the merged result with
+     `serde_json::to_string_pretty`.
+   - After copying the workspace yaml into the pruned output, when the
+     package manager is pnpm (any version), call
+     `prune_workspace_patches(workspace_yaml_path, &pruned_patches)` to
+     filter the yaml's `patchedDependencies` in place.
+3. In `crates/turborepo-repository/src/package_manager/pnpm.rs`:
+   - Drop the migration block in `prune_patches()` that copies
+     workspace-yaml patches into `package.json`'s `pnpm.patchedDependencies`.
+     The `repo_root` parameter is no longer needed.
+   - Add `pub fn prune_workspace_patches<R>(workspace_yaml_path,
+     patches)` that reads the yaml as a `serde_yaml_ng::Value`,
+     filters the `patchedDependencies` mapping to retain only entries
+     whose value (a `RelativeUnixPath`) is in the patches set, and
+     re-serializes back to disk.
+   - Update the existing `test_workspace_patches_pruning` test to
+     `test_workspace_patches_not_migrated_to_package_json` (asserts the
+     migration no longer happens). Rename the relevant
+     `PnpmWorkspace.patched_dependencies` field marker so the struct
+     compiles after migration code is removed.
+
+Equally valid alternative fixes the verifier accepts:
+- Same `preserve_order` flag plus a different merge strategy: read
+  original as `Value`, mutate paths under `dependencies`,
+  `devDependencies`, `pnpm.patchedDependencies` directly to drop pruned
+  entries (no separate `pruned_value` intermediate).
+- `prune_workspace_patches()` inlined into `prune.rs` rather than
+  living in `pnpm.rs`.
+- Workspace-yaml prune uses a different yaml library or a hand-rolled
+  text rewrite (the original byte-for-byte preservation is not required
+  — only the `patchedDependencies` filtering is).
+- Different module placement for the workspace-yaml prune helper
+  (e.g., a new submodule, or a method on a struct).
+- Variables/functions in non-English identifiers — the verifier reads
+  only the prune CLI's output files.
+
+Wrong/non-optimal fixes the verifier rejects:
+- Skip the `package.json` rewrite entirely on prune (always copy the
+  original verbatim). This breaks the dependency narrowing prune is
+  designed to do — `out/package.json` would still claim deps the
+  pruned scope doesn't use, fattening the docker image and confusing
+  downstream pnpm install. The verifier exercises the full
+  prune CLI; if the rewrite is no-oped, downstream behavior breaks.
+- "Fix" key ordering by alphabetizing the original first. The user-
+  visible `package.json` should match the project's conventions
+  (typically `name` first, scripts after, etc.), not be re-sorted.
+- Migrate the workspace-yaml patches into `package.json` while ALSO
+  emptying the workspace yaml in the output. Functionally produces
+  no patches in two places, but the original `package.json` had no
+  `pnpm` key — adding one changes content. The verifier asserts the
+  pruned `package.json` does not gain a `pnpm` key for fixtures whose
+  original did not have one.
+- Skip workspace-yaml pruning entirely (copy through unchanged). For
+  monorepos where the pruned scope doesn't need every patch, the
+  output's pnpm-workspace.yaml would still reference patches that are
+  no longer present, and pnpm install would fail. The verifier asserts
+  the workspace yaml's `patchedDependencies` is filtered in place to
+  the pruned subgraph's actual patches.
+
+Red herrings the agent may chase:
+- The lockfile parsers and the lockfile pruning subgraph.
+- The hashing code in `turborepo-task-hash`.
+- The `copy_global_dependencies` future-flag path.
+- Recent pnpm 9 migrations or `corepack`-related changes.
+- The `.pnpm-store` location or `.npmrc` settings.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["rust", "cli"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "framework-fluency", "logic-fix", "test-execution", "build-tooling", "dependency-research"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 110
+files = 3
+hunks = 10
+scope = "broad"
+
+[metadata.origin]
+repo = "vercel/turborepo"
+pr_numbers = [12376]
+base_commit = "595b5813562d8916e1bd590cc07b152880b5fb68"
+base_commit_date = "2026-03-18"
+merged_at = "2026-03-18"
+
+
+
+

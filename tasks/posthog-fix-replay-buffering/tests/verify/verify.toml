@@ -1,0 +1,24 @@
+# Why this layout:
+# - test_parent = frontend/src/scenes/session-recordings/player so the test
+#   file's relative imports of `./snapshotDataLogic` and `./__mocks__/test-setup`
+#   resolve. Putting it elsewhere (e.g. frontend/__verification__) would break
+#   the path-relative imports that the existing same-directory test files use.
+# - config_dir = frontend so jest picks up frontend/jest.config.ts which has
+#   the moduleNameMapper for '~/' and '@posthog/replay-shared'.
+# - command = pnpm exec jest because PostHog ships pnpm and that's what its
+#   CI and the existing test files rely on.
+# - test_path_flag = --testPathPattern (singular) because PostHog is on jest
+#   29; the plural form is jest 30+ only.
+# - timeout = 300 (5 min). This is the js runner's per-test-file subprocess
+#   timeout (it adds +60s internally). pnpm install runs in test-setup.sh —
+#   not under this clock — and the jest run itself is ~3-4s once node_modules
+#   is in place. 300s is generous headroom for ts-jest cold starts and
+#   transitive workspace symlink resolution.
+
+[jest]
+config_dir = "frontend"
+test_parent = "frontend/src/scenes/session-recordings/player"
+command = "pnpm exec jest"
+runner = "jest"
+test_path_flag = "--testPathPattern"
+timeout = 300

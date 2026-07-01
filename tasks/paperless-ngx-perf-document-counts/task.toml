@@ -1,0 +1,233 @@
+version = "1.0"
+
+[environment]
+base_image = "paperless-ngx-perf-document-counts:latest"
+build_timeout_sec = 1800.0
+cpus = 2
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "paperless-ngx"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "paperless-ngx"
+
+[metadata]
+family = "paperless-ngx-perf-document-counts"
+variant = "hard"
+segment = "investigate"
+repo = "paperless-ngx"
+tags = ["paperless-ngx", "python-service", "sql-database"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """Paperless-ngx exposes five matching-model REST endpoints
+(/api/correspondents/, /api/tags/, /api/document_types/,
+/api/storage_paths/, /api/custom_fields/) that each include a
+permissions-aware document_count for every record. On instances with
+hundreds of thousands of documents and tens of thousands of
+guardian-permission rows the count annotation produces SQL with a
+multi-OR JOIN through the Document table, and /api/tags/ +
+/api/custom_fields/ time out for non-superuser accounts. We need to
+re-shape those queries so the count annotation is index-friendly and
+the listings stay fast as the dataset grows, without changing the
+counts that any user actually sees.
+"""
+context = """Touchpoints: src/documents/permissions.py
+(get_document_count_filter_for_user — pre-existing helper that builds
+the Q-filter for the count annotation), src/documents/views.py
+(PermissionsAwareDocumentCountMixin and the five viewsets that consume
+it: CorrespondentViewSet, TagViewSet, DocumentTypeViewSet,
+StoragePathViewSet, CustomFieldViewSet), and
+src/documents/serialisers.py (CustomFieldSerializer, plus the
+MatchingModelSerializer family which exposes document_count as an
+IntegerField).
+
+The two existing permission helpers shape the slow path:
+- get_objects_for_user_owner_aware(user, perms, Model) — returns the
+  OR'd union of three querysets (owner=user, owner IS NULL,
+  Guardian-permitted via guardian.get_objects_for_user). When wrapped
+  in .values_list("id", flat=True) and used as an IN subquery, this
+  produces a complex SQL plan because the inner Guardian piece is
+  itself a JOIN against UserObjectPermission and GroupObjectPermission.
+- Count("documents", filter=Q(documents__id__in=...)) — forces an
+  outer JOIN through the Document table for every aggregation.
+
+Tag.documents is an M2M (Django auto-generates Document.tags.through);
+CustomField.fields is the related_name from CustomFieldInstance.
+Counting through these tables directly is dramatically cheaper than
+joining Document, because the through table is exactly the
+{document_id, related_id} pair the count needs and is already indexed
+on both columns.
+
+The two-layer permission model (model-level Permission +
+django-guardian object-level UserObjectPermission /
+GroupObjectPermission) is documented in
+docs/repo-notes/paperless-ngx.md § 4.
+
+Senior decisions and likely traps:
+- The CustomFieldViewSet pre-fix open-codes its own get_queryset that
+  uses fields__document__id__in instead of going through the shared
+  mixin. Adopting the mixin chain (PermissionsAwareDocumentCountMixin
+  → BulkPermissionMixin → PassUserMixin) suddenly causes
+  get_serializer to forward user= and full_perms= kwargs into
+  CustomFieldSerializer.__init__, which doesn't accept them and
+  crashes the listing with TypeError unless the serializer pops them
+  before delegating to super().__init__. An agent who optimizes the
+  query but forgets the kwargs.pop ships a broken /api/custom_fields/
+  endpoint.
+- The MRO of "class XViewSet(ModelViewSet, PermissionsAwareDocumentCountMixin)"
+  vs "class XViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet)"
+  is conventionally reversed — the mixin should come first. Pre-fix
+  the mixin's get_queryset is reachable through the MRO chain so the
+  annotation works, but a refactor that moves logic between
+  get_queryset and a parent-class method can only be reasoned about
+  cleanly if the mixin's ordering is correct.
+- The TagViewSet.list method has a SECOND code path for tag-hierarchy
+  descendants (when descendant_pks is non-empty) that recomputes the
+  Count(...) annotation directly on a child queryset. That code path
+  must be migrated to whatever new helper the agent introduces, or
+  the children visible in the response 'all' field will carry stale
+  / incorrectly-filtered counts.
+- The Q for unauthenticated users (Q(documents__deleted_at__isnull=True,
+  documents__owner__isnull=True)) is invoked at drf-spectacular
+  schema-generation time; the new helper must continue to return a
+  well-formed, evaluable QuerySet for AnonymousUser even though no
+  real HTTP request reaches that branch (IsAuthenticated blocks it).
+- Soft-deleted documents (deleted_at IS NOT NULL) must remain
+  excluded from document_count for every user.
+
+Performance signal:
+- The PR's own benchmarks: 500K docs, 37500 shared-perm rows →
+  /api/tags/ as a non-superuser TIMES OUT at 30s pre-fix and
+  finishes in 2.7s post-fix.
+- For benchmark scale (8000 docs, 100 tags, 100 custom fields, 2000
+  perm rows on SQLite in the Docker container), pre-fix /api/tags/
+  takes ~4s and /api/custom_fields/ takes ~0.4s; post-fix completes
+  in ~0.13s and ~0.04s respectively.
+"""
+solution = """Canonical fix follows the oracle:
+
+1. Add src/documents/permissions._permitted_document_ids(user) — a
+   small helper returning a queryset of permitted, non-deleted
+   document IDs. For unauthenticated users: filter
+   Document.objects.filter(deleted_at__isnull=True,
+   owner__isnull=True). For superuser: filter only
+   deleted_at__isnull=True. For regular users:
+   Document.objects.filter(deleted_at__isnull=True).filter(
+       Q(owner=user) | Q(owner__isnull=True) | Q(id__in=permitted_documents),
+   ) where permitted_documents is the union (not OR-merged queryset)
+   of UserObjectPermission and GroupObjectPermission rows that grant
+   view_document, joined back via Cast("object_pk", IntegerField()).
+
+2. Add annotate_document_count_for_related_queryset(queryset,
+   through_model, related_object_field, target_field="document_id",
+   user=None) — annotates queryset with document_count via
+   Coalesce(Subquery(through_model.objects.filter(
+       <related>=OuterRef("pk"),
+       <target>__in=permitted_ids,
+   ).values(<related>).annotate(c=Count(<target>)).values("c")[:1]), 0).
+
+3. Rewire get_document_count_filter_for_user to build its Q from
+   _permitted_document_ids:
+   - Superuser: Q(documents__deleted_at__isnull=True).
+   - Otherwise: Q(documents__id__in=_permitted_document_ids(user)).
+
+4. Update PermissionsAwareDocumentCountMixin:
+   - Add class-level hooks document_count_through and
+     document_count_source_field defaulting to None.
+   - In get_queryset(): if document_count_through is set, call
+     annotate_document_count_for_related_queryset with the configured
+     through model and source field. Otherwise, fall back to
+     Count("documents", filter=self.get_document_count_filter()).
+
+5. Configure each viewset:
+   - CorrespondentViewSet, DocumentTypeViewSet, StoragePathViewSet:
+     swap MRO so PermissionsAwareDocumentCountMixin precedes
+     ModelViewSet. No through-table — fall-back path.
+   - TagViewSet: same MRO swap, plus document_count_through =
+     Document.tags.through and document_count_source_field = "tag_id".
+     Update the descendant-listing branch in list() to use the new
+     helper too.
+   - CustomFieldViewSet: same MRO swap, plus document_count_through
+     = CustomFieldInstance and document_count_source_field =
+     "field_id". Delete the bespoke get_queryset.
+
+6. Update CustomFieldSerializer.__init__ to pop "user" and
+   "full_perms" from kwargs before super().__init__(...), since the
+   new mixin chain (PermissionsAwareDocumentCountMixin includes
+   PassUserMixin) now passes those kwargs.
+
+Acceptable alternative implementations (verifier and rubric must
+accept):
+- Computing _permitted_document_ids inline inside the mixin instead
+  of as a separate helper.
+- Using a different generic helper signature (e.g., not parameterized
+  on through_model — instead introspecting the M2M relation
+  internally).
+- Pushing the permitted-id set into the serializer context and
+  computing counts at serializer time rather than in the queryset
+  annotation, as long as the API response is unchanged in shape AND
+  fast.
+- Different naming (e.g., permitted_doc_ids, count_through_relation,
+  etc.) including non-English names.
+- Using RawSQL / CTE / window functions instead of correlated
+  subqueries.
+
+Common shortcuts that should NOT pass:
+- Optimizing the SQL but breaking the count for users with shared
+  view_document perms — verifier T1 case "recipient" catches this.
+- Optimizing the SQL but no longer excluding soft-deleted documents
+  — verifier T2 catches this.
+- Optimizing /api/tags/ but not /api/custom_fields/ — verifier T6
+  catches this.
+- Adopting the new mixin in CustomFieldViewSet without updating
+  CustomFieldSerializer.__init__ to pop user/full_perms kwargs —
+  verifier T4 catches this with a clear error message.
+- Migrating TagViewSet.list's top-level queryset but leaving the
+  descendant branch on the old Q-filter — verifier T3 catches this
+  when the recipient sees a stale count on a hidden descendant.
+"""
+
+[metadata.taxonomy]
+task_type = "performance"
+stack = ["python-service", "sql-database"]
+runtime_dependence = "runtime-essential"
+skills = ["codebase-exploration", "framework-fluency", "query-optimization", "performance-measurement", "data-population", "test-execution", "architectural-refactoring", "security-reasoning", "dependency-research"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 155
+files = 3
+hunks = 13
+scope = "broad"
+
+[metadata.origin]
+repo = "paperless-ngx/paperless-ngx"
+pr_numbers = [11950]
+base_commit = "5b9bb147cfa73b935914606c7ecf5371aff07acf"
+base_commit_date = "2026-01-30"
+merged_at = "2026-02-05"
+
+
+
+

@@ -1,0 +1,181 @@
+version = "1.0"
+
+[environment]
+base_image = "firezone-fix-connlib-align-device:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "30G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 600.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "firezone"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "firezone"
+
+[metadata]
+family = "firezone-fix-connlib-align-device"
+variant = "hard"
+segment = "investigate"
+repo = "firezone"
+tags = ["firezone", "rust"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """After a recent client release, Static Device Pool resources stopped
+working: the tray/UI reports `connected_devices = 0` and no
+client-to-client routes are ever installed, even though the portal
+authorises the devices and everything looks healthy on the control
+plane. The data plane simply never brings the device-pool peers
+online. Figure out why device-pool resources are silently failing to
+take effect in the connlib data plane, and fix it.
+"""
+context = """firezone's data plane (connlib) receives a stream of JSON messages
+from the portal over a phoenix-channel and deserializes them into
+strongly-typed Rust enums/structs in
+`rust/libs/connlib/tunnel/src/messages/client.rs`. The
+`ResourceDescription` enum and its `StaticDevicePool` variant carry a
+list of `DevicePoolMember`s; the portal also sends device
+access-control messages (`ClientDeviceAccessAuthorized` /
+`ClientDeviceAccessDenied`) and failure reasons (`FailReason`).
+
+The symptom is far from the cause. "0 connected devices / no routes"
+naturally points an investigator at the routing table
+(`client_routing_table`), the ICE/peer-connection negotiation, or the
+tray's connected-device accounting — none of which are at fault. The
+real failure is upstream of all of them: portal messages describing
+the device pool are being **silently dropped at the deserialization
+boundary**, so the routing layer never even sees them. The only
+breadcrumb is a WARN log emitted by the message decode path.
+
+This is an investigation/bug task with a `runtime-helpful` profile.
+The agent does not strictly need a live portal to find the bug — the
+message types and their serde derives, plus the WARN in the decode
+path, are enough to localize it by reading code. But reproducing the
+decode of a representative portal payload (a few lines of
+`serde_json::from_str` against the public message types) is the
+cleanest confirmation.
+
+The shipped image installs Rust 1.95.0 (pinned in
+`rust-toolchain.toml`) plus build-essential / pkg-config / libssl-dev
+/ clang for the workspace's `-sys` crates, pre-fetches workspace deps
+via `cargo fetch`, and pre-warms the cargo cache with
+`cargo build -p client-shared --tests` and `cargo check -p tunnel`.
+The relay's eBPF compile chain (nightly + bpf-linker + LLVM) is
+intentionally NOT installed — it only appears in `tunnel`'s
+`[dev-dependencies]`, which a downstream consumer like `client-shared`
+never compiles. The reward stack therefore avoids the eBPF dependency
+entirely while still exercising the `tunnel::messages::client` types.
+"""
+solution = """Canonical fix (the merged PR #13253), in
+`rust/libs/connlib/tunnel/src/messages/client.rs`:
+
+1. ROOT CAUSE: a prior refactor (PR #13028) renamed the Rust struct
+   field `DevicePoolMember.client_id` to `id`, but the portal
+   serialiser still emits `client_id` on the wire. With serde's
+   default field naming, every `StaticDevicePool` resource failed to
+   deserialize with a `missing field 'id'` WARN and was silently
+   dropped — so no device-pool routes were ever installed.
+
+   Fix: restore the wire name without churning the in-memory field —
+   `#[serde(rename = "client_id", alias = "id")]` on
+   `DevicePoolMember.id`. The in-memory field stays named `id`, so
+   call sites in `routing_table` / `pending_device_access` are
+   unchanged. (The merged PR uses `rename`; the alias keeps backward
+   compatibility with any old payloads.)
+
+2. Make `ClientDeviceAccessDenied.ipv4` / `.ipv6` into
+   `Option<Ipv4Addr>` / `Option<Ipv6Addr>` with `#[serde(default)]`,
+   because the portal may legitimately omit one or both addresses
+   depending on the denial reason. `ClientState::handle_client_device
+   _access_denied` (in `tunnel/src/client.rs`) takes the optional
+   addresses and looks up the routing entry by ipv4, falling back to
+   ipv6 (`ipv4.and_then(...).or_else(|| ipv6.and_then(...))`). The
+   eventloop call site forwards the Option fields unchanged.
+
+3. Add the four new `FailReason` variants the portal now sends —
+   `Disabled`, `AmbiguousAddress`, `MissingAddress`, `InvalidAddress`
+   (the enum carries `#[serde(rename_all = "snake_case")]` and a
+   `#[serde(other)] Unknown` catch-all that currently masks them).
+   Handle the new variants at every explicit match site:
+   `tunnel/src/dns/device_stub_resolver.rs` (servfail bucket) and
+   `client-shared/src/eventloop.rs` (no-op bucket).
+
+Equally valid alternative implementations the verifier accepts:
+
+  - `#[serde(alias = "client_id")]` (without `rename`) — also accepts
+    the `client_id` wire key. Passes the behavioral verifier.
+  - Representing denial address absence with any deserialization that
+    succeeds when ipv4/ipv6 are missing (Option is idiomatic; the
+    verifier only checks that decode succeeds, not the in-memory
+    representation).
+  - Declaring the four new `FailReason` variants in any order, or with
+    additional variants — the verifier checks that the four portal
+    strings no longer fall through to `Unknown`, not the variant set.
+
+Wrong / non-solving fixes the verifier and rubric reject:
+
+  - Touching the routing table, ICE negotiation, or tray accounting
+    (the red herrings). The device-pool messages never reach those
+    layers, so changes there do nothing — the behavioral verifier
+    still fails because the wire payload still won't deserialize.
+  - Adding a `#[serde(alias)]` to the wrong field, or renaming the
+    in-memory field to `client_id` (churns unrelated call sites; the
+    rubric flags the in-memory instability, and the behavioral test's
+    `m.id` access depends on the field staying `id`).
+  - Adding the new `FailReason` variants but failing to handle them at
+    a match site — `cargo check -p tunnel -p client-shared` fails
+    (non-exhaustive match), caught by the structural check.
+
+Red herrings the agent may chase (candidate-confirmed):
+
+  - The routing-table logic (`client_routing_table` lookups) — the
+    natural suspect for "no routes," but it never receives the
+    dropped resources.
+  - ICE / peer-connection negotiation — plausible for "devices not
+    connecting," but unrelated to message decode.
+  - Tray / connected-device state accounting — where the `0` is
+    displayed, not where it originates.
+"""
+
+[metadata.taxonomy]
+task_type = "bug"
+stack = ["rust"]
+runtime_dependence = "runtime-helpful"
+skills = ["codebase-exploration", "fault-localization", "log-interpretation", "red-herring-navigation", "framework-fluency", "logic-fix", "test-execution"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 49
+files = 4
+hunks = 6
+scope = "spread"
+
+[metadata.origin]
+repo = "firezone/firezone"
+pr_numbers = [13253]
+base_commit = "fc261c19ccfb3ed3f2e0cdb6ebcaedc81fe244fc"
+base_commit_date = "2026-05-13"
+merged_at = "2026-05-13"
+
+
+
+

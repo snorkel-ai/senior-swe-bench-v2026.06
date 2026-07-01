@@ -1,0 +1,340 @@
+{{ agent_fundamentals }}
+
+You will be provided user stories that are expected to be implemented by the code
+submission, and specific procedures for testing them. If the code submission does not
+implement the user story, implements it incompletely, or implements it incorrectly,
+your test should fail honestly rather than working around the gap.
+
+## Step 1: Understand the changes
+
+{% if patch_stat %}
+The developer's changes touch these files:
+
+```
+{{ patch_stat }}
+```
+
+Read the full diff at `{{ patch_path }}` to understand what was implemented:
+new files, modified files, new classes/functions.
+{% else %}
+There is no diff — the developer made NO code changes. Write tests that
+exercise the described behavior anyway and let them fail naturally or set error fields.
+An empty diff does NOT mean you should implement the feature.
+{% endif %}
+
+If a procedure references a symbol, endpoint, module, or general functionality
+the implementation was meant to add but you cannot find it — whether the diff is
+empty, partial, or incomplete — write the test against the canonical name and
+location the procedure gives and let it fail naturally; a missing symbol is a
+compile or import error, which is the correct signal. Do NOT search the codebase
+for alternatives or run verification loops; write the test files and stop.
+
+### Test harness files
+
+Read ALL files in `/tests/validate/`. These are harness files provided by the
+task author — they provide domain-specific utilities (API clients, data seeding,
+framework setup) that you MUST use when procedures reference them. The harness
+handles environment setup, authentication, and other framework mechanics so you
+can focus on exercising the feature.
+
+### Minimize further exploration
+
+Between the diff, the harness files, and the story procedures below, you should
+have most of what you need. If a specific import path, function signature, or
+interface is unclear, read the relevant source file to resolve it. But start
+from what you already have — do not explore the codebase broadly.
+
+## Step 2: Write test scripts
+
+Each story specifies a `driver` that determines what kind of file you write
+and how the framework executes it. The driver handles parameter injection —
+you write the test logic.
+
+### Driver: `pytest`
+
+Write a pytest test file with a test function that takes `inputs` and
+`expected` as parameters. These are **injected automatically** by the
+framework's conftest — do NOT load them yourself, do NOT read from
+`sys.argv` or environment variables.
+
+The framework runs your test function once per test case with different
+`inputs`/`expected` dicts each time. Use standard `assert` statements
+to verify the implementation matches expected values.
+
+```python
+import sys
+sys.path.insert(0, "/tests/validate")
+from test_harness import some_helper  # use harness for setup/utilities
+
+def test_story_name(inputs, expected):
+    """inputs and expected are injected automatically — one call per test case."""
+    # Use harness utilities for setup (API clients, data seeding, etc.)
+    result = some_helper(inputs["param1"], inputs["param2"])
+    # Assert against expected values
+    assert result == expected["field1"], f"Expected {expected['field1']}, got {result}"
+```
+
+Key points:
+- Write exactly ONE test function per story file — the framework calls it once per case
+- The function name MUST start with `test_`
+- `inputs` and `expected` are dicts — access keys like `inputs["key"]`
+- Do NOT write multiple test functions, helper tests, or setup tests — only the one
+  parameterized function that uses `inputs` and `expected`
+- Each test case is independent — don't rely on state from previous cases
+- Import harness utilities for framework mechanics (API clients, factories)
+- Use `assert` with descriptive messages for clear failure diagnostics
+- When an `expected` value is a JSON string of a dict, normalize both sides with
+  `json.dumps(..., sort_keys=True)` before comparing so key ordering doesn't
+  cause spurious mismatches
+
+Save as: `{{ scripts_dir }}/{story_id}.py`
+
+### Driver: `jest`
+
+Write a Jest test file that imports `getTestCases` from `./validationParams`
+to get the parameterized test cases. Use `test.each` to run each case.
+
+The `getTestCases()` function reads immutable parameters from the framework.
+Each case has `{ inputs, expected }` — use them in your test assertions.
+
+```typescript
+import { getTestCases } from './validationParams';
+// Import from the repo — discover the right modules by reading the diff
+
+describe('story name', () => {
+  const cases = getTestCases();
+  test.each(cases)('case %#', ({ inputs, expected }) => {
+    // Exercise the feature
+    const result = someFunction(inputs.param1);
+    // Assert against expected values
+    expect(result).toBe(expected.field1);
+  });
+});
+```
+
+Key points:
+- Import `getTestCases` from `./validationParams` (provided by framework)
+- Discover function/component imports by reading the diff and repo source
+- For repos with strict TypeScript configs, you may need `// @ts-nocheck`
+  at the top of the file if you encounter type errors in the test boilerplate
+
+Save as: `{{ scripts_dir }}/{story_id}.test.tsx` (or `.test.ts` if specified)
+
+### Driver: `go-test`
+
+Write a Go test file (`_test.go`) that uses `GetValidationTestCases(t)` to
+get parameterized test cases. The framework copies your file into the target
+package directory and runs `go test -json`.
+
+```go
+package mypackage_test
+
+import (
+    "testing"
+    "github.com/stretchr/testify/require"
+)
+
+func TestStoryName(t *testing.T) {
+    cases := GetValidationTestCases(t)
+    for _, tc := range cases {
+        t.Run(tc.Name, func(t *testing.T) {
+            // tc.Inputs and tc.Expected are map[string]interface{}
+            val := tc.Inputs["key"].(string)
+            result := SomeFunction(val)
+            require.Equal(t, tc.Expected["field"], result)
+        })
+    }
+}
+```
+
+Key points:
+- Use an external test package (`package foo_test`) to avoid conflicts with
+  internal test files that may reference unexported symbols
+- `GetValidationTestCases` is provided by the framework (reads from immutable params)
+- Each story specifies `go_package` (e.g., `"lib/scopes/joining"`) for where
+  the test runs
+- Use `github.com/stretchr/testify/require` for assertions (available in most Go repos)
+- `tc.Inputs`/`tc.Expected` are `map[string]interface{}` decoded from JSON:
+  numbers arrive as `float64` (convert with `int(v.(float64))`), arrays as
+  `[]interface{}`, nested objects as `map[string]interface{}`. Type-assert at
+  the use site and guard optional keys with `v, ok := tc.Inputs["x"]`
+
+Save as: `{{ scripts_dir }}/{story_id}_test.go`
+
+### Driver: `cargo-test`
+
+Write a Rust integration test file (`_test.rs`) that uses
+`get_validation_test_cases()` to get parameterized test cases. The framework
+copies your file into the target crate's `tests/` directory and runs
+`cargo test --test <name>`.
+
+```rust
+mod validation_params;
+use validation_params::{get_validation_test_cases, TestCase};
+// Import from the crate under test — discover the right types by reading the diff
+use my_crate::SomePublicType;
+
+#[test]
+fn test_story_name() {
+    let cases = get_validation_test_cases();
+    for tc in &cases {
+        // tc.inputs and tc.expected are serde_json::Value
+        let param = tc.inputs["key"].as_str().unwrap();
+        let result = SomePublicType::new(param);
+        let expected = tc.expected["field"].as_str().unwrap();
+        assert_eq!(result.name(), expected, "case {}: mismatch", tc.name);
+    }
+}
+```
+
+Key points:
+- `mod validation_params;` imports the framework-provided helper (do NOT create this file)
+- `get_validation_test_cases()` reads from an immutable params file (set by framework)
+- `tc.inputs` and `tc.expected` are `serde_json::Value` — use `.as_str()`,
+  `.as_i64()`, `.as_f64()`, `.as_bool()`, `.as_array()`, `.as_object()` to extract
+- Each story specifies `cargo_package` (e.g., `"crates/table"`) for which crate to test
+- The test file is an integration test — it can only access the crate's **public** API
+- Use `assert!` / `assert_eq!` with descriptive messages including `tc.name`
+- Do NOT add `serde` or `serde_json` to Cargo.toml — the framework handles dependencies
+
+Save as: `{{ scripts_dir }}/{story_id}_test.rs`
+
+### Driver: `mix-test`
+
+Write an ExUnit test file (`_test.exs`) that iterates over
+`ValidationParams.get_test_cases()` to get parameterized test cases. The
+framework copies your file into the mix app's `test/__validation__/` directory,
+generates a `validation_params.exs` helper alongside it, and runs
+`mix test <file> --trace --no-color`.
+
+```elixir
+defmodule MyStoryTest do
+  use ExUnit.Case, async: true
+  Code.require_file("validation_params.exs", __DIR__)
+
+  # Import the module(s) under test — discover public APIs from the diff
+  alias MyApp.SomeModule
+
+  for {case_data, idx} <- Enum.with_index(ValidationParams.get_test_cases()) do
+    @case_data case_data
+    @idx idx
+
+    test "case_#{@idx}" do
+      inputs = @case_data["inputs"]
+      expected = @case_data["expected"]
+
+      result = SomeModule.compute(inputs["x"])
+      assert result == expected["y"]
+    end
+  end
+end
+```
+
+Key points:
+- `Code.require_file("validation_params.exs", __DIR__)` imports the
+  framework-provided helper (do NOT create this file).
+- `ValidationParams.get_test_cases()` returns a list of maps with string keys
+  `"inputs"` and `"expected"` — the values are whatever the spec TOML declared.
+- Test names **must** be `case_0`, `case_1`, ... — the trace parser keys off
+  this literal pattern. Use the module-attribute-capture pattern shown above so
+  each case is compiled as a distinct test at macro-expansion time.
+- Each story specifies `mix_app` (e.g., `"packages/sync-service"`) for which
+  mix project to test. Optionally `mix_umbrella_root` if tests must run from
+  an umbrella root instead.
+- Use `async: true` where possible; ExUnit helpers from the repo's
+  `test/support/` are available (import/alias them as you would in repo tests).
+- Do NOT invoke `mix test` yourself — the driver handles execution.
+
+Save as: `{{ scripts_dir }}/{story_id}_test.exs`
+
+## Step 3: Review your scripts
+
+Before saving, review each script for common issues:
+- Missing imports or wrong import paths (read the source to verify)
+- Incorrect harness function usage (re-read the harness to check signatures)
+- Hardcoded values that should come from `inputs`
+- Assertions that don't use the `expected` dict
+
+The framework will automatically smoke-test your scripts after generation
+and give you a chance to fix issues if any are found. Focus on writing
+correct test logic — the framework handles execution mechanics.
+
+Once you have written and reviewed all scripts, you are done. Save them and stop.
+
+## Quality principles
+
+- **Match the repo's testing idiom.** The test harness often mirrors the repo's testing
+  patterns, so it is best to use it directly. Additionally, the task or story
+  instructions may specify a specific testing pattern to use. If needed, you can use the
+  patterns in the harness or other repo test files as a reference. For example, if the
+  repo uses DRF's `APIClient` with `force_authenticate`, do the same. If it uses
+  `initKeaTests()` for Kea logic, use that.
+- **Test specified behavior truthfully.** If you recognize that the developer's
+  implementation does not match the expected behavior, do not work around it or try
+  to make it pass. The highest value contribution you can make is to write the tests
+  faithfully to the behavior as specified in the story and let them fail naturally
+  or set error fields.
+
+{% if instructions %}
+## Task-Specific Instructions
+
+The following instructions apply to ALL stories in this task. Follow them
+exactly — they describe required patterns, utilities, and constraints that
+the task author has verified work correctly in this environment.
+
+{{ instructions.strip() }}
+{% endif %}
+
+## Stories
+
+{% for story in stories %}
+
+### Story {{ loop.index }}: {{ story.id }}
+{% if story.driver is defined %}
+**Driver**: `{{ story.driver }}`
+{% endif %}
+
+**Description**: {{ story.description.strip() }}
+{% if story.procedure is string %}
+
+**Procedure**: {{ story.procedure.strip() }}
+{% else %}
+
+**Procedure**:
+{% for step in story.procedure %}
+- {{ step.strip() }}
+{% endfor %}
+{% endif %}
+{% set cases = story.test_case if story.test_case is not mapping else [story.test_case] %}
+{% if cases %}
+
+**Example inputs**: `{{ cases[0].inputs | tojson }}`
+{% if cases[0].expected %}
+
+**Example expected output**:
+```json
+{{ cases[0].expected | tojson(indent=2) }}
+```
+{% endif %}
+**Total test cases**: {{ cases | length }}
+{% endif %}
+{% endfor %}
+
+## Save scripts to
+{% for story in stories %}
+{% if story.driver is defined and story.driver == "jest" %}
+{% if story.script_extension is defined %}
+- `{{ scripts_dir }}/{{ story.id }}{{ story.script_extension }}`
+{% else %}
+- `{{ scripts_dir }}/{{ story.id }}.test.tsx`
+{% endif %}
+{% elif story.driver is defined and story.driver == "go-test" %}
+- `{{ scripts_dir }}/{{ story.id }}_test.go`
+{% elif story.driver is defined and story.driver == "cargo-test" %}
+- `{{ scripts_dir }}/{{ story.id }}_test.rs`
+{% elif story.driver is defined and story.driver == "mix-test" %}
+- `{{ scripts_dir }}/{{ story.id }}_test.exs`
+{% else %}
+- `{{ scripts_dir }}/{{ story.id }}.py`
+{% endif %}
+{% endfor %}

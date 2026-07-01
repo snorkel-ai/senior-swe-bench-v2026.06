@@ -1,0 +1,41 @@
+# Verifier runner configuration for the project-column-picker feature.
+#
+# `verify_project_column_test.go` is injected by the senior-swe-bench Go
+# runner (src/python/ssb_lib/runners/go.py) into
+# `/repo/gitea/models/project/`, where it compiles against that
+# package's existing `main_test.go` (which calls unittest.MainTest and
+# loads the YAML fixtures). The runner then runs `go test -run
+# TestVerify... ./models/project` and cleans the file up afterwards.
+#
+# This is the pass_to_pass structural guard `backend_no_regression`: it
+# drives the pre-existing, stable public `DeleteColumnByID` entry point
+# (column deletion re-homes the column's issues onto the project's
+# default column and appends them at the end of that column's ordering).
+# That behavior exists on BOTH the pre-fix and post-fix trees and must
+# stay green — the feature's refactor of the internal
+# moveIssuesToAnotherColumn helper / the extracted next-sorting query
+# must not regress it. The test never references the refactored internal
+# helper (which changes shape between trees), only stable exported API.
+
+[go]
+# Package directory relative to /repo/gitea — runner copies the test
+# file here, runs `go test`, then removes it.
+package = "models/project"
+
+# Build tags mirror `make test-sqlite`'s TEST_TAGS. sqlite enables the
+# cgo sqlite3 driver (mattn/go-sqlite3 is the only sqlite driver in
+# go.mod); sqlite_unlock_notify is the matching feature gate the
+# unit-test bootstrap demands.
+build_tags = ["sqlite", "sqlite_unlock_notify"]
+
+# Cold cgo + models/project compile against the gitea unittest
+# framework is ~60s on a warm module cache; the test body runs in well
+# under a second. 600s leaves margin if a `git clean -fdx` wiped the
+# build cache.
+timeout = 600
+
+# CGO_ENABLED=1 is mandatory (sqlite3 link). GOEXPERIMENT=jsonv2 mirrors
+# gitea's Makefile default. GOTOOLCHAIN=local locks the toolchain to the
+# bundled 1.26.2 installed in the image so `go test` won't try to fetch
+# a newer toolchain on a cold environment.
+env = { CGO_ENABLED = "1", GOEXPERIMENT = "jsonv2", GOTOOLCHAIN = "local" }

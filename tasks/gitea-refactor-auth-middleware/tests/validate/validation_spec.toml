@@ -1,0 +1,260 @@
+stack_profile = "go-server"
+
+# ---------------------------------------------------------------------------
+# Global settings passed to the go-test driver for every story.
+# The Gitea integration test package requires sqlite build tags and CGO.
+# Without -tags, InitSettingsForTesting panics because no SQLite driver is
+# compiled into the binary.
+# ---------------------------------------------------------------------------
+[settings]
+[settings.go]
+command = "go test -tags sqlite,sqlite_unlock_notify"
+env = { CGO_ENABLED = "1", GOEXPERIMENT = "jsonv2", GOTOOLCHAIN = "local", GITEA_TEST_CONF = "tests/sqlite.ini" }
+
+instructions = """
+All stories use the **go-test** driver. The framework injects a
+`validation_params_test.go` helper alongside your test file that exposes
+`GetValidationTestCases(t) []ValidationTestCase` (each case has
+`Name`, `Inputs map[string]interface{}`, `Expected map[string]interface{}`).
+
+Your test file MUST:
+
+- Live under `tests/integration/` (the `go_package` for every story).
+- Use `package integration` (no `_test` suffix). The framework picks up
+  `TestMain` from `tests/integration/integration_test.go` — DO NOT
+  redefine it. Build tags are sqlite + sqlite_unlock_notify; the
+  harness sets these for you.
+- Call `GetValidationTestCases(t)` once and iterate via
+  `t.Run(tc.Name, func(t *testing.T) { ... })`. `tc.Name` is literally
+  `case_0`, `case_1`, ... — DO NOT rename.
+- Use `github.com/stretchr/testify/require` for failures and
+  `github.com/stretchr/testify/assert` for non-fatal assertions.
+- Read each `tc.Inputs[...]` and `tc.Expected[...]` value as
+  `map[string]interface{}`; type-assert with `.(string)`, `.(bool)`,
+  `.(map[string]interface{})`, etc. Numeric values come back as
+  `float64`. Missing keys use `_, ok := tc.Inputs["x"]; if !ok { ... }`.
+
+The integration test infrastructure provides every helper you need:
+
+- `defer tests.PrepareTestEnv(t)()` — reload fixtures + git repo dirs.
+  Call this at the top of every test function.
+- `NewRequest(t, "GET", "/path")` — build a request.
+- `req.AddBasicAuth("user2")` — Basic auth (default password is
+  "password"; all fixture users use that).
+- `getUserToken(t, "user2", auth_model.AccessTokenScopeReadRepository)`
+  — fetch a Bearer token with a specific scope.
+- `req.AddTokenAuth(token)` — attach the token.
+- `MakeRequest(t, req, expectedStatus)` — drive the request through
+  the in-memory router; returns `*httptest.ResponseRecorder`. Pass
+  `NoExpectedStatus` (an exported constant from the integration
+  package) when you want to inspect the status code yourself.
+
+For badge tests on a private repo, make sure user2/repo2 has the
+TypeActions repo_unit row before requesting the badge — gitea's
+MustEnableActions guard returns 404 if the unit isn't present. The
+fixture only ships the unit on user2/repo1 (public). Idiomatic seed:
+
+    import (
+        "code.gitea.io/gitea/models/db"
+        repo_model "code.gitea.io/gitea/models/repo"
+        "code.gitea.io/gitea/models/unit"
+    )
+
+    exists, err := db.GetEngine(t.Context()).
+        Where("repo_id = ? AND type = ?", int64(2), int(unit.TypeActions)).
+        Exist(&repo_model.RepoUnit{})
+    require.NoError(t, err)
+    if !exists {
+        _, err := db.GetEngine(t.Context()).Insert(&repo_model.RepoUnit{
+            RepoID: int64(2),
+            Type:   unit.TypeActions,
+        })
+        require.NoError(t, err)
+    }
+
+### Required imports (suggested for every story)
+
+```go
+import (
+    "strings"
+    "testing"
+
+    auth_model "code.gitea.io/gitea/models/auth"
+    "code.gitea.io/gitea/models/db"
+    repo_model "code.gitea.io/gitea/models/repo"
+    "code.gitea.io/gitea/models/unit"
+    "code.gitea.io/gitea/tests"
+
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/require"
+)
+```
+
+Study the submitted patch in full first, then adapt your test code to any implementation-specific details it contains, staying within the contract the procedures below specify.
+"""
+
+# ---------------------------------------------------------------------------
+# Story 1: workflow badge accepts Basic auth and OAuth2 token (the new behavior)
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "workflow_badge_authenticates_via_basic_and_token"
+driver = "go-test"
+go_module_dir = ""
+go_package = "tests/integration"
+
+description = """
+A repository's workflow status badge URL on a private repository now
+responds to Basic auth and OAuth2 personal access token credentials,
+in addition to the previously-supported browser session cookie. CI
+workers and other non-browser clients can finally embed the badge
+image in private READMEs. Without any credentials, the URL still
+returns 404 because the repo is private.
+"""
+
+procedure = """
+- Setup: defer tests.PrepareTestEnv(t)(). Make sure user2/repo2
+  (private, owner=user2) has a TypeActions repo_unit row — insert one
+  via `db.GetEngine(t.Context()).Insert(&repo_model.RepoUnit{...})`
+  if absent. Only user2/repo1 (public) has the unit shipped in
+  fixtures.
+- For each test case from `GetValidationTestCases(t)`, run a subtest
+  named `tc.Name`:
+  - Build a request:
+    `req := NewRequest(t, "GET",
+        "/user2/repo2/actions/workflows/none.yml/badge.svg")`.
+  - Apply auth based on `tc.Inputs["auth_method"].(string)`:
+      - "none"  → no auth header.
+      - "basic" → req.AddBasicAuth("user2").
+      - "token" → token := getUserToken(t, "user2",
+                  auth_model.AccessTokenScopeReadRepository);
+                  req.AddTokenAuth(token).
+  - resp := MakeRequest(t, req, NoExpectedStatus).
+  - EXPECTED: response status code equals `expected["response_status"]`
+    (a float64; cast to int via `int(expected["response_status"].(float64))`).
+  - EXPECTED: when `expected["expected_body_substring"].(string)` is
+    non-empty, the response body contains it (use `strings.Contains(
+    resp.Body.String(), expected["expected_body_substring"].(string))`).
+    When empty (""), do not assert on the body.
+  - EXPECTED: when `expected["expected_content_type"].(string)` is
+    non-empty, the response Content-Type header equals it. When empty
+    (""), do not assert on Content-Type.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+auth_method = "none"
+[story.test_case.expected]
+response_status = 404
+expected_body_substring = ""
+expected_content_type = ""
+
+[[story.test_case]]
+[story.test_case.inputs]
+auth_method = "basic"
+[story.test_case.expected]
+response_status = 200
+expected_body_substring = "<svg"
+expected_content_type = "image/svg+xml"
+
+[[story.test_case]]
+[story.test_case.inputs]
+auth_method = "token"
+[story.test_case.expected]
+response_status = 200
+expected_body_substring = "<svg"
+expected_content_type = "image/svg+xml"
+
+# ---------------------------------------------------------------------------
+# Story 2: legacy RSS/atom feed routes still authenticate Basic auth
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "repo_feed_basic_auth_preserved"
+driver = "go-test"
+go_module_dir = ""
+go_package = "tests/integration"
+
+description = """
+Repository feed URLs (the .rss and .atom variants) authenticate
+Basic auth on private repositories. Non-browser feed readers and
+scripts that subscribe to private repo feeds depend on this.
+"""
+
+procedure = """
+- Setup: defer tests.PrepareTestEnv(t)().
+- For each test case from `GetValidationTestCases(t)`, run a subtest
+  named `tc.Name`:
+  - Build a request:
+    `req := NewRequest(t, "GET", tc.Inputs["url"].(string))`.
+  - Apply Basic auth: `req.AddBasicAuth("user2")`.
+  - resp := MakeRequest(t, req, NoExpectedStatus).
+  - EXPECTED: response status code equals `expected["response_status"]`.
+  - EXPECTED: response Content-Type contains `expected["content_type_substring"]` — use `strings.Contains(resp.Header().Get("Content-Type"), expected["content_type_substring"].(string))`.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+url = "/user2/repo2.rss"
+[story.test_case.expected]
+response_status = 200
+content_type_substring = "rss"
+
+[[story.test_case]]
+[story.test_case.inputs]
+url = "/user2/repo2.atom"
+[story.test_case.expected]
+response_status = 200
+content_type_substring = "atom"
+
+# ---------------------------------------------------------------------------
+# Story 3: legacy archive / raw routes still authenticate Basic auth
+# ---------------------------------------------------------------------------
+
+[[story]]
+id = "repo_archive_and_raw_basic_auth_preserved"
+driver = "go-test"
+go_module_dir = ""
+go_package = "tests/integration"
+
+description = """
+Repository archive downloads and raw blob URLs authenticate Basic
+auth on private repositories. Build pipelines and `curl`-based fetch
+scripts depend on these endpoints.
+"""
+
+procedure = """
+- Setup: defer tests.PrepareTestEnv(t)().
+- For each test case from `GetValidationTestCases(t)`, run a subtest
+  named `tc.Name`:
+  - Build a request:
+    `req := NewRequest(t, "GET", tc.Inputs["url"].(string))`.
+  - Apply Basic auth: `req.AddBasicAuth("user2")`.
+  - resp := MakeRequest(t, req, NoExpectedStatus).
+  - EXPECTED: response status code equals `expected["response_status"]`.
+  - EXPECTED: when `expected["content_type_substring"].(string)` is
+    non-empty, the response Content-Type contains it (via
+    `strings.Contains`). When empty (""), do not assert on
+    Content-Type.
+"""
+
+[[story.test_case]]
+[story.test_case.inputs]
+url = "/user2/repo2/archive/master.zip"
+[story.test_case.expected]
+response_status = 200
+content_type_substring = "octet-stream"
+
+[[story.test_case]]
+[story.test_case.inputs]
+url = "/user2/repo2/archive/master.tar.gz"
+[story.test_case.expected]
+response_status = 200
+content_type_substring = ""
+
+[[story.test_case]]
+[story.test_case.inputs]
+url = "/user2/repo2/raw/branch/master/Home.md"
+[story.test_case.expected]
+response_status = 200
+content_type_substring = ""

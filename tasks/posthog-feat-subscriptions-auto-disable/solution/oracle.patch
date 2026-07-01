@@ -1,0 +1,1399 @@
+diff --git a/ee/api/subscription.py b/ee/api/subscription.py
+index 1707f3ab61f..ae63a319ddb 100644
+--- a/ee/api/subscription.py
++++ b/ee/api/subscription.py
+@@ -43,6 +43,7 @@ from posthog.temporal.common.client import sync_connect
+ from posthog.temporal.subscriptions.types import ProcessSubscriptionWorkflowInputs, SubscriptionTriggerType
+ from posthog.utils import str_to_bool
+ 
++from ee.tasks.subscriptions.auto_disable import validate_re_enable
+ from ee.tasks.subscriptions.subscription_utils import DEFAULT_MAX_ASSET_COUNT
+ 
+ SUMMARY_QUOTA_CACHE_TTL_SECONDS = 60
+@@ -132,6 +133,7 @@ class SubscriptionSerializer(serializers.ModelSerializer):
+             "created_at",
+             "created_by",
+             "deleted",
++            "enabled",
+             "title",
+             "summary",
+             "next_delivery_date",
+@@ -171,6 +173,9 @@ class SubscriptionSerializer(serializers.ModelSerializer):
+             "until_date": {"help_text": "When to stop delivering (ISO 8601 datetime). Null for indefinite."},
+             "title": {"help_text": "Human-readable name for this subscription."},
+             "deleted": {"help_text": "Set to true to soft-delete. Subscriptions cannot be hard-deleted."},
++            "enabled": {
++                "help_text": "Whether the subscription is active. Set to false to pause delivery without deleting. Auto-set to false when the delivery integration becomes invalid."
++            },
+         }
+ 
+     def get_insight_short_id(self, obj: Subscription) -> Optional[str]:
+@@ -197,7 +202,41 @@ class SubscriptionSerializer(serializers.ModelSerializer):
+         self._validate_dashboard_export_subscription(attrs)
+ 
+         target_type = attrs.get("target_type") or (self.instance.target_type if self.instance else None)
+-        integration_id = attrs.get("integration_id") or (self.instance.integration_id if self.instance else None)
++        # Use explicit-key check for integration_id so a deliberate `null` in the PATCH
++        # body falls through to the validation below — `or` would silently coalesce
++        # to the stale instance value and pass `validate_re_enable` with the wrong id.
++        integration_id = (
++            attrs["integration_id"]
++            if "integration_id" in attrs
++            else (self.instance.integration_id if self.instance else None)
++        )
++
++        # Reject re-enables of subscriptions whose delivery prerequisite is still
++        # permanently broken — otherwise the next delivery would just auto-disable
++        # them again.
++        is_re_enabling = self.instance is not None and attrs.get("enabled") is True and self.instance.enabled is False
++        if is_re_enabling:
++            error_message = validate_re_enable(target_type, integration_id)
++            if error_message:
++                raise ValidationError({"enabled": [error_message]})
++
++        # Reject mutations that would land `next_delivery_date=None` — `enabled=True`
++        # with a null next_delivery_date is invisible to the scheduler (the
++        # `__lte=now` filter in `fetch_due_subscriptions_activity` drops nulls).
++        # Three reachable paths: re-enable an exhausted sub, create one with a bad
++        # rrule, or PATCH an active sub's schedule into exhaustion.
++        check_schedule = (
++            is_re_enabling
++            or self.instance is None
++            or (self.instance is not None and self.instance.enabled and bool(Subscription.RRULE_FIELDS & attrs.keys()))
++        )
++        if check_schedule and Subscription.project_next_delivery_date(instance=self.instance, **attrs) is None:
++            base = "Subscription schedule has reached its end date. Extend until_date or remove count"
++            if is_re_enabling:
++                raise ValidationError({"enabled": [f"{base} before re-enabling."]})
++            if self.instance is None:
++                raise ValidationError({"start_date": [f"{base}."]})
++            raise ValidationError(f"{base}.")
+ 
+         if target_type == Subscription.SubscriptionTarget.SLACK:
+             if not integration_id:
+@@ -408,6 +447,12 @@ class SubscriptionSerializer(serializers.ModelSerializer):
+         if dashboard_export_insight_ids:
+             instance.dashboard_export_insights.set(dashboard_export_insight_ids)
+ 
++        # Skip the workflow trigger when the new subscription is created in a disabled
++        # state — mirrors the equivalent guard in `update()`. Avoids firing a delivery
++        # for a subscription that won't fire on its schedule either.
++        if not instance.enabled:
++            return instance
++
+         with slo_operation(
+             spec=SloSpec(
+                 distinct_id=str(request.user.distinct_id),
+@@ -457,6 +502,7 @@ class SubscriptionSerializer(serializers.ModelSerializer):
+     def update(self, instance: Subscription, validated_data: dict, *args, **kwargs) -> Subscription:
+         request = self.context["request"]
+         previous_value = instance.target_value
++        was_disabled = instance.enabled is False
+         is_delete = not instance.deleted and validated_data.get("deleted") is True
+         invite_message = validated_data.pop("invite_message", "")
+         dashboard_export_insight_ids = validated_data.pop("dashboard_export_insights", [])
+@@ -491,6 +537,21 @@ class SubscriptionSerializer(serializers.ModelSerializer):
+         if dashboard_export_insight_ids:
+             instance.dashboard_export_insights.set(dashboard_export_insight_ids)
+ 
++        # Re-enabling clears the stale next_delivery_date that was frozen while
++        # disabled. Without this, the scheduler picks the sub up on its next tick
++        # (the past date matches `next_delivery_date__lte=now`) and fires a second
++        # SCHEDULED delivery right after the immediate TARGET_CHANGE confirmation.
++        if was_disabled and instance.enabled:
++            instance.set_next_delivery_date()
++            instance.save(update_fields=["next_delivery_date"])
++
++        # Skip the workflow trigger when the resulting state is disabled. No delivery
++        # should fire for a disabled subscription regardless of whether it was just
++        # disabled or already disabled. Re-enabling (`enabled: false → true`) DOES
++        # trigger the workflow so the user gets immediate confirmation delivery.
++        if not instance.enabled:
++            return instance
++
+         temporal = sync_connect()
+         workflow_id = f"handle-subscription-value-change-{instance.id}-{uuid.uuid4()}"
+         asyncio.run(
+@@ -686,6 +747,11 @@ class SubscriptionViewSet(TeamAndOrgViewSetMixin, ForbidDestroyModel, viewsets.M
+         subscription = self.get_object()
+         if subscription.deleted:
+             return Response(status=status.HTTP_404_NOT_FOUND)
++        if not subscription.enabled:
++            return Response(
++                {"detail": "Subscription is disabled. Re-enable it before sending a test delivery."},
++                status=status.HTTP_409_CONFLICT,
++            )
+ 
+         temporal = sync_connect()
+         workflow_id = f"test-delivery-subscription-{subscription.id}"
+diff --git a/ee/tasks/subscriptions/auto_disable.py b/ee/tasks/subscriptions/auto_disable.py
+new file mode 100644
+index 00000000000..07c9e2e08c9
+--- /dev/null
++++ b/ee/tasks/subscriptions/auto_disable.py
+@@ -0,0 +1,130 @@
++import uuid
++from typing import NamedTuple
++
++import structlog
++
++from posthog.email import EmailMessage
++from posthog.exceptions_capture import capture_exception
++from posthog.models.subscription import Subscription
++
++from ee.tasks.subscriptions import SUPPORTED_TARGET_TYPES
++
++
++class DisableReason(NamedTuple):
++    # Stable identity used for analytics (`error_type`) and activity comparisons.
++    key: str
++    # Shown in the disabled-subscription email body and the activity's recipient_results.
++    description: str
++    # Re-enable rejection message surfaced by the API serializer; `{target_type}` is interpolated.
++    user_message: str
++
++
++SLACK_DISCONNECTED_DISABLE_REASON = DisableReason(
++    key="missing_integration",
++    description="Slack integration disconnected",
++    user_message="Cannot re-enable Slack subscription: no integration configured. Reconnect Slack first.",
++)
++UNSUPPORTED_TARGET_DISABLE_REASON = DisableReason(
++    key="unsupported_target",
++    description="Unsupported delivery channel",
++    user_message="Cannot re-enable {target_type} subscription: this delivery channel is not currently supported.",
++)
++
++logger = structlog.get_logger(__name__)
++
++
++def get_subscription_disable_reason(target_type: str | None, integration_id: int | None) -> DisableReason | None:
++    """Single source of truth for "what target configuration is permanently broken"."""
++    if not target_type:
++        return None
++    if target_type not in SUPPORTED_TARGET_TYPES:
++        return UNSUPPORTED_TARGET_DISABLE_REASON
++    if target_type == Subscription.SubscriptionTarget.SLACK and not integration_id:
++        return SLACK_DISCONNECTED_DISABLE_REASON
++    return None
++
++
++def validate_re_enable(target_type: str | None, integration_id: int | None) -> str | None:
++    """API-serializer wrapper — returns the user-facing rejection message, or None if re-enable is OK."""
++    reason = get_subscription_disable_reason(target_type, integration_id)
++    if reason is None:
++        return None
++    return reason.user_message.format(target_type=target_type)
++
++
++def disable_invalid_subscription(subscription: Subscription, reason: DisableReason) -> None:
++    # Compare-and-swap so only one racing caller sends the disabled-notification
++    # email (UUID4 campaign keys mean MessagingRecord can't dedup the duplicate).
++    rowcount = Subscription.objects.filter(pk=subscription.pk, enabled=True).update(enabled=False)
++    if rowcount == 0:
++        # A concurrent caller already disabled the row — no-op, no side effects.
++        # The in-memory `subscription.enabled` is intentionally NOT touched here so
++        # callers can distinguish "we just disabled it" from "it was already disabled";
++        # the activity site re-fetches via select_related when it needs fresh state.
++        logger.info(
++            "subscription.auto_disable_already_disabled",
++            subscription_id=subscription.id,
++            team_id=subscription.team_id,
++            reason=reason.key,
++        )
++        return
++
++    logger.warning(
++        "subscription.auto_disabling",
++        subscription_id=subscription.id,
++        team_id=subscription.team_id,
++        reason=reason.key,
++    )
++    # Mirror the UPDATE in memory so callers see the new state without a fresh
++    # SELECT — refresh_from_db() would also drop the eagerly-loaded created_by
++    # relation (loaded via select_related at the activity site).
++    subscription.enabled = False
++
++    if subscription.created_by and subscription.created_by.email:
++        try:
++            send_notifications_for_disabled_subscription(
++                subscription, reason.description, [subscription.created_by.email]
++            )
++        except Exception as e:
++            # Disabling is the durable side effect; email is best-effort. If the email
++            # fails (SMTP outage, ImproperlyConfigured on self-hosted, Customer.io 5xx)
++            # the SLO outcome must stay `success` — we successfully prevented the
++            # subscription from re-firing, which is the contract this code provides.
++            capture_exception(e)
++            logger.warning(
++                "subscription.send_disabled_notification_failed",
++                subscription_id=subscription.id,
++                error=str(e),
++                exc_info=True,
++            )
++
++
++def send_notifications_for_disabled_subscription(subscription: Subscription, reason: str, targets: list[str]) -> None:
++    logger.info(
++        "subscription.send_disabled_notification",
++        subscription_id=subscription.id,
++        recipient_count=len(targets),
++    )
++
++    display_name = subscription.title or "your subscription"
++    subject = (
++        f'PostHog subscription "{subscription.title}" has been automatically disabled'
++        if subscription.title
++        else "Your PostHog subscription has been automatically disabled"
++    )
++    campaign_key = f"subscription-disabled-notification-{subscription.id}-{uuid.uuid4()}"
++
++    message = EmailMessage(
++        campaign_key=campaign_key,
++        subject=subject,
++        template_name="subscription_disabled",
++        template_context={
++            "subscription_url": subscription.url,
++            "subscription_title": display_name,
++            "reason": reason,
++        },
++    )
++    for target in targets:
++        message.add_recipient(email=target)
++
++    message.send()
+diff --git a/frontend/src/lib/components/Subscriptions/subscriptionLogic.ts b/frontend/src/lib/components/Subscriptions/subscriptionLogic.ts
+index ef09a041d9e..cfadb8acf6e 100644
+--- a/frontend/src/lib/components/Subscriptions/subscriptionLogic.ts
++++ b/frontend/src/lib/components/Subscriptions/subscriptionLogic.ts
+@@ -35,6 +35,7 @@ const NEW_SUBSCRIPTION: Partial<SubscriptionType> = {
+     bysetpos: 1,
+     dashboard_export_insights: [],
+     integration_id: null,
++    enabled: true,
+     summary_enabled: false,
+     summary_prompt_guide: '',
+ }
+@@ -102,7 +103,7 @@ export const subscriptionLogic = kea<subscriptionLogicType>([
+ 
+     forms(({ props, actions }) => ({
+         subscription: {
+-            defaults: {} as unknown as SubscriptionType,
++            defaults: { enabled: NEW_SUBSCRIPTION.enabled } as unknown as SubscriptionType,
+             errors: ({
+                 frequency,
+                 interval,
+diff --git a/frontend/src/lib/components/Subscriptions/subscriptionsLogic.ts b/frontend/src/lib/components/Subscriptions/subscriptionsLogic.ts
+index 7b0c597999c..abba8a849ee 100644
+--- a/frontend/src/lib/components/Subscriptions/subscriptionsLogic.ts
++++ b/frontend/src/lib/components/Subscriptions/subscriptionsLogic.ts
+@@ -9,6 +9,7 @@ import { SubscriptionType } from '~/types'
+ 
+ import { runSubscriptionTestDelivery } from './runSubscriptionTestDelivery'
+ import type { subscriptionsLogicType } from './subscriptionsLogicType'
++import { toggleSubscriptionEnabled } from './toggleSubscriptionEnabled'
+ import { SubscriptionBaseProps } from './utils'
+ 
+ export const subscriptionsLogic = kea<subscriptionsLogicType>([
+@@ -22,6 +23,9 @@ export const subscriptionsLogic = kea<subscriptionsLogicType>([
+         deliverSubscription: (id: number) => ({ id }),
+         deliverSubscriptionSuccess: true,
+         deliverSubscriptionFailure: true,
++        setSubscriptionEnabled: (id: number, enabled: boolean) => ({ id, enabled }),
++        setSubscriptionEnabledSuccess: true,
++        setSubscriptionEnabledFailure: true,
+     }),
+ 
+     loaders(({ props }) => ({
+@@ -57,6 +61,14 @@ export const subscriptionsLogic = kea<subscriptionsLogicType>([
+                 deliverSubscriptionFailure: () => null,
+             },
+         ],
++        togglingEnabledId: [
++            null as number | null,
++            {
++                setSubscriptionEnabled: (_, { id }) => id,
++                setSubscriptionEnabledSuccess: () => null,
++                setSubscriptionEnabledFailure: () => null,
++            },
++        ],
+     }),
+ 
+     listeners(({ actions }) => ({
+@@ -75,6 +87,15 @@ export const subscriptionsLogic = kea<subscriptionsLogicType>([
+                 actions.deliverSubscriptionFailure()
+             }
+         },
++        setSubscriptionEnabled: async ({ id, enabled }) => {
++            const ok = await toggleSubscriptionEnabled(id, enabled)
++            if (ok) {
++                actions.setSubscriptionEnabledSuccess()
++            } else {
++                actions.setSubscriptionEnabledFailure()
++            }
++        },
++        setSubscriptionEnabledSuccess: () => actions.loadSubscriptions(),
+     })),
+ 
+     afterMount(({ actions }) => actions.loadSubscriptions()),
+diff --git a/frontend/src/lib/components/Subscriptions/toggleSubscriptionEnabled.ts b/frontend/src/lib/components/Subscriptions/toggleSubscriptionEnabled.ts
+new file mode 100644
+index 00000000000..68c664c00d2
+--- /dev/null
++++ b/frontend/src/lib/components/Subscriptions/toggleSubscriptionEnabled.ts
+@@ -0,0 +1,16 @@
++import { lemonToast } from 'lib/lemon-ui/LemonToast'
++import { getCurrentTeamId } from 'lib/utils/getAppContext'
++
++import { subscriptionsPartialUpdate } from '~/generated/core/api'
++
++export async function toggleSubscriptionEnabled(id: number, enabled: boolean): Promise<boolean> {
++    try {
++        await subscriptionsPartialUpdate(String(getCurrentTeamId()), id, { enabled })
++        lemonToast.success(enabled ? 'Subscription enabled' : 'Subscription disabled')
++        return true
++    } catch (e: any) {
++        const detail = typeof e?.detail === 'string' ? e.detail : null
++        lemonToast.error(detail ?? 'Could not update subscription')
++        return false
++    }
++}
+diff --git a/frontend/src/lib/components/Subscriptions/views/EditSubscription.tsx b/frontend/src/lib/components/Subscriptions/views/EditSubscription.tsx
+index a8163b15bd2..5700cd0f64a 100644
+--- a/frontend/src/lib/components/Subscriptions/views/EditSubscription.tsx
++++ b/frontend/src/lib/components/Subscriptions/views/EditSubscription.tsx
+@@ -2,7 +2,7 @@ import { useActions, useValues } from 'kea'
+ import { Form } from 'kea-forms'
+ 
+ import { IconChevronLeft } from '@posthog/icons'
+-import { LemonInput, LemonTextArea, Link } from '@posthog/lemon-ui'
++import { LemonCheckbox, LemonInput, LemonTextArea, Link } from '@posthog/lemon-ui'
+ 
+ import { IntegrationChoice } from 'lib/components/CyclotronJob/integrations/IntegrationChoice'
+ import { FlaggedFeature } from 'lib/components/FlaggedFeature'
+@@ -174,9 +174,21 @@ export function EditSubscription({
+                             </LemonBanner>
+                         )}
+ 
+-                        <LemonField name="title" label="Name">
+-                            <LemonInput placeholder="e.g. Weekly team report" />
+-                        </LemonField>
++                        <div className="flex gap-4 items-end">
++                            <LemonField className="flex-auto" name="title" label="Name">
++                                <LemonInput placeholder="e.g. Weekly team report" />
++                            </LemonField>
++                            <LemonField name="enabled" className="pb-2">
++                                {({ value, onChange }) => (
++                                    <LemonCheckbox
++                                        checked={value !== false}
++                                        onChange={onChange}
++                                        data-attr="subscription-enabled"
++                                        label="Enabled"
++                                    />
++                                )}
++                            </LemonField>
++                        </div>
+ 
+                         {dashboard?.tiles && selectionReady && (
+                             <LemonField name="dashboard_export_insights" label="Insights to include">
+diff --git a/frontend/src/lib/components/Subscriptions/views/ManageSubscriptions.tsx b/frontend/src/lib/components/Subscriptions/views/ManageSubscriptions.tsx
+index 8f8e6ac1d43..de097eb8b05 100644
+--- a/frontend/src/lib/components/Subscriptions/views/ManageSubscriptions.tsx
++++ b/frontend/src/lib/components/Subscriptions/views/ManageSubscriptions.tsx
+@@ -1,6 +1,7 @@
+ import { useActions, useValues } from 'kea'
+ 
+ import { IconEllipsis } from '@posthog/icons'
++import { LemonTag } from '@posthog/lemon-ui'
+ 
+ import { dayjs } from 'lib/dayjs'
+ import { IconSlack } from 'lib/lemon-ui/icons'
+@@ -10,6 +11,7 @@ import { LemonSkeleton } from 'lib/lemon-ui/LemonSkeleton'
+ import { ProfileBubbles } from 'lib/lemon-ui/ProfilePicture'
+ import { Spinner } from 'lib/lemon-ui/Spinner'
+ import { capitalizeFirstLetter, pluralize } from 'lib/utils'
++import { isSubscriptionEnabled } from 'scenes/subscriptions/components/SubscriptionsTable'
+ 
+ import { SubscriptionType } from '~/types'
+ 
+@@ -21,7 +23,9 @@ interface SubscriptionListItemProps {
+     onClick: () => void
+     onDelete?: () => void
+     onDeliver?: () => void
++    onToggleEnabled?: (enabled: boolean) => void
+     isDelivering?: boolean
++    isToggling?: boolean
+ }
+ 
+ export function SubscriptionListItem({
+@@ -29,9 +33,13 @@ export function SubscriptionListItem({
+     onClick,
+     onDelete,
+     onDeliver,
++    onToggleEnabled,
+     isDelivering,
++    isToggling,
+ }: SubscriptionListItemProps): JSX.Element {
+     const selectedInsightsCount = subscription.dashboard_export_insights?.length
++    const enabled = isSubscriptionEnabled(subscription)
++    const sideActionBusy = isDelivering || isToggling
+ 
+     return (
+         <LemonButton
+@@ -40,12 +48,22 @@ export function SubscriptionListItem({
+             data-attr="subscription-list-item"
+             fullWidth
+             sideAction={{
+-                icon: isDelivering ? <Spinner /> : <IconEllipsis />,
+-                disabled: isDelivering,
++                icon: sideActionBusy ? <Spinner /> : <IconEllipsis />,
++                disabled: sideActionBusy,
+                 dropdown: {
+                     overlay: (
+                         <>
+-                            {onDeliver && (
++                            {onToggleEnabled && (
++                                <LemonButton
++                                    onClick={() => onToggleEnabled(!enabled)}
++                                    data-attr="subscription-list-item-toggle-enabled"
++                                    fullWidth
++                                    disabled={isToggling}
++                                >
++                                    {enabled ? 'Disable subscription' : 'Enable subscription'}
++                                </LemonButton>
++                            )}
++                            {onDeliver && enabled && (
+                                 <LemonButton
+                                     onClick={onDeliver}
+                                     data-attr="subscription-list-item-manual-deliver"
+@@ -72,14 +90,18 @@ export function SubscriptionListItem({
+         >
+             <div className="flex justify-between flex-auto items-center p-2">
+                 <div>
+-                    <div className="text-link font-medium">{subscription.title}</div>
++                    <div className={`font-medium ${enabled ? 'text-link' : 'text-muted'}`}>{subscription.title}</div>
+                     <div className="text-sm text-text-3000">
+                         {capitalizeFirstLetter(subscription.summary)}
+                         {selectedInsightsCount
+                             ? ` · ${pluralize(selectedInsightsCount, 'insight', 'insights', true)}`
+                             : null}
+                     </div>
+-                    {subscription.next_delivery_date ? (
++                    {!enabled ? (
++                        <LemonTag type="danger" size="small" className="mt-1">
++                            Disabled
++                        </LemonTag>
++                    ) : subscription.next_delivery_date ? (
+                         <div className="text-xs text-secondary">
+                             Next delivery: {dayjs(subscription.next_delivery_date).format('ddd, MMM D [at] HH:mm')}
+                         </div>
+@@ -113,8 +135,8 @@ export function ManageSubscriptions({
+         dashboardId,
+     })
+ 
+-    const { subscriptions, subscriptionsLoading, deliveringSubscriptionId } = useValues(logic)
+-    const { deleteSubscription, deliverSubscription } = useActions(logic)
++    const { subscriptions, subscriptionsLoading, deliveringSubscriptionId, togglingEnabledId } = useValues(logic)
++    const { deleteSubscription, deliverSubscription, setSubscriptionEnabled } = useActions(logic)
+ 
+     const subscriptionResourceNoun = !insightShortId && dashboardId ? 'dashboard' : 'insight'
+ 
+@@ -132,8 +154,7 @@ export function ManageSubscriptions({
+                 ) : subscriptions.length ? (
+                     <div className="deprecated-space-y-2">
+                         <div>
+-                            <strong>{subscriptions?.length}</strong>
+-                            {' active '}
++                            <strong>{subscriptions?.length}</strong>{' '}
+                             {pluralize(subscriptions.length || 0, 'subscription', 'subscriptions', false)}
+                         </div>
+ 
+@@ -145,7 +166,9 @@ export function ManageSubscriptions({
+                                     onClick={() => onSelect(sub.id)}
+                                     onDelete={() => deleteSubscription(sub.id)}
+                                     onDeliver={() => deliverSubscription(sub.id)}
++                                    onToggleEnabled={(enabled) => setSubscriptionEnabled(sub.id, enabled)}
+                                     isDelivering={deliveringSubscriptionId === sub.id}
++                                    isToggling={togglingEnabledId === sub.id}
+                                 />
+                             ))}
+                         </div>
+diff --git a/frontend/src/scenes/subscriptions/SubscriptionScene.tsx b/frontend/src/scenes/subscriptions/SubscriptionScene.tsx
+index c3254d32031..2b63fdac5b4 100644
+--- a/frontend/src/scenes/subscriptions/SubscriptionScene.tsx
++++ b/frontend/src/scenes/subscriptions/SubscriptionScene.tsx
+@@ -1,7 +1,7 @@
+ import { useActions, useValues } from 'kea'
+ import { router } from 'kea-router'
+ 
+-import { LemonButton } from '@posthog/lemon-ui'
++import { LemonButton, LemonTag } from '@posthog/lemon-ui'
+ 
+ import { NotFound } from 'lib/components/NotFound'
+ import { PayGateMini } from 'lib/components/PayGateMini/PayGateMini'
+@@ -18,7 +18,7 @@ import { AvailableFeature } from '~/types'
+ 
+ import { SubscriptionDeliveryHistory } from './components/SubscriptionDeliveryHistory'
+ import { SubscriptionsLoadingSkeleton } from './components/SubscriptionsLoadingSkeleton'
+-import { subscriptionEditHref, subscriptionName } from './components/SubscriptionsTable'
++import { isSubscriptionEnabled, subscriptionEditHref, subscriptionName } from './components/SubscriptionsTable'
+ import { SubscriptionSummary } from './components/SubscriptionSummary'
+ import { subscriptionSceneLogic } from './subscriptionSceneLogic'
+ import { subscriptionsSceneLogic } from './subscriptionsSceneLogic'
+@@ -26,8 +26,11 @@ import { subscriptionsSceneLogic } from './subscriptionsSceneLogic'
+ function SubscriptionDetailActions({ sub, tabId }: { sub: SubscriptionApi; tabId?: string }): JSX.Element {
+     const { push } = useActions(router)
+     const { activeTabId } = useValues(sceneLogic)
++    const { setEnabled } = useActions(subscriptionSceneLogic)
++    const { subscriptionLoading } = useValues(subscriptionSceneLogic)
+     const listTabId = tabId ?? activeTabId ?? undefined
+     const editHref = subscriptionEditHref(sub)
++    const enabled = isSubscriptionEnabled(sub)
+ 
+     const deleteSubscription = (): void => {
+         const name = subscriptionName(sub)
+@@ -48,6 +51,17 @@ function SubscriptionDetailActions({ sub, tabId }: { sub: SubscriptionApi; tabId
+ 
+     return (
+         <div className="flex flex-wrap items-center gap-2">
++            <LemonTag type={enabled ? 'success' : 'danger'} data-attr="subscription-status-tag">
++                {enabled ? 'Enabled' : 'Disabled'}
++            </LemonTag>
++            <LemonButton
++                type="secondary"
++                onClick={() => setEnabled({ enabled: !enabled })}
++                loading={subscriptionLoading}
++                data-attr="subscription-toggle-enabled"
++            >
++                {enabled ? 'Disable subscription' : 'Enable subscription'}
++            </LemonButton>
+             {editHref ? (
+                 <LemonButton type="secondary" onClick={() => push(editHref)}>
+                     Edit subscription
+@@ -108,7 +122,13 @@ export function SubscriptionScene({ tabId }: SceneProps): JSX.Element {
+                                 ) : undefined
+                             }
+                         />
+-                        {subscription ? <SubscriptionSummary sub={subscription} /> : null}
++                        {subscription ? (
++                            // Mute the body when the subscription is paused — the LemonTag in the
++                            // header is the explicit signal; this is the at-a-glance reinforcement.
++                            <div className={isSubscriptionEnabled(subscription) ? '' : 'opacity-60'}>
++                                <SubscriptionSummary sub={subscription} />
++                            </div>
++                        ) : null}
+                         {deliveriesEnabled ? (
+                             <SubscriptionDeliveryHistory
+                                 deliveriesPage={deliveriesPage}
+diff --git a/frontend/src/scenes/subscriptions/SubscriptionsScene.tsx b/frontend/src/scenes/subscriptions/SubscriptionsScene.tsx
+index 50ff7c2cd43..a167de7e746 100644
+--- a/frontend/src/scenes/subscriptions/SubscriptionsScene.tsx
++++ b/frontend/src/scenes/subscriptions/SubscriptionsScene.tsx
+@@ -23,15 +23,23 @@ import { AvailableFeature } from '~/types'
+ 
+ import { SubscriptionsFiltersBar } from './components/SubscriptionsFiltersBar'
+ import { SubscriptionsLoadingSkeleton } from './components/SubscriptionsLoadingSkeleton'
+-import { SubscriptionsTable, subscriptionEditHref, subscriptionName } from './components/SubscriptionsTable'
++import {
++    SubscriptionsTable,
++    isSubscriptionEnabled,
++    subscriptionEditHref,
++    subscriptionName,
++} from './components/SubscriptionsTable'
+ import { SubscriptionsTab, subscriptionsSceneLogic } from './subscriptionsSceneLogic'
+ 
+ function SubscriptionsRowActions({ sub }: { sub: SubscriptionApi }): JSX.Element {
+     const { push } = useActions(router)
+-    const { deleteSubscriptionSuccess, deliverSubscription } = useActions(subscriptionsSceneLogic)
+-    const { deliveringSubscriptionId } = useValues(subscriptionsSceneLogic)
++    const { deleteSubscriptionSuccess, deliverSubscription, setSubscriptionEnabled } =
++        useActions(subscriptionsSceneLogic)
++    const { deliveringSubscriptionId, togglingEnabledId } = useValues(subscriptionsSceneLogic)
+     const href = subscriptionEditHref(sub)
+     const isDelivering = deliveringSubscriptionId === sub.id
++    const isToggling = togglingEnabledId === sub.id
++    const enabled = isSubscriptionEnabled(sub)
+ 
+     return (
+         <LemonMenu
+@@ -45,11 +53,21 @@ function SubscriptionsRowActions({ sub }: { sub: SubscriptionApi }): JSX.Element
+                       ]
+                     : []),
+                 {
+-                    label: 'Test delivery',
+-                    'data-attr': 'subscription-list-item-manual-deliver',
+-                    disabledReason: isDelivering ? 'Sending test delivery…' : null,
+-                    onClick: () => deliverSubscription(sub.id),
++                    label: enabled ? 'Disable subscription' : 'Enable subscription',
++                    'data-attr': 'subscription-list-item-toggle-enabled',
++                    disabledReason: isToggling ? 'Updating…' : null,
++                    onClick: () => setSubscriptionEnabled(sub.id, !enabled),
+                 },
++                ...(enabled
++                    ? [
++                          {
++                              label: 'Test delivery',
++                              'data-attr': 'subscription-list-item-manual-deliver',
++                              disabledReason: isDelivering ? 'Sending test delivery…' : null,
++                              onClick: () => deliverSubscription(sub.id),
++                          },
++                      ]
++                    : []),
+                 {
+                     label: 'Delete',
+                     status: 'danger' as const,
+@@ -66,10 +84,10 @@ function SubscriptionsRowActions({ sub }: { sub: SubscriptionApi }): JSX.Element
+             ]}
+         >
+             <LemonButton
+-                icon={isDelivering ? <Spinner /> : <IconEllipsis />}
++                icon={isDelivering || isToggling ? <Spinner /> : <IconEllipsis />}
+                 size="small"
+                 aria-label="Subscription actions"
+-                disabled={isDelivering}
++                disabled={isDelivering || isToggling}
+             />
+         </LemonMenu>
+     )
+diff --git a/frontend/src/scenes/subscriptions/components/SubscriptionsTable.stories.tsx b/frontend/src/scenes/subscriptions/components/SubscriptionsTable.stories.tsx
+index 3dd17b40d82..7f1dcce14a4 100644
+--- a/frontend/src/scenes/subscriptions/components/SubscriptionsTable.stories.tsx
++++ b/frontend/src/scenes/subscriptions/components/SubscriptionsTable.stories.tsx
+@@ -39,6 +39,7 @@ const MOCK_SUBSCRIPTIONS: SubscriptionApi[] = [
+         summary: 'sent every week',
+         next_delivery_date: '2026-04-07T17:00:00Z',
+         deleted: false,
++        enabled: true,
+     },
+     {
+         id: 2,
+@@ -58,6 +59,7 @@ const MOCK_SUBSCRIPTIONS: SubscriptionApi[] = [
+         summary: 'sent every day',
+         next_delivery_date: '2026-04-08T09:00:00Z',
+         deleted: false,
++        enabled: true,
+         integration_id: 1,
+     },
+     {
+@@ -78,6 +80,7 @@ const MOCK_SUBSCRIPTIONS: SubscriptionApi[] = [
+         summary: 'sent every month',
+         next_delivery_date: null,
+         deleted: false,
++        enabled: true,
+     },
+     {
+         id: 4,
+@@ -97,6 +100,28 @@ const MOCK_SUBSCRIPTIONS: SubscriptionApi[] = [
+         summary: 'sent every week',
+         next_delivery_date: '2026-04-14T12:00:00Z',
+         deleted: false,
++        enabled: true,
++    },
++    {
++        id: 5,
++        insight: 105,
++        dashboard: null,
++        insight_short_id: 'disabled-insight',
++        resource_name: 'Activation funnel',
++        title: 'Auto-paused after integration broke',
++        dashboard_export_insights: [],
++        target_type: TargetTypeEnumApi.Slack,
++        target_value: 'C99999|#archived-channel',
++        frequency: SubscriptionFrequencyEnumApi.Weekly,
++        interval: 1,
++        start_date: '2022-01-01T00:00:00Z',
++        created_at: '2023-04-27T10:04:37.977401Z',
++        created_by: MOCK_USER,
++        summary: 'sent every week',
++        next_delivery_date: null,
++        deleted: false,
++        enabled: false,
++        integration_id: 1,
+     },
+ ]
+ 
+@@ -135,6 +160,7 @@ function buildMockSubscriptions(total: number): SubscriptionApi[] {
+             summary: 'sent every week',
+             next_delivery_date: '2026-04-07T17:00:00Z',
+             deleted: false,
++            enabled: true,
+             ...(isSlack ? { integration_id: 1 } : {}),
+         }
+     })
+diff --git a/frontend/src/scenes/subscriptions/components/SubscriptionsTable.tsx b/frontend/src/scenes/subscriptions/components/SubscriptionsTable.tsx
+index 2115ed0e21d..625419a64b8 100644
+--- a/frontend/src/scenes/subscriptions/components/SubscriptionsTable.tsx
++++ b/frontend/src/scenes/subscriptions/components/SubscriptionsTable.tsx
+@@ -1,4 +1,4 @@
+-import { LemonTable, LemonTableColumn, LemonTableColumns, Link, Tooltip } from '@posthog/lemon-ui'
++import { LemonTable, LemonTableColumn, LemonTableColumns, LemonTag, Link, Tooltip } from '@posthog/lemon-ui'
+ import type { PaginationManual, Sorting } from '@posthog/lemon-ui'
+ 
+ import { TZLabel } from 'lib/components/TZLabel'
+@@ -20,6 +20,10 @@ export function subscriptionName(sub: SubscriptionApi): string {
+     return sub.title?.trim() || sub.resource_name?.trim() || 'Untitled subscription'
+ }
+ 
++export function isSubscriptionEnabled(sub: { enabled?: boolean | null }): boolean {
++    return sub.enabled !== false
++}
++
+ export function subscriptionEditHref(sub: SubscriptionApi): string | null {
+     if (sub.insight && sub.insight_short_id) {
+         return urls.insightSubcription(sub.insight_short_id as InsightShortId, String(sub.id))
+@@ -94,7 +98,7 @@ function buildColumns(renderRowActions: (sub: SubscriptionApi) => JSX.Element):
+                         <div className="min-w-0 w-full overflow-hidden">
+                             <Link
+                                 to={urls.subscription(sub.id)}
+-                                className="font-medium block truncate"
++                                className={`font-medium block truncate ${isSubscriptionEnabled(sub) ? '' : 'text-muted'}`}
+                                 data-attr="subscription-name-link"
+                             >
+                                 {name}
+@@ -185,6 +189,17 @@ function buildColumns(renderRowActions: (sub: SubscriptionApi) => JSX.Element):
+             >),
+             sorter: true,
+         },
++        {
++            title: 'Status',
++            key: 'enabled',
++            dataIndex: 'enabled',
++            render: (_value: unknown, sub: SubscriptionApi) =>
++                isSubscriptionEnabled(sub) ? (
++                    <LemonTag type="success">Enabled</LemonTag>
++                ) : (
++                    <LemonTag type="danger">Disabled</LemonTag>
++                ),
++        },
+         {
+             width: 56,
+             align: 'right',
+diff --git a/frontend/src/scenes/subscriptions/components/subscriptionStoryFixtures.ts b/frontend/src/scenes/subscriptions/components/subscriptionStoryFixtures.ts
+index ef358be87ac..46316aaa4f1 100644
+--- a/frontend/src/scenes/subscriptions/components/subscriptionStoryFixtures.ts
++++ b/frontend/src/scenes/subscriptions/components/subscriptionStoryFixtures.ts
+@@ -33,6 +33,7 @@ export const MOCK_SUBSCRIPTION_INSIGHT: SubscriptionApi = {
+     summary: 'sent every week',
+     next_delivery_date: '2026-04-07T17:00:00Z',
+     deleted: false,
++    enabled: true,
+ }
+ 
+ /** Insight subscription with several email recipients so Resource shows the type label, not the long name. */
+@@ -62,6 +63,7 @@ export const MOCK_SUBSCRIPTION_DASHBOARD: SubscriptionApi = {
+     summary: 'sent every day',
+     next_delivery_date: '2026-04-08T09:00:00Z',
+     deleted: false,
++    enabled: true,
+     integration_id: 1,
+ }
+ 
+diff --git a/frontend/src/scenes/subscriptions/subscriptionSceneLogic.tsx b/frontend/src/scenes/subscriptions/subscriptionSceneLogic.tsx
+index 3fd347a9ca8..c6cd5f02617 100644
+--- a/frontend/src/scenes/subscriptions/subscriptionSceneLogic.tsx
++++ b/frontend/src/scenes/subscriptions/subscriptionSceneLogic.tsx
+@@ -13,6 +13,7 @@ import { urls } from 'scenes/urls'
+ 
+ import {
+     subscriptionsDeliveriesList,
++    subscriptionsPartialUpdate,
+     subscriptionsRetrieve,
+     subscriptionsTestDeliveryCreate,
+ } from '~/generated/core/api'
+@@ -84,6 +85,16 @@ export const subscriptionSceneLogic = kea<subscriptionSceneLogicType>([
+                     }
+                     return await subscriptionsRetrieve(String(getCurrentTeamId()), numericId)
+                 },
++                // Used by the Pause / Resume button on the detail page. PATCH
++                // returns the updated subscription so the loader replaces the
++                // whole value — no extra GET needed.
++                setEnabled: async ({ enabled }: { enabled: boolean }) => {
++                    const numericId = parseInt(props.id, 10)
++                    if (!Number.isFinite(numericId)) {
++                        return values.subscription
++                    }
++                    return await subscriptionsPartialUpdate(String(getCurrentTeamId()), numericId, { enabled })
++                },
+             },
+         ],
+         deliveriesPage: [
+@@ -195,6 +206,18 @@ export const subscriptionSceneLogic = kea<subscriptionSceneLogicType>([
+                       : 'Could not load delivery history.'
+             lemonToast.error(message)
+         },
++        setEnabledSuccess: ({ subscription }) => {
++            if (!subscription) {
++                return
++            }
++            lemonToast.success(subscription.enabled ? 'Subscription enabled' : 'Subscription disabled')
++        },
++        setEnabledFailure: ({ errorObject }) => {
++            // Surface the serializer's actionable message (e.g. re-enabling a Slack
++            // sub with no integration) — backend already validates this.
++            const detail = errorObject?.detail
++            lemonToast.error(typeof detail === 'string' ? detail : 'Could not update subscription')
++        },
+     })),
+     afterMount(({ actions }) => {
+         void actions.loadSubscription()
+diff --git a/frontend/src/scenes/subscriptions/subscriptionsSceneLogic.tsx b/frontend/src/scenes/subscriptions/subscriptionsSceneLogic.tsx
+index e59677b9fb0..96a4abf51e0 100644
+--- a/frontend/src/scenes/subscriptions/subscriptionsSceneLogic.tsx
++++ b/frontend/src/scenes/subscriptions/subscriptionsSceneLogic.tsx
+@@ -5,6 +5,7 @@ import { router } from 'kea-router'
+ import { Sorting } from '@posthog/lemon-ui'
+ 
+ import { runSubscriptionTestDelivery } from 'lib/components/Subscriptions/runSubscriptionTestDelivery'
++import { toggleSubscriptionEnabled } from 'lib/components/Subscriptions/toggleSubscriptionEnabled'
+ import { tabAwareActionToUrl } from 'lib/logic/scenes/tabAwareActionToUrl'
+ import { tabAwareScene } from 'lib/logic/scenes/tabAwareScene'
+ import { tabAwareUrlToAction } from 'lib/logic/scenes/tabAwareUrlToAction'
+@@ -209,6 +210,9 @@ export const subscriptionsSceneLogic = kea<subscriptionsSceneLogicType>([
+         deliverSubscription: (id: number) => ({ id }),
+         deliverSubscriptionSuccess: true,
+         deliverSubscriptionFailure: true,
++        setSubscriptionEnabled: (id: number, enabled: boolean) => ({ id, enabled }),
++        setSubscriptionEnabledSuccess: true,
++        setSubscriptionEnabledFailure: true,
+     }),
+     reducers({
+         search: [
+@@ -280,6 +284,16 @@ export const subscriptionsSceneLogic = kea<subscriptionsSceneLogicType>([
+                 deliverSubscriptionFailure: () => null,
+             },
+         ],
++        // Tracks the subscription whose Pause/Resume PATCH is in flight so the row's
++        // menu item can show a busy state and prevent double-clicks.
++        togglingEnabledId: [
++            null as number | null,
++            {
++                setSubscriptionEnabled: (_, { id }) => id,
++                setSubscriptionEnabledSuccess: () => null,
++                setSubscriptionEnabledFailure: () => null,
++            },
++        ],
+     }),
+     loaders(({ values }) => ({
+         subscriptionsResponse: [
+@@ -372,6 +386,15 @@ export const subscriptionsSceneLogic = kea<subscriptionsSceneLogicType>([
+                 actions.deliverSubscriptionFailure()
+             }
+         },
++        setSubscriptionEnabled: async ({ id, enabled }) => {
++            const ok = await toggleSubscriptionEnabled(id, enabled)
++            if (ok) {
++                actions.setSubscriptionEnabledSuccess()
++            } else {
++                actions.setSubscriptionEnabledFailure()
++            }
++        },
++        setSubscriptionEnabledSuccess: () => actions.loadSubscriptions(),
+     })),
+     tabAwareActionToUrl(({ values }) => {
+         const syncUrl = (
+diff --git a/frontend/src/types.ts b/frontend/src/types.ts
+index 4d86b360f03..ed055b9d417 100644
+--- a/frontend/src/types.ts
++++ b/frontend/src/types.ts
+@@ -5026,6 +5026,9 @@ export enum ValueOptionType {
+ 
+ export type WeekdayType = 'monday' | 'tuesday' | 'wednesday' | 'thursday' | 'friday' | 'saturday' | 'sunday'
+ 
++// TODO: migrate to SubscriptionApi from frontend/src/generated/core/api.schemas.ts.
++// This hand-written interface predates the generated type and now requires
++// dual-maintenance for every backend field change.
+ export interface SubscriptionType {
+     id: number
+     insight?: number
+@@ -5048,6 +5051,7 @@ export interface SubscriptionType {
+     created_by?: UserBasicType | null
+     created_at: string
+     deleted?: boolean
++    enabled?: boolean
+     summary_enabled?: boolean
+     summary_prompt_guide?: string
+ }
+diff --git a/posthog/migrations/1146_subscription_enabled.py b/posthog/migrations/1146_subscription_enabled.py
+new file mode 100644
+index 00000000000..8f3d1809340
+--- /dev/null
++++ b/posthog/migrations/1146_subscription_enabled.py
+@@ -0,0 +1,13 @@
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++    dependencies = [("posthog", "1145_alter_integration_kind")]
++
++    operations = [
++        migrations.AddField(
++            model_name="subscription",
++            name="enabled",
++            field=models.BooleanField(default=True),
++        ),
++    ]
+diff --git a/posthog/migrations/max_migration.txt b/posthog/migrations/max_migration.txt
+index bd25447b4db..5f649ddf0d5 100644
+--- a/posthog/migrations/max_migration.txt
++++ b/posthog/migrations/max_migration.txt
+@@ -1 +1 @@
+-1145_alter_integration_kind
++1146_subscription_enabled
+diff --git a/posthog/models/subscription.py b/posthog/models/subscription.py
+index 277fca91532..e744f24ad20 100644
+--- a/posthog/models/subscription.py
++++ b/posthog/models/subscription.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass
+-from datetime import timedelta
++from datetime import datetime, timedelta
+ from typing import Any, Literal, Optional, cast
+ 
+ from django.contrib.postgres.fields import ArrayField
+@@ -67,6 +67,13 @@ class Subscription(models.Model):
+ 
+     RRULE_FIELDS = {"frequency", "count", "interval", "start_date", "until_date", "bysetpos", "byweekday"}
+ 
++    _FREQ_MAP: dict[str, int] = {
++        SubscriptionFrequency.DAILY: DAILY,
++        SubscriptionFrequency.WEEKLY: WEEKLY,
++        SubscriptionFrequency.MONTHLY: MONTHLY,
++        SubscriptionFrequency.YEARLY: YEARLY,
++    }
++
+     # Relations - i.e. WHAT are we exporting?
+     team = models.ForeignKey("Team", on_delete=models.CASCADE)
+     dashboard = models.ForeignKey("dashboards.Dashboard", on_delete=models.CASCADE, null=True)
+@@ -111,6 +118,10 @@ class Subscription(models.Model):
+     created_by = models.ForeignKey("User", on_delete=models.SET_NULL, null=True, blank=True)
+     deleted = models.BooleanField(default=False)
+ 
++    # False when paused or auto-disabled because the delivery prerequisite is
++    # permanently invalid (e.g. Slack integration disconnected).
++    enabled = models.BooleanField(default=True)
++
+     summary_enabled = models.BooleanField(default=False)
+     summary_prompt_guide = models.CharField(max_length=500, blank=True, default="")
+ 
+@@ -137,31 +148,57 @@ class Subscription(models.Model):
+                 kwargs["update_fields"].append("next_delivery_date")
+         super().save(*args, **kwargs)
+ 
+-    @property
+-    def rrule(self):
+-        freq_map: dict[str, int] = {
+-            self.SubscriptionFrequency.DAILY: DAILY,
+-            self.SubscriptionFrequency.WEEKLY: WEEKLY,
+-            self.SubscriptionFrequency.MONTHLY: MONTHLY,
+-            self.SubscriptionFrequency.YEARLY: YEARLY,
+-        }
+-        freq = cast(Literal[0, 1, 2, 3, 4, 5, 6], freq_map[self.frequency])
++    @staticmethod
++    def _build_rrule(
++        *,
++        frequency: str,
++        start_date: Any,
++        count: Any = None,
++        interval: Any = None,
++        until_date: Any = None,
++        bysetpos: Any = None,
++        byweekday: Any = None,
++    ) -> rrule:
++        freq = cast(Literal[0, 1, 2, 3, 4, 5, 6], Subscription._FREQ_MAP[frequency])
+         return rrule(
+             freq=freq,
+-            count=self.count,
+-            interval=self.interval,
+-            dtstart=self.start_date,
+-            until=self.until_date,
+-            bysetpos=self.bysetpos if self.byweekday else None,
+-            byweekday=to_rrule_weekdays(self.byweekday) if self.byweekday else None,
++            count=count,
++            interval=interval,
++            dtstart=start_date,
++            until=until_date,
++            bysetpos=bysetpos if byweekday else None,
++            byweekday=to_rrule_weekdays(byweekday) if byweekday else None,
+         )
+ 
+-    def set_next_delivery_date(self, from_dt=None):
++    @staticmethod
++    def _compute_next_delivery_date(*, from_dt: Optional[datetime] = None, **rrule_fields: Any) -> Optional[datetime]:
++        # Buffer of 15 minutes since we might run a bit early — never schedule into the past.
++        now = timezone.now() + timedelta(minutes=15)
++        return Subscription._build_rrule(**rrule_fields).after(dt=max(from_dt or now, now), inc=False)
++
++    @property
++    def rrule(self) -> rrule:
++        return self._build_rrule(**{f: getattr(self, f) for f in self.RRULE_FIELDS})
++
++    def set_next_delivery_date(self, from_dt: Optional[datetime] = None) -> None:
+         # Authoritative schedule — a client-side preview mirror lives in
+-        # frontend/src/lib/components/Subscriptions/utils.tsx (getNextDeliveryDate)
+-        # We never want next_delivery_date to be in the past
+-        now = timezone.now() + timedelta(minutes=15)  # Buffer of 15 minutes since we might run a bit early
+-        self.next_delivery_date = self.rrule.after(dt=max(from_dt or now, now), inc=False)
++        # frontend/src/lib/components/Subscriptions/utils.tsx (getNextDeliveryDate).
++        self.next_delivery_date = self._compute_next_delivery_date(
++            from_dt=from_dt, **{f: getattr(self, f) for f in self.RRULE_FIELDS}
++        )
++
++    @classmethod
++    def project_next_delivery_date(
++        cls, instance: Optional["Subscription"] = None, **overrides: Any
++    ) -> Optional[datetime]:
++        """What `next_delivery_date` would be for the rrule defined by `instance` fields
++        (when given) layered with `overrides`, without persisting. Returns None on an
++        exhausted rrule. Pass `instance` for PATCH validation, omit it for creates."""
++        base = {f: getattr(instance, f) for f in cls.RRULE_FIELDS} if instance is not None else {}
++        merged = {**base, **{k: v for k, v in overrides.items() if k in cls.RRULE_FIELDS}}
++        if "frequency" not in merged or "start_date" not in merged:
++            return None  # DRF field validation should reject before we get here.
++        return cls._compute_next_delivery_date(**merged)
+ 
+     @property
+     def url(self):
+diff --git a/posthog/templates/email/subscription_disabled.html b/posthog/templates/email/subscription_disabled.html
+new file mode 100644
+index 00000000000..edfe8be9805
+--- /dev/null
++++ b/posthog/templates/email/subscription_disabled.html
+@@ -0,0 +1,15 @@
++{% extends "email/base.html" %} {% load posthog_assets %} {% load posthog_filters %} {% block section %}
++    <p>
++        Your subscription <strong>{{ subscription_title }}</strong> has been
++        <strong>automatically disabled</strong> because:
++    </p>
++    <p><i>{{ reason }}</i></p>
++    <p>
++        To resume delivery, fix the issue above and re-enable the subscription.
++    </p>
++    {% if subscription_url %}
++    <div class="mb mt text-center">
++        <a class="button" href="{% absolute_uri subscription_url %}">Manage subscription</a>
++    </div>
++    {% endif %}
++{% endblock %}
+diff --git a/posthog/temporal/subscriptions/__init__.py b/posthog/temporal/subscriptions/__init__.py
+index de559dab85f..4e6fa30bc1e 100644
+--- a/posthog/temporal/subscriptions/__init__.py
++++ b/posthog/temporal/subscriptions/__init__.py
+@@ -5,6 +5,7 @@ from posthog.temporal.subscriptions.activities import (
+     deliver_subscription,
+     fetch_due_subscriptions_activity,
+     update_delivery_record,
++    validate_subscription_for_delivery,
+ )
+ from posthog.temporal.subscriptions.snapshot_activities import snapshot_subscription_insights
+ from posthog.temporal.subscriptions.workflows import (
+@@ -17,6 +18,7 @@ WORKFLOWS = [ScheduleAllSubscriptionsWorkflow, HandleSubscriptionValueChangeWork
+ 
+ ACTIVITIES = [
+     fetch_due_subscriptions_activity,
++    validate_subscription_for_delivery,
+     create_export_assets,
+     deliver_subscription,
+     advance_next_delivery_date,
+diff --git a/posthog/temporal/subscriptions/activities.py b/posthog/temporal/subscriptions/activities.py
+index 5118cabe0fb..5e46e5d33ac 100644
+--- a/posthog/temporal/subscriptions/activities.py
++++ b/posthog/temporal/subscriptions/activities.py
+@@ -28,13 +28,21 @@ from posthog.temporal.subscriptions.types import (
+     DeliverSubscriptionResult,
+     FetchDueSubscriptionsActivityInputs,
+     RecipientResult,
++    SubscriptionAbortInfo,
+     SubscriptionInfo,
+     UpdateDeliveryRecordInputs,
+ )
+ 
+ from products.dashboards.backend.models.dashboard_tile import DashboardTile
+ 
+-from ee.tasks.subscriptions import SLACK_USER_CONFIG_ERRORS, SUPPORTED_TARGET_TYPES, _capture_delivery_failed_event
++from ee.tasks.subscriptions import SLACK_USER_CONFIG_ERRORS, _capture_delivery_failed_event
++from ee.tasks.subscriptions.auto_disable import (
++    SLACK_DISCONNECTED_DISABLE_REASON,
++    UNSUPPORTED_TARGET_DISABLE_REASON,
++    DisableReason,
++    disable_invalid_subscription,
++    get_subscription_disable_reason,
++)
+ from ee.tasks.subscriptions.email_subscriptions import send_email_subscription_report
+ from ee.tasks.subscriptions.slack_subscriptions import (
+     get_slack_integration_for_team,
+@@ -43,6 +51,10 @@ from ee.tasks.subscriptions.slack_subscriptions import (
+ 
+ LOGGER = get_logger(__name__)
+ 
++# Used only as the recipient_results error message — `no_assets` doesn't auto-disable
++# (it indicates a transient resolve failure that retries can recover from).
++NO_ASSETS_REASON = "No assets to deliver — likely a transient export pipeline failure; will retry on next schedule"
++
+ 
+ async def _resolve_target_delivery_id(inputs: CreateExportAssetsInputs) -> uuid.UUID | None:
+     """Find the SubscriptionDelivery row that create_export_assets should write to.
+@@ -143,7 +155,7 @@ async def fetch_due_subscriptions_activity(inputs: FetchDueSubscriptionsActivity
+                 else str(sub["team_id"]),
+                 next_delivery_date=sub["next_delivery_date"].isoformat() if sub["next_delivery_date"] else None,
+             )
+-            for sub in Subscription.objects.filter(next_delivery_date__lte=now_with_buffer, deleted=False)
++            for sub in Subscription.objects.filter(next_delivery_date__lte=now_with_buffer, deleted=False, enabled=True)
+             .exclude(dashboard__deleted=True)
+             .exclude(insight__deleted=True)
+             .values("id", "team_id", "created_by__distinct_id", "next_delivery_date")
+@@ -155,6 +167,41 @@ async def fetch_due_subscriptions_activity(inputs: FetchDueSubscriptionsActivity
+     return subscriptions
+ 
+ 
++@temporalio.activity.defn
++async def validate_subscription_for_delivery(subscription_id: int) -> SubscriptionAbortInfo | None:
++    """Returns abort info when delivery should not proceed; None to continue."""
++    subscription = await database_sync_to_async(
++        Subscription.objects.select_related("created_by", "integration").get,
++        thread_sensitive=False,
++    )(pk=subscription_id)
++
++    # Idempotency: a Temporal redispatch (e.g. worker crash mid-acknowledge) after a
++    # prior auto-disable committed must not re-fire side effects.
++    if not subscription.enabled:
++        await LOGGER.ainfo("validate_subscription.already_disabled_skipping", subscription_id=subscription_id)
++        return SubscriptionAbortInfo()
++
++    reason = get_subscription_disable_reason(subscription.target_type, subscription.integration_id)
++    if reason is None:
++        return None
++
++    LOGGER.warning(
++        "validate_subscription.invalid_auto_disabling",
++        subscription_id=subscription_id,
++        target_type=subscription.target_type,
++        reason=reason.key,
++    )
++    _capture_delivery_failed_event(subscription, Exception(reason.description))
++    await database_sync_to_async(disable_invalid_subscription, thread_sensitive=False)(subscription, reason)
++    return SubscriptionAbortInfo(
++        failed_recipient=RecipientResult(
++            recipient=subscription.target_value,
++            status="failed",
++            error={"message": reason.description, "type": reason.key},
++        )
++    )
++
++
+ @temporalio.activity.defn
+ async def create_export_assets(inputs: CreateExportAssetsInputs) -> CreateExportAssetsResult:
+     await LOGGER.ainfo(
+@@ -291,6 +338,27 @@ async def create_export_assets(inputs: CreateExportAssetsInputs) -> CreateExport
+     )
+ 
+ 
++async def _auto_disable_and_return(
++    subscription: Subscription,
++    reason: DisableReason,
++    recipient_results: list[RecipientResult],
++) -> DeliverSubscriptionResult:
++    """Permanent-failure exit path: record per-recipient failure, capture analytics,
++    and auto-disable the subscription."""
++    recipient_results.append(
++        RecipientResult(
++            recipient=subscription.target_value,
++            status="failed",
++            error={"message": reason.description, "type": reason.key},
++        )
++    )
++    # `_capture_delivery_failed_event` only reads `str(e)` and `type(e).__name__`,
++    # so a plain Exception conveys the same info without implying retry semantics.
++    _capture_delivery_failed_event(subscription, Exception(reason.description))
++    await database_sync_to_async(disable_invalid_subscription, thread_sensitive=False)(subscription, reason)
++    return DeliverSubscriptionResult(recipient_results=recipient_results)
++
++
+ @temporalio.activity.defn
+ async def deliver_subscription(inputs: DeliverSubscriptionInputs) -> DeliverSubscriptionResult:
+     recipient_results: list[RecipientResult] = []
+@@ -300,6 +368,14 @@ async def deliver_subscription(inputs: DeliverSubscriptionInputs) -> DeliverSubs
+         thread_sensitive=False,
+     )(pk=inputs.subscription_id)
+ 
++    # Activity-retry idempotency: if a previous attempt already auto-disabled this
++    # subscription (UPDATE committed) and Temporal redispatched the activity (e.g.
++    # worker crash mid-acknowledge), don't re-fire the disable side effects — UUID4
++    # campaign keys mean MessagingRecord wouldn't dedup the duplicate email.
++    if not subscription.enabled:
++        LOGGER.info("deliver_subscription.skipped_disabled", subscription_id=inputs.subscription_id)
++        return DeliverSubscriptionResult(recipient_results=[])
++
+     await LOGGER.ainfo(
+         "deliver_subscription.starting",
+         subscription_id=inputs.subscription_id,
+@@ -308,13 +384,16 @@ async def deliver_subscription(inputs: DeliverSubscriptionInputs) -> DeliverSubs
+         is_new=inputs.is_new_subscription_target,
+     )
+ 
+-    if subscription.target_type not in SUPPORTED_TARGET_TYPES:
++    if (
++        get_subscription_disable_reason(subscription.target_type, subscription.integration_id)
++        == UNSUPPORTED_TARGET_DISABLE_REASON
++    ):
+         LOGGER.warning(
+             "deliver_subscription.unsupported_target",
+             subscription_id=inputs.subscription_id,
+             target_type=subscription.target_type,
+         )
+-        return DeliverSubscriptionResult(recipient_results=recipient_results)
++        return await _auto_disable_and_return(subscription, UNSUPPORTED_TARGET_DISABLE_REASON, recipient_results)
+ 
+     assets_by_id = await database_sync_to_async(
+         lambda: {
+@@ -329,8 +408,24 @@ async def deliver_subscription(inputs: DeliverSubscriptionInputs) -> DeliverSubs
+     assets = [assets_by_id[aid] for aid in inputs.exported_asset_ids if aid in assets_by_id]
+ 
+     if not assets:
++        # Empty here means non-empty exported_asset_ids didn't resolve from DB — a
++        # transient condition (TTL sweep, prior export crash, S3 race). Genuine
++        # deletion is filtered upstream in create_export_assets and the workflow
++        # short-circuits to SKIPPED before this activity runs. Don't auto-disable;
++        # the failure is observable via the `subscription_delivery_failed` analytics
++        # event and the next scheduled delivery retries.
+         LOGGER.warning("deliver_subscription.no_assets", subscription_id=inputs.subscription_id)
+-        capture_exception(Exception("No assets are in this subscription"), {"subscription_id": inputs.subscription_id})
++        recipient_results.append(
++            RecipientResult(
++                recipient=subscription.target_value,
++                status="failed",
++                error={"message": NO_ASSETS_REASON, "type": "no_assets"},
++            )
++        )
++        # Plain Exception — `_capture_delivery_failed_event` only reads `str(e)` and
++        # `type(e).__name__`, and the activity returns cleanly so retry semantics on
++        # ApplicationError would be misleading (matches `_auto_disable_and_return`).
++        _capture_delivery_failed_event(subscription, Exception(NO_ASSETS_REASON))
+         return DeliverSubscriptionResult(recipient_results=recipient_results)
+ 
+     if subscription.target_type == "email":
+@@ -414,32 +509,9 @@ async def deliver_subscription(inputs: DeliverSubscriptionInputs) -> DeliverSubs
+                     "deliver_subscription.no_slack_integration",
+                     subscription_id=inputs.subscription_id,
+                 )
+-                missing_integration_error = {
+-                    "message": "No Slack integration configured",
+-                    "type": "missing_integration",
+-                }
+-                recipient_results.append(
+-                    RecipientResult(
+-                        recipient=subscription.target_value,
+-                        status="failed",
+-                        error=missing_integration_error,
+-                    )
+-                )
+-                # Same shape as ProcessSubscriptionWorkflow success-path serialization so
+-                # update_delivery_record gets per-recipient rows from ActivityError.details.
+-                raise ApplicationError(
+-                    "No Slack integration configured for this team",
+-                    {
+-                        "recipient_results": [
+-                            {
+-                                "recipient": r.recipient,
+-                                "status": r.status,
+-                                **({"error": r.error} if r.error else {}),
+-                            }
+-                            for r in recipient_results
+-                        ]
+-                    },
+-                    non_retryable=True,
++                # Slack integration disconnected — auto-disable, mirrors the alert pattern.
++                return await _auto_disable_and_return(
++                    subscription, SLACK_DISCONNECTED_DISABLE_REASON, recipient_results
+                 )
+ 
+             LOGGER.info("deliver_subscription.sending_slack_message", subscription_id=subscription.id)
+@@ -590,6 +662,11 @@ async def update_delivery_record(inputs: UpdateDeliveryRecordInputs) -> None:
+ @temporalio.activity.defn
+ async def advance_next_delivery_date(subscription_id: int) -> None:
+     subscription = await database_sync_to_async(Subscription.objects.get, thread_sensitive=False)(pk=subscription_id)
++    # Disabled subs (e.g. auto-disabled this run / paused by user) don't get a
++    # future delivery date — avoids showing a misleading "next delivery" in the UI.
++    if not subscription.enabled:
++        await LOGGER.ainfo("advance_next_delivery_date.skipped_disabled", subscription_id=subscription_id)
++        return
+     subscription.set_next_delivery_date(subscription.next_delivery_date)
+     await database_sync_to_async(subscription.save, thread_sensitive=False)(update_fields=["next_delivery_date"])
+     await LOGGER.ainfo(
+diff --git a/posthog/temporal/subscriptions/types.py b/posthog/temporal/subscriptions/types.py
+index c5e9d32e5dd..dea4cfcff0a 100644
+--- a/posthog/temporal/subscriptions/types.py
++++ b/posthog/temporal/subscriptions/types.py
+@@ -143,6 +143,15 @@ class DeliverSubscriptionResult:
+     recipient_results: list[RecipientResult] = dataclasses.field(default_factory=list)
+ 
+ 
++@dataclasses.dataclass
++class SubscriptionAbortInfo:
++    """Returned by `validate_subscription_for_delivery` when the workflow should abort.
++    `failed_recipient` is populated only when this run auto-disabled the sub
++    (workflow records FAILED). None means already-disabled — idempotency redispatch."""
++
++    failed_recipient: typing.Optional[RecipientResult] = None
++
++
+ @dataclasses.dataclass
+ class CreateDeliveryRecordInputs:
+     subscription_id: int
+diff --git a/posthog/temporal/subscriptions/workflows.py b/posthog/temporal/subscriptions/workflows.py
+index 788e469ac79..7fffaad299f 100644
+--- a/posthog/temporal/subscriptions/workflows.py
++++ b/posthog/temporal/subscriptions/workflows.py
+@@ -3,6 +3,7 @@ import uuid
+ import typing
+ import asyncio
+ import datetime as dt
++import dataclasses
+ 
+ import temporalio.common
+ import temporalio.workflow
+@@ -27,6 +28,7 @@ from posthog.temporal.subscriptions.activities import (
+     deliver_subscription,
+     fetch_due_subscriptions_activity,
+     update_delivery_record,
++    validate_subscription_for_delivery,
+ )
+ from posthog.temporal.subscriptions.snapshot_activities import snapshot_subscription_insights
+ from posthog.temporal.subscriptions.types import (
+@@ -275,6 +277,26 @@ class ProcessSubscriptionWorkflow(PostHogWorkflow):
+                 ),
+             )
+ 
++            # Validate up-front: if the subscription is already disabled or its target
++            # configuration is permanently broken, auto-disable and short-circuit before
++            # the export pipeline runs.
++            abort_info = await temporalio.workflow.execute_activity(
++                validate_subscription_for_delivery,
++                inputs.subscription_id,
++                start_to_close_timeout=dt.timedelta(minutes=1),
++                retry_policy=temporalio.common.RetryPolicy(
++                    initial_interval=dt.timedelta(seconds=5),
++                    maximum_interval=dt.timedelta(seconds=30),
++                    maximum_attempts=3,
++                ),
++            )
++            if abort_info is not None:
++                # Just-disabled → FAILED with reason. Already-disabled (no failed_recipient) → SKIPPED default.
++                if abort_info.failed_recipient is not None:
++                    delivery_recipient_results = [dataclasses.asdict(abort_info.failed_recipient)]
++                    final_status = DeliveryStatus.FAILED
++                return
++
+             # Phase 1: Prepare — create ExportedAssets and persist insight snapshots
+             # onto SubscriptionDelivery.content_snapshot (written from within the
+             # activity to avoid shipping multi-MB query_results across Temporal's
+@@ -467,7 +489,9 @@ class ProcessSubscriptionWorkflow(PostHogWorkflow):
+                     if caught_error is None:
+                         raise
+ 
+-            # Advance schedule — always for scheduled deliveries, even on failure
++            # Advance schedule — always for scheduled deliveries, even on failure.
++            # The activity itself no-ops when the subscription is disabled, so a
++            # just-auto-disabled sub doesn't get a misleading future delivery date.
+             if inputs.trigger_type == SubscriptionTriggerType.SCHEDULED:
+                 await temporalio.workflow.execute_activity(
+                     advance_next_delivery_date,

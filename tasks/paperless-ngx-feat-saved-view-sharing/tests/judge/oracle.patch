@@ -1,0 +1,1036 @@
+diff --git a/src-ui/src/app/components/app-frame/app-frame.component.html b/src-ui/src/app/components/app-frame/app-frame.component.html
+index fbdf40811..d876e28ea 100644
+--- a/src-ui/src/app/components/app-frame/app-frame.component.html
++++ b/src-ui/src/app/components/app-frame/app-frame.component.html
+@@ -99,12 +99,7 @@
+         </ul>
+ 
+         <div class="nav-group mt-3 mb-1" *pngxIfPermissions="{ action: PermissionAction.View, type: PermissionType.SavedView }">
+-          @if (savedViewService.loading) {
+-            <h6 class="sidebar-heading px-3 text-muted">
+-              <span i18n>Saved views</span>
+-              <div class="spinner-border spinner-border-sm fw-normal ms-2" role="status"></div>
+-            </h6>
+-          } @else if (savedViewService.sidebarViews?.length > 0) {
++          @if (savedViewService.sidebarViews?.length > 0) {
+             <h6 class="sidebar-heading px-3 text-muted">
+               <span i18n>Saved views</span>
+             </h6>
+@@ -134,6 +129,11 @@
+                 </li>
+               }
+             </ul>
++          } @else if (savedViewService.loading) {
++            <h6 class="sidebar-heading px-3 text-muted">
++              <span i18n>Saved views</span>
++              <div class="spinner-border spinner-border-sm fw-normal ms-2" role="status"></div>
++            </h6>
+           }
+         </div>
+ 
+diff --git a/src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.html b/src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.html
+index fd88002ba..f11fc9760 100644
+--- a/src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.html
++++ b/src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.html
+@@ -16,6 +16,12 @@
+     </div>
+   </form>
+ 
++  @if (note) {
++    <div class="small text-muted fst-italic mt-2">
++      {{ note }}
++    </div>
++  }
++
+ </div>
+ <div class="modal-footer">
+   @if (!buttonsEnabled) {
+diff --git a/src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.ts b/src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.ts
+index a11a3cfaf..56c26f785 100644
+--- a/src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.ts
++++ b/src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.ts
+@@ -40,6 +40,9 @@ export class PermissionsDialogComponent {
+   @Input()
+   title = $localize`Set permissions`
+ 
++  @Input()
++  note: string = null
++
+   @Input()
+   set object(o: ObjectWithPermissions) {
+     this.o = o
+diff --git a/src-ui/src/app/components/document-list/document-list.component.html b/src-ui/src/app/components/document-list/document-list.component.html
+index 7fd1dc7fc..176513663 100644
+--- a/src-ui/src/app/components/document-list/document-list.component.html
++++ b/src-ui/src/app/components/document-list/document-list.component.html
+@@ -104,11 +104,9 @@
+         }
+       }
+ 
+-      <div *pngxIfPermissions="{ action: PermissionAction.Change, type: PermissionType.SavedView }">
+-        @if (list.activeSavedViewId) {
+-          <button ngbDropdownItem (click)="saveViewConfig()" [disabled]="!savedViewIsModified" i18n>Save "{{list.activeSavedViewTitle}}"</button>
+-        }
+-      </div>
++      @if (list.activeSavedViewId && activeSavedViewCanChange) {
++        <button ngbDropdownItem (click)="saveViewConfig()" [disabled]="!savedViewIsModified" i18n>Save "{{list.activeSavedViewTitle}}"</button>
++      }
+       <button ngbDropdownItem (click)="saveViewConfigAs()" *pngxIfPermissions="{ action: PermissionAction.Add, type: PermissionType.SavedView }" i18n>Save as...</button>
+       <a ngbDropdownItem routerLink="/savedviews" *pngxIfPermissions="{ action: PermissionAction.View, type: PermissionType.SavedView }" i18n>All saved views</a>
+     </div>
+diff --git a/src-ui/src/app/components/document-list/document-list.component.ts b/src-ui/src/app/components/document-list/document-list.component.ts
+index c0dd8f80a..2cd2ccaf3 100644
+--- a/src-ui/src/app/components/document-list/document-list.component.ts
++++ b/src-ui/src/app/components/document-list/document-list.component.ts
+@@ -47,7 +47,10 @@ import { UsernamePipe } from 'src/app/pipes/username.pipe'
+ import { DocumentListViewService } from 'src/app/services/document-list-view.service'
+ import { HotKeyService } from 'src/app/services/hot-key.service'
+ import { OpenDocumentsService } from 'src/app/services/open-documents.service'
+-import { PermissionsService } from 'src/app/services/permissions.service'
++import {
++  PermissionAction,
++  PermissionsService,
++} from 'src/app/services/permissions.service'
+ import { SavedViewService } from 'src/app/services/rest/saved-view.service'
+ import { SettingsService } from 'src/app/services/settings.service'
+ import { ToastService } from 'src/app/services/toast.service'
+@@ -148,12 +151,18 @@ export class DocumentListComponent
+ 
+   unmodifiedFilterRules: FilterRule[] = []
+   private unmodifiedSavedView: SavedView
++  private activeSavedView: SavedView | null = null
+ 
+   private unsubscribeNotifier: Subject<any> = new Subject()
+ 
+   get savedViewIsModified(): boolean {
+-    if (!this.list.activeSavedViewId || !this.unmodifiedSavedView) return false
+-    else {
++    if (
++      !this.list.activeSavedViewId ||
++      !this.unmodifiedSavedView ||
++      !this.activeSavedViewCanChange
++    ) {
++      return false
++    } else {
+       return (
+         this.unmodifiedSavedView.sort_field !== this.list.sortField ||
+         this.unmodifiedSavedView.sort_reverse !== this.list.sortReverse ||
+@@ -180,6 +189,16 @@ export class DocumentListComponent
+     }
+   }
+ 
++  get activeSavedViewCanChange(): boolean {
++    if (!this.activeSavedView) {
++      return false
++    }
++    return this.permissionService.currentUserHasObjectPermissions(
++      PermissionAction.Change,
++      this.activeSavedView
++    )
++  }
++
+   get isFiltered() {
+     return !!this.filterEditor?.rulesModified
+   }
+@@ -264,11 +283,13 @@ export class DocumentListComponent
+       .pipe(takeUntil(this.unsubscribeNotifier))
+       .subscribe(({ view }) => {
+         if (!view) {
++          this.activeSavedView = null
+           this.router.navigate(['404'], {
+             replaceUrl: true,
+           })
+           return
+         }
++        this.activeSavedView = view
+         this.unmodifiedSavedView = view
+         this.list.activateSavedViewWithQueryParams(
+           view,
+@@ -292,6 +313,7 @@ export class DocumentListComponent
+           // loading a saved view on /documents
+           this.loadViewConfig(parseInt(queryParams.get('view')))
+         } else {
++          this.activeSavedView = null
+           this.list.activateSavedView(null)
+           this.list.loadFromQueryParams(queryParams)
+           this.unmodifiedFilterRules = []
+@@ -374,7 +396,7 @@ export class DocumentListComponent
+   }
+ 
+   saveViewConfig() {
+-    if (this.list.activeSavedViewId != null) {
++    if (this.list.activeSavedViewId != null && this.activeSavedViewCanChange) {
+       let savedView: SavedView = {
+         id: this.list.activeSavedViewId,
+         filter_rules: this.list.filterRules,
+@@ -388,6 +410,7 @@ export class DocumentListComponent
+         .pipe(first())
+         .subscribe({
+           next: (view) => {
++            this.activeSavedView = view
+             this.unmodifiedSavedView = view
+             this.toastService.showInfo(
+               $localize`View "${this.list.activeSavedViewTitle}" saved successfully.`
+@@ -409,6 +432,11 @@ export class DocumentListComponent
+       .getCached(viewID)
+       .pipe(first())
+       .subscribe((view) => {
++        if (!view) {
++          this.activeSavedView = null
++          return
++        }
++        this.activeSavedView = view
+         this.unmodifiedSavedView = view
+         this.list.activateSavedView(view)
+         this.list.reload(() => {
+@@ -426,24 +454,48 @@ export class DocumentListComponent
+       modal.componentInstance.buttonsEnabled = false
+       let savedView: SavedView = {
+         name: formValue.name,
+-        show_on_dashboard: formValue.showOnDashboard,
+-        show_in_sidebar: formValue.showInSideBar,
+         filter_rules: this.list.filterRules,
+         sort_reverse: this.list.sortReverse,
+         sort_field: this.list.sortField,
+         display_mode: this.list.displayMode,
+         display_fields: this.activeDisplayFields,
+       }
++      const permissions = formValue.permissions_form
++      if (permissions) {
++        if (permissions.owner !== null && permissions.owner !== undefined) {
++          savedView.owner = permissions.owner
++        }
++        if (permissions.set_permissions) {
++          savedView['set_permissions'] = permissions.set_permissions
++        }
++      }
+ 
+       this.savedViewService
+         .create(savedView)
+         .pipe(first())
+         .subscribe({
+-          next: () => {
+-            modal.close()
+-            this.toastService.showInfo(
+-              $localize`View "${savedView.name}" created successfully.`
++          next: (createdView) => {
++            this.saveCreatedViewVisibility(
++              createdView,
++              formValue.showOnDashboard,
++              formValue.showInSideBar
+             )
++              .pipe(first())
++              .subscribe({
++                next: () => {
++                  modal.close()
++                  this.toastService.showInfo(
++                    $localize`View "${savedView.name}" created successfully.`
++                  )
++                },
++                error: (error) => {
++                  modal.close()
++                  this.toastService.showError(
++                    $localize`View "${savedView.name}" created successfully, but could not update visibility settings.`,
++                    error
++                  )
++                },
++              })
+           },
+           error: (httpError) => {
+             let error = httpError.error
+@@ -457,6 +509,28 @@ export class DocumentListComponent
+     })
+   }
+ 
++  private saveCreatedViewVisibility(
++    createdView: SavedView,
++    showOnDashboard: boolean,
++    showInSideBar: boolean
++  ) {
++    const dashboardViewIds = this.savedViewService.dashboardViews.map(
++      (v) => v.id
++    )
++    const sidebarViewIds = this.savedViewService.sidebarViews.map((v) => v.id)
++    if (showOnDashboard) {
++      dashboardViewIds.push(createdView.id)
++    }
++    if (showInSideBar) {
++      sidebarViewIds.push(createdView.id)
++    }
++
++    return this.settingsService.updateSavedViewsVisibility(
++      dashboardViewIds,
++      sidebarViewIds
++    )
++  }
++
+   openDocumentDetail(document: Document | number) {
+     this.router.navigate([
+       'documents',
+diff --git a/src-ui/src/app/components/document-list/save-view-config-dialog/save-view-config-dialog.component.html b/src-ui/src/app/components/document-list/save-view-config-dialog/save-view-config-dialog.component.html
+index acfb15c84..4e4bf2cd3 100644
+--- a/src-ui/src/app/components/document-list/save-view-config-dialog/save-view-config-dialog.component.html
++++ b/src-ui/src/app/components/document-list/save-view-config-dialog/save-view-config-dialog.component.html
+@@ -8,6 +8,7 @@
+     <pngx-input-text i18n-title title="Name" formControlName="name" [error]="error?.name" autocomplete="off"></pngx-input-text>
+     <pngx-input-check i18n-title title="Show in sidebar" formControlName="showInSideBar"></pngx-input-check>
+     <pngx-input-check i18n-title title="Show on dashboard" formControlName="showOnDashboard"></pngx-input-check>
++    <pngx-permissions-form accordion="true" formControlName="permissions_form"></pngx-permissions-form>
+     @if (error?.filter_rules) {
+       <div class="alert alert-danger" role="alert">
+         <h6 class="alert-heading" i18n>Filter rules error occurred while saving this view</h6>
+diff --git a/src-ui/src/app/components/document-list/save-view-config-dialog/save-view-config-dialog.component.ts b/src-ui/src/app/components/document-list/save-view-config-dialog/save-view-config-dialog.component.ts
+index c0c43fd39..78ac67e36 100644
+--- a/src-ui/src/app/components/document-list/save-view-config-dialog/save-view-config-dialog.component.ts
++++ b/src-ui/src/app/components/document-list/save-view-config-dialog/save-view-config-dialog.component.ts
+@@ -13,14 +13,22 @@ import {
+   ReactiveFormsModule,
+ } from '@angular/forms'
+ import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap'
++import { User } from 'src/app/data/user'
+ import { CheckComponent } from '../../common/input/check/check.component'
++import { PermissionsFormComponent } from '../../common/input/permissions/permissions-form/permissions-form.component'
+ import { TextComponent } from '../../common/input/text/text.component'
+ 
+ @Component({
+   selector: 'pngx-save-view-config-dialog',
+   templateUrl: './save-view-config-dialog.component.html',
+   styleUrls: ['./save-view-config-dialog.component.scss'],
+-  imports: [CheckComponent, TextComponent, FormsModule, ReactiveFormsModule],
++  imports: [
++    CheckComponent,
++    TextComponent,
++    PermissionsFormComponent,
++    FormsModule,
++    ReactiveFormsModule,
++  ],
+ })
+ export class SaveViewConfigDialogComponent implements OnInit {
+   private modal = inject(NgbActiveModal)
+@@ -36,6 +44,8 @@ export class SaveViewConfigDialogComponent implements OnInit {
+ 
+   closeEnabled = false
+ 
++  users: User[]
++
+   _defaultName = ''
+ 
+   get defaultName() {
+@@ -52,6 +62,7 @@ export class SaveViewConfigDialogComponent implements OnInit {
+     name: new FormControl(''),
+     showInSideBar: new FormControl(false),
+     showOnDashboard: new FormControl(false),
++    permissions_form: new FormControl(null),
+   })
+ 
+   ngOnInit(): void {
+@@ -62,7 +73,16 @@ export class SaveViewConfigDialogComponent implements OnInit {
+   }
+ 
+   save() {
+-    this.saveClicked.emit(this.saveViewConfigForm.value)
++    const formValue = this.saveViewConfigForm.value
++    const saveViewConfig = {
++      name: formValue.name,
++      showInSideBar: formValue.showInSideBar,
++      showOnDashboard: formValue.showOnDashboard,
++    }
++    if (formValue.permissions_form) {
++      saveViewConfig['permissions_form'] = formValue.permissions_form
++    }
++    this.saveClicked.emit(saveViewConfig)
+   }
+ 
+   cancel() {
+diff --git a/src-ui/src/app/components/manage/saved-views/saved-views.component.html b/src-ui/src/app/components/manage/saved-views/saved-views.component.html
+index 2f5ef3338..1c14b6832 100644
+--- a/src-ui/src/app/components/manage/saved-views/saved-views.component.html
++++ b/src-ui/src/app/components/manage/saved-views/saved-views.component.html
+@@ -25,15 +25,23 @@
+             </div>
+           </div>
+           <div class="col-auto">
+-            <label class="form-label" for="name_{{view.id}}" i18n>Actions</label>
+-            <pngx-confirm-button
+-              label="Delete"
+-              i18n-label
+-              (confirm)="deleteSavedView(view)"
+-              *pngxIfPermissions="{ action: PermissionAction.Delete, type: PermissionType.SavedView }"
+-              buttonClasses="btn-sm btn-outline-danger form-control"
+-              iconName="trash">
+-            </pngx-confirm-button>
++            @if (canDeleteSavedView(view)) {
++              <label class="form-label" for="name_{{view.id}}" i18n>Actions</label>
++              <button
++                class="btn btn-sm btn-outline-secondary form-control mb-2"
++                type="button"
++                (click)="editPermissions(view)"
++                *pngxIfPermissions="{ action: PermissionAction.Change, type: PermissionType.SavedView }"
++                i18n><i-bs class="me-1" name="person-fill-lock"></i-bs>Permissions</button>
++              <pngx-confirm-button
++                label="Delete"
++                i18n-label
++                (confirm)="deleteSavedView(view)"
++                *pngxIfPermissions="{ action: PermissionAction.Delete, type: PermissionType.SavedView }"
++                buttonClasses="btn-sm btn-outline-danger form-control"
++                iconName="trash">
++              </pngx-confirm-button>
++            }
+           </div>
+         </div>
+         <div class="row">
+diff --git a/src-ui/src/app/components/manage/saved-views/saved-views.component.ts b/src-ui/src/app/components/manage/saved-views/saved-views.component.ts
+index 015f9b486..9a0f11ea7 100644
+--- a/src-ui/src/app/components/manage/saved-views/saved-views.component.ts
++++ b/src-ui/src/app/components/manage/saved-views/saved-views.component.ts
+@@ -6,11 +6,18 @@ import {
+   FormsModule,
+   ReactiveFormsModule,
+ } from '@angular/forms'
++import { NgbModal } from '@ng-bootstrap/ng-bootstrap'
+ import { dirtyCheck } from '@ngneat/dirty-check-forms'
+-import { BehaviorSubject, Observable, takeUntil } from 'rxjs'
++import { NgxBootstrapIconsModule } from 'ngx-bootstrap-icons'
++import { BehaviorSubject, Observable, of, switchMap, takeUntil } from 'rxjs'
++import { PermissionsDialogComponent } from 'src/app/components/common/permissions-dialog/permissions-dialog.component'
+ import { DisplayMode } from 'src/app/data/document'
+ import { SavedView } from 'src/app/data/saved-view'
+ import { IfPermissionsDirective } from 'src/app/directives/if-permissions.directive'
++import {
++  PermissionAction,
++  PermissionsService,
++} from 'src/app/services/permissions.service'
+ import { SavedViewService } from 'src/app/services/rest/saved-view.service'
+ import { SettingsService } from 'src/app/services/settings.service'
+ import { ToastService } from 'src/app/services/toast.service'
+@@ -34,15 +41,18 @@ import { LoadingComponentWithPermissions } from '../../loading-component/loading
+     FormsModule,
+     ReactiveFormsModule,
+     AsyncPipe,
++    NgxBootstrapIconsModule,
+   ],
+ })
+ export class SavedViewsComponent
+   extends LoadingComponentWithPermissions
+   implements OnInit, OnDestroy
+ {
+-  private savedViewService = inject(SavedViewService)
+-  private settings = inject(SettingsService)
+-  private toastService = inject(ToastService)
++  private readonly savedViewService = inject(SavedViewService)
++  private readonly permissionsService = inject(PermissionsService)
++  private readonly settings = inject(SettingsService)
++  private readonly toastService = inject(ToastService)
++  private readonly modalService = inject(NgbModal)
+ 
+   DisplayMode = DisplayMode
+ 
+@@ -65,11 +75,17 @@ export class SavedViewsComponent
+   }
+ 
+   ngOnInit(): void {
++    this.reloadViews()
++  }
++
++  private reloadViews(): void {
+     this.loading = true
+-    this.savedViewService.listAll().subscribe((r) => {
+-      this.savedViews = r.results
+-      this.initialize()
+-    })
++    this.savedViewService
++      .list(null, null, null, false, { full_perms: true })
++      .subscribe((r) => {
++        this.savedViews = r.results
++        this.initialize()
++      })
+   }
+ 
+   ngOnDestroy(): void {
+@@ -95,16 +111,20 @@ export class SavedViewsComponent
+         display_mode: view.display_mode,
+         display_fields: view.display_fields,
+       }
++      const canEdit = this.canEditSavedView(view)
+       this.savedViewsGroup.addControl(
+         view.id.toString(),
+         new FormGroup({
+-          id: new FormControl(null),
+-          name: new FormControl(null),
+-          show_on_dashboard: new FormControl(null),
+-          show_in_sidebar: new FormControl(null),
+-          page_size: new FormControl(null),
+-          display_mode: new FormControl(null),
+-          display_fields: new FormControl([]),
++          id: new FormControl({ value: null, disabled: !canEdit }),
++          name: new FormControl({ value: null, disabled: !canEdit }),
++          show_on_dashboard: new FormControl({
++            value: null,
++            disabled: false,
++          }),
++          show_in_sidebar: new FormControl({ value: null, disabled: false }),
++          page_size: new FormControl({ value: null, disabled: !canEdit }),
++          display_mode: new FormControl({ value: null, disabled: !canEdit }),
++          display_fields: new FormControl({ value: [], disabled: !canEdit }),
+         })
+       )
+     }
+@@ -133,10 +153,7 @@ export class SavedViewsComponent
+         $localize`Saved view "${savedView.name}" deleted.`
+       )
+       this.savedViewService.clearCache()
+-      this.savedViewService.listAll().subscribe((r) => {
+-        this.savedViews = r.results
+-        this.initialize()
+-      })
++      this.reloadViews()
+     })
+   }
+ 
+@@ -145,26 +162,120 @@ export class SavedViewsComponent
+   }
+ 
+   public save() {
+-    // only patch views that have actually changed
++    // Save only changed views, then save the visibility changes into user settings.
++    const groups = Object.values(this.savedViewsGroup.controls) as FormGroup[]
++    const visibilityChanged = groups.some(
++      (group) =>
++        group.get('show_on_dashboard')?.dirty ||
++        group.get('show_in_sidebar')?.dirty
++    )
++
+     const changed: SavedView[] = []
+-    Object.values(this.savedViewsGroup.controls)
+-      .filter((g: FormGroup) => !g.pristine)
+-      .forEach((group: FormGroup) => {
+-        changed.push(group.value)
+-      })
++    const dashboardVisibleIds: number[] = []
++    const sidebarVisibleIds: number[] = []
++
++    groups.forEach((group) => {
++      const value = group.getRawValue()
++      if (value.show_on_dashboard) {
++        dashboardVisibleIds.push(value.id)
++      }
++      if (value.show_in_sidebar) {
++        sidebarVisibleIds.push(value.id)
++      }
++      // Would be fine to send, but no longer stored on the model
++      delete value.show_on_dashboard
++      delete value.show_in_sidebar
++
++      if (!group.get('name')?.enabled) {
++        // Quick check for user doesn't have permissions, then bail
++        return
++      }
++
++      const modelFieldsChanged =
++        group.get('name')?.dirty ||
++        group.get('page_size')?.dirty ||
++        group.get('display_mode')?.dirty ||
++        group.get('display_fields')?.dirty
++
++      if (!modelFieldsChanged) {
++        return
++      }
++
++      changed.push(value)
++    })
++
++    if (!changed.length && !visibilityChanged) {
++      return
++    }
++
++    let saveOperation = of([])
+     if (changed.length) {
+-      this.savedViewService.patchMany(changed).subscribe({
++      saveOperation = saveOperation.pipe(
++        switchMap(() => this.savedViewService.patchMany(changed))
++      )
++    }
++    if (visibilityChanged) {
++      saveOperation = saveOperation.pipe(
++        switchMap(() =>
++          this.settings.updateSavedViewsVisibility(
++            dashboardVisibleIds,
++            sidebarVisibleIds
++          )
++        )
++      )
++    }
++
++    saveOperation.subscribe({
++      next: () => {
++        this.toastService.showInfo($localize`Views saved successfully.`)
++        this.savedViewService.clearCache()
++        this.reloadViews()
++      },
++      error: (error) => {
++        this.toastService.showError($localize`Error while saving views.`, error)
++      },
++    })
++  }
++
++  public canEditSavedView(view: SavedView): boolean {
++    return this.permissionsService.currentUserHasObjectPermissions(
++      PermissionAction.Change,
++      view
++    )
++  }
++
++  public canDeleteSavedView(view: SavedView): boolean {
++    return this.permissionsService.currentUserOwnsObject(view)
++  }
++
++  public editPermissions(savedView: SavedView): void {
++    const modal = this.modalService.open(PermissionsDialogComponent, {
++      backdrop: 'static',
++    })
++    const dialog = modal.componentInstance as PermissionsDialogComponent
++    dialog.object = savedView
++    dialog.note = $localize`Note: Sharing saved views does not share the underlying documents.`
++
++    modal.componentInstance.confirmClicked.subscribe(({ permissions }) => {
++      modal.componentInstance.buttonsEnabled = false
++      const view = {
++        id: savedView.id,
++        owner: permissions.owner,
++      }
++      view['set_permissions'] = permissions.set_permissions
++      this.savedViewService.patch(view as SavedView).subscribe({
+         next: () => {
+-          this.toastService.showInfo($localize`Views saved successfully.`)
+-          this.store.next(this.savedViewsForm.value)
++          this.toastService.showInfo($localize`Permissions updated`)
++          modal.close()
++          this.reloadViews()
+         },
+         error: (error) => {
+           this.toastService.showError(
+-            $localize`Error while saving views.`,
++            $localize`Error updating permissions`,
+             error
+           )
+         },
+       })
+-    }
++    })
+   }
+ }
+diff --git a/src-ui/src/app/data/ui-settings.ts b/src-ui/src/app/data/ui-settings.ts
+index c47c409d5..cec804f99 100644
+--- a/src-ui/src/app/data/ui-settings.ts
++++ b/src-ui/src/app/data/ui-settings.ts
+@@ -62,6 +62,10 @@ export const SETTINGS_KEYS = {
+     'general-settings:update-checking:backend-setting',
+   SAVED_VIEWS_WARN_ON_UNSAVED_CHANGE:
+     'general-settings:saved-views:warn-on-unsaved-change',
++  DASHBOARD_VIEWS_VISIBLE_IDS:
++    'general-settings:saved-views:dashboard-views-visible-ids',
++  SIDEBAR_VIEWS_VISIBLE_IDS:
++    'general-settings:saved-views:sidebar-views-visible-ids',
+   DASHBOARD_VIEWS_SORT_ORDER:
+     'general-settings:saved-views:dashboard-views-sort-order',
+   SIDEBAR_VIEWS_SORT_ORDER:
+@@ -248,6 +252,16 @@ export const SETTINGS: UiSetting[] = [
+     type: 'array',
+     default: [],
+   },
++  {
++    key: SETTINGS_KEYS.DASHBOARD_VIEWS_VISIBLE_IDS,
++    type: 'array',
++    default: [],
++  },
++  {
++    key: SETTINGS_KEYS.SIDEBAR_VIEWS_VISIBLE_IDS,
++    type: 'array',
++    default: [],
++  },
+   {
+     key: SETTINGS_KEYS.DASHBOARD_VIEWS_SORT_ORDER,
+     type: 'array',
+diff --git a/src-ui/src/app/services/rest/saved-view.service.ts b/src-ui/src/app/services/rest/saved-view.service.ts
+index 7bdb890a0..d9baec22b 100644
+--- a/src-ui/src/app/services/rest/saved-view.service.ts
++++ b/src-ui/src/app/services/rest/saved-view.service.ts
+@@ -36,7 +36,9 @@ export class SavedViewService extends AbstractPaperlessService<SavedView> {
+     return super.list(page, pageSize, sortField, sortReverse, extraParams).pipe(
+       tap({
+         next: (r) => {
+-          this.savedViews = r.results
++          const views = r.results.map((view) => this.withUserVisibility(view))
++          this.savedViews = views
++          r.results = views
+           this._loading = false
+           this.settingsService.dashboardIsEmpty =
+             this.dashboardViews.length === 0
+@@ -65,8 +67,35 @@ export class SavedViewService extends AbstractPaperlessService<SavedView> {
+     return this.savedViews
+   }
+ 
++  private getVisibleViewIds(setting: string): number[] {
++    const configured = this.settingsService.get(setting)
++    return Array.isArray(configured) ? configured : []
++  }
++
++  private withUserVisibility(view: SavedView): SavedView {
++    return {
++      ...view,
++      show_on_dashboard: this.isDashboardVisible(view),
++      show_in_sidebar: this.isSidebarVisible(view),
++    }
++  }
++
++  private isDashboardVisible(view: SavedView): boolean {
++    const visibleIds = this.getVisibleViewIds(
++      SETTINGS_KEYS.DASHBOARD_VIEWS_VISIBLE_IDS
++    )
++    return visibleIds.includes(view.id)
++  }
++
++  private isSidebarVisible(view: SavedView): boolean {
++    const visibleIds = this.getVisibleViewIds(
++      SETTINGS_KEYS.SIDEBAR_VIEWS_VISIBLE_IDS
++    )
++    return visibleIds.includes(view.id)
++  }
++
+   get sidebarViews(): SavedView[] {
+-    const sidebarViews = this.savedViews.filter((v) => v.show_in_sidebar)
++    const sidebarViews = this.savedViews.filter((v) => this.isSidebarVisible(v))
+ 
+     const sorted: number[] = this.settingsService.get(
+       SETTINGS_KEYS.SIDEBAR_VIEWS_SORT_ORDER
+@@ -81,7 +110,9 @@ export class SavedViewService extends AbstractPaperlessService<SavedView> {
+   }
+ 
+   get dashboardViews(): SavedView[] {
+-    const dashboardViews = this.savedViews.filter((v) => v.show_on_dashboard)
++    const dashboardViews = this.savedViews.filter((v) =>
++      this.isDashboardVisible(v)
++    )
+ 
+     const sorted: number[] = this.settingsService.get(
+       SETTINGS_KEYS.DASHBOARD_VIEWS_SORT_ORDER
+diff --git a/src-ui/src/app/services/settings.service.ts b/src-ui/src/app/services/settings.service.ts
+index 1cfbdf4a3..f006cae12 100644
+--- a/src-ui/src/app/services/settings.service.ts
++++ b/src-ui/src/app/services/settings.service.ts
+@@ -699,4 +699,17 @@ export class SettingsService {
+     ])
+     return this.storeSettings()
+   }
++
++  updateSavedViewsVisibility(
++    dashboardVisibleViewIds: number[],
++    sidebarVisibleViewIds: number[]
++  ): Observable<any> {
++    this.set(SETTINGS_KEYS.DASHBOARD_VIEWS_VISIBLE_IDS, [
++      ...new Set(dashboardVisibleViewIds),
++    ])
++    this.set(SETTINGS_KEYS.SIDEBAR_VIEWS_VISIBLE_IDS, [
++      ...new Set(sidebarVisibleViewIds),
++    ])
++    return this.storeSettings()
++  }
+ }
+diff --git a/src-ui/src/environments/environment.prod.ts b/src-ui/src/environments/environment.prod.ts
+index 28a27911f..a5bf6942f 100644
+--- a/src-ui/src/environments/environment.prod.ts
++++ b/src-ui/src/environments/environment.prod.ts
+@@ -3,7 +3,7 @@ const base_url = new URL(document.baseURI)
+ export const environment = {
+   production: true,
+   apiBaseUrl: document.baseURI + 'api/',
+-  apiVersion: '9', // match src/paperless/settings.py
++  apiVersion: '10', // match src/paperless/settings.py
+   appTitle: 'Paperless-ngx',
+   tag: 'prod',
+   version: '2.20.10',
+diff --git a/src/documents/migrations/0015_savedview_visibility_to_ui_settings.py b/src/documents/migrations/0015_savedview_visibility_to_ui_settings.py
+new file mode 100644
+index 000000000..bcce863b0
+--- /dev/null
++++ b/src/documents/migrations/0015_savedview_visibility_to_ui_settings.py
+@@ -0,0 +1,153 @@
++# Generated by Django 5.2.11 on 2026-02-20 22:05
++
++from collections import defaultdict
++
++from django.db import migrations
++from django.db import models
++
++# from src-ui/src/app/data/ui-settings.ts
++SAVED_VIEWS_KEY = "saved_views"
++DASHBOARD_VIEWS_VISIBLE_IDS_KEY = "dashboard_views_visible_ids"
++SIDEBAR_VIEWS_VISIBLE_IDS_KEY = "sidebar_views_visible_ids"
++
++
++def _parse_visible_ids(raw_value) -> set[int]:
++    """Return integer SavedView IDs parsed from a JSON list value."""
++    if not isinstance(raw_value, list):
++        return set()
++
++    parsed_ids = set()
++    for raw_id in raw_value:
++        raw_id_string = str(raw_id)
++        if raw_id_string.isdigit():
++            parsed_ids.add(int(raw_id_string))
++    return parsed_ids
++
++
++def _set_default_visibility_ids(apps, schema_editor):
++    """
++    Move SavedView visibility from boolean model props into JSON UiSettings.settings.saved_views, specifically:
++      settings.saved_views.dashboard_views_visible_ids
++      settings.saved_views.sidebar_views_visible_ids
++    """
++    SavedView = apps.get_model("documents", "SavedView")
++    UiSettings = apps.get_model("documents", "UiSettings")
++    User = apps.get_model("auth", "User")
++
++    dashboard_visible_ids_by_owner: defaultdict[int, list[int]] = defaultdict(list)
++    for owner_id, view_id in SavedView.objects.filter(
++        owner__isnull=False,
++        show_on_dashboard=True,
++    ).values_list("owner_id", "id"):
++        dashboard_visible_ids_by_owner[owner_id].append(view_id)
++
++    sidebar_visible_ids_by_owner: defaultdict[int, list[int]] = defaultdict(list)
++    for owner_id, view_id in SavedView.objects.filter(
++        owner__isnull=False,
++        show_in_sidebar=True,
++    ).values_list("owner_id", "id"):
++        sidebar_visible_ids_by_owner[owner_id].append(view_id)
++
++    for user in User.objects.all():
++        ui_settings, _ = UiSettings.objects.get_or_create(
++            user=user,
++            defaults={"settings": {}},
++        )
++        current_settings = ui_settings.settings
++        if not isinstance(current_settings, dict):
++            current_settings = {}
++
++        changed = False
++        saved_views_settings = current_settings.get(SAVED_VIEWS_KEY)
++        if not isinstance(saved_views_settings, dict):
++            saved_views_settings = {}
++            changed = True
++
++        if saved_views_settings.get(DASHBOARD_VIEWS_VISIBLE_IDS_KEY) is None:
++            saved_views_settings[DASHBOARD_VIEWS_VISIBLE_IDS_KEY] = (
++                dashboard_visible_ids_by_owner.get(user.id, [])
++            )
++            changed = True
++
++        if saved_views_settings.get(SIDEBAR_VIEWS_VISIBLE_IDS_KEY) is None:
++            saved_views_settings[SIDEBAR_VIEWS_VISIBLE_IDS_KEY] = (
++                sidebar_visible_ids_by_owner.get(user.id, [])
++            )
++            changed = True
++
++        current_settings[SAVED_VIEWS_KEY] = saved_views_settings
++
++        if changed:
++            ui_settings.settings = current_settings
++            ui_settings.save(update_fields=["settings"])
++
++
++def _restore_visibility_fields(apps, schema_editor):
++    SavedView = apps.get_model("documents", "SavedView")
++    UiSettings = apps.get_model("documents", "UiSettings")
++
++    dashboard_visible_ids_by_owner: dict[int, set[int]] = {}
++    sidebar_visible_ids_by_owner: dict[int, set[int]] = {}
++    for ui_settings in UiSettings.objects.all():
++        current_settings = ui_settings.settings
++        if not isinstance(current_settings, dict):
++            continue
++        saved_views_settings = current_settings.get(SAVED_VIEWS_KEY)
++        if not isinstance(saved_views_settings, dict):
++            saved_views_settings = {}
++
++        dashboard_visible_ids_by_owner[ui_settings.user_id] = _parse_visible_ids(
++            saved_views_settings.get(DASHBOARD_VIEWS_VISIBLE_IDS_KEY),
++        )
++
++        sidebar_visible_ids_by_owner[ui_settings.user_id] = _parse_visible_ids(
++            saved_views_settings.get(SIDEBAR_VIEWS_VISIBLE_IDS_KEY),
++        )
++
++    SavedView.objects.update(show_on_dashboard=False, show_in_sidebar=False)
++    for owner_id, dashboard_visible_ids in dashboard_visible_ids_by_owner.items():
++        if not dashboard_visible_ids:
++            continue
++        SavedView.objects.filter(
++            owner_id=owner_id,
++            id__in=dashboard_visible_ids,
++        ).update(
++            show_on_dashboard=True,
++        )
++    for owner_id, sidebar_visible_ids in sidebar_visible_ids_by_owner.items():
++        if not sidebar_visible_ids:
++            continue
++        SavedView.objects.filter(owner_id=owner_id, id__in=sidebar_visible_ids).update(
++            show_in_sidebar=True,
++        )
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("documents", "0014_alter_paperlesstask_task_name"),
++    ]
++
++    operations = [
++        migrations.AlterField(
++            model_name="savedview",
++            name="show_on_dashboard",
++            field=models.BooleanField(default=False, verbose_name="show on dashboard"),
++        ),
++        migrations.AlterField(
++            model_name="savedview",
++            name="show_in_sidebar",
++            field=models.BooleanField(default=False, verbose_name="show in sidebar"),
++        ),
++        migrations.RunPython(
++            _set_default_visibility_ids,
++            reverse_code=_restore_visibility_fields,
++        ),
++        migrations.RemoveField(
++            model_name="savedview",
++            name="show_on_dashboard",
++        ),
++        migrations.RemoveField(
++            model_name="savedview",
++            name="show_in_sidebar",
++        ),
++    ]
+diff --git a/src/documents/models.py b/src/documents/models.py
+index 4461a14ce..f0191b47f 100644
+--- a/src/documents/models.py
++++ b/src/documents/models.py
+@@ -475,13 +475,6 @@ class SavedView(ModelWithOwner):
+ 
+     name = models.CharField(_("name"), max_length=128)
+ 
+-    show_on_dashboard = models.BooleanField(
+-        _("show on dashboard"),
+-    )
+-    show_in_sidebar = models.BooleanField(
+-        _("show in sidebar"),
+-    )
+-
+     sort_field = models.CharField(
+         _("sort field"),
+         max_length=128,
+diff --git a/src/documents/serialisers.py b/src/documents/serialisers.py
+index 7df7e2e5e..457fb00ab 100644
+--- a/src/documents/serialisers.py
++++ b/src/documents/serialisers.py
+@@ -1428,8 +1428,6 @@ class SavedViewSerializer(OwnedObjectSerializer):
+         fields = [
+             "id",
+             "name",
+-            "show_on_dashboard",
+-            "show_in_sidebar",
+             "sort_field",
+             "sort_reverse",
+             "filter_rules",
+@@ -1439,6 +1437,7 @@ class SavedViewSerializer(OwnedObjectSerializer):
+             "owner",
+             "permissions",
+             "user_can_change",
++            "set_permissions",
+         ]
+ 
+     def validate(self, attrs):
+@@ -1476,7 +1475,7 @@ class SavedViewSerializer(OwnedObjectSerializer):
+             and len(validated_data["display_fields"]) == 0
+         ):
+             validated_data["display_fields"] = None
+-        super().update(instance, validated_data)
++        instance = super().update(instance, validated_data)
+         if rules_data is not None:
+             SavedViewFilterRule.objects.filter(saved_view=instance).delete()
+             for rule_data in rules_data:
+@@ -1488,7 +1487,7 @@ class SavedViewSerializer(OwnedObjectSerializer):
+         if "user" in validated_data:
+             # backwards compatibility
+             validated_data["owner"] = validated_data.pop("user")
+-        saved_view = SavedView.objects.create(**validated_data)
++        saved_view = super().create(validated_data)
+         for rule_data in rules_data:
+             SavedViewFilterRule.objects.create(saved_view=saved_view, **rule_data)
+         return saved_view
+diff --git a/src/documents/views.py b/src/documents/views.py
+index 7c6acf79c..9b960a8b4 100644
+--- a/src/documents/views.py
++++ b/src/documents/views.py
+@@ -2097,24 +2097,21 @@ class LogViewSet(ViewSet):
+         return Response(existing_logs)
+ 
+ 
+-class SavedViewViewSet(ModelViewSet, PassUserMixin):
++@extend_schema_view(**generate_object_with_permissions_schema(SavedViewSerializer))
++class SavedViewViewSet(BulkPermissionMixin, PassUserMixin, ModelViewSet):
+     model = SavedView
+ 
+-    queryset = SavedView.objects.all()
++    queryset = SavedView.objects.select_related("owner").prefetch_related(
++        "filter_rules",
++    )
+     serializer_class = SavedViewSerializer
+     pagination_class = StandardPagination
+     permission_classes = (IsAuthenticated, PaperlessObjectPermissions)
+-
+-    def get_queryset(self):
+-        user = self.request.user
+-        return (
+-            SavedView.objects.filter(owner=user)
+-            .select_related("owner")
+-            .prefetch_related("filter_rules")
+-        )
+-
+-    def perform_create(self, serializer: serializers.BaseSerializer[Any]) -> None:
+-        serializer.save(owner=self.request.user)
++    filter_backends = (
++        OrderingFilter,
++        ObjectOwnedOrGrantedPermissionsFilter,
++    )
++    ordering_fields = ("name",)
+ 
+ 
+ @extend_schema_view(
+@@ -2649,7 +2646,11 @@ class GlobalSearchView(PassUserMixin):
+                     )
+             docs = docs[:OBJECT_LIMIT]
+         saved_views = (
+-            SavedView.objects.filter(owner=request.user, name__icontains=query)
++            get_objects_for_user_owner_aware(
++                request.user,
++                "view_savedview",
++                SavedView,
++            ).filter(name__icontains=query)
+             if request.user.has_perm("documents.view_savedview")
+             else []
+         )
+diff --git a/src/paperless/settings/__init__.py b/src/paperless/settings/__init__.py
+index 5c6f843fa..d86980165 100644
+--- a/src/paperless/settings/__init__.py
++++ b/src/paperless/settings/__init__.py
+@@ -376,10 +376,10 @@ REST_FRAMEWORK = {
+         "rest_framework.authentication.SessionAuthentication",
+     ],
+     "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.AcceptHeaderVersioning",
+-    "DEFAULT_VERSION": "9",  # match src-ui/src/environments/environment.prod.ts
++    "DEFAULT_VERSION": "10",  # match src-ui/src/environments/environment.prod.ts
+     # Make sure these are ordered and that the most recent version appears
+     # last. See api.md#api-versioning when adding new versions.
+-    "ALLOWED_VERSIONS": ["2", "3", "4", "5", "6", "7", "8", "9"],
++    "ALLOWED_VERSIONS": ["2", "3", "4", "5", "6", "7", "8", "9", "10"],
+     # DRF Spectacular default schema
+     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+ }

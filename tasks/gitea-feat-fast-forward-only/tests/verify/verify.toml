@@ -1,0 +1,30 @@
+# Go runner config for verify_ff_only_signed_test.go.
+#
+# The behavioral verifier drives gitea's real in-process integration harness
+# (onGiteaRun spins up a live TCP server), so the test file is injected into
+# the `tests/integration` package and compiled against its TestMain bootstrap.
+#
+# - package: relative to the repo root inside the container (/repo/gitea).
+#   The runner copies verify_ff_only_signed_test.go into tests/integration so
+#   it sees the package helpers (onGiteaRun, loginUser, testRepoFork,
+#   testEditFileToNewBranch, NewRequestWith*, MakeRequest, DecodeJSON).
+# - build_tags: gitea's test bootstrap (modules/setting/testenv.go +
+#   mattn/go-sqlite3, the only sqlite driver in go.mod) refuses to start
+#   without the sqlite + sqlite_unlock_notify tags.
+# - timeout: 600s of headroom. The integration test forks a repo, edits a
+#   file, opens a PR and toggles branch protection against a live server;
+#   the image bakes a prewarmed cgo-sqlite build cache + the gitea binary so
+#   the heavy compile/bootstrap is hot. [verifier].timeout_sec in task.toml
+#   covers the cold-cache path on a fresh worker.
+[go]
+package = "tests/integration"
+build_tags = ["sqlite", "sqlite_unlock_notify"]
+timeout = 600
+
+# CGO_ENABLED=1 is mandatory (sqlite3 link). GOEXPERIMENT=jsonv2 mirrors
+# gitea's Makefile default. GOTOOLCHAIN=local pins the bundled Go toolchain so
+# `go test` never tries to download a newer one on a cold environment.
+# GITEA_TEST_CONF points the harness at the SIGNING_KEY=none sqlite config
+# materialised in the image (tests.InitTest defaults to this path, set
+# explicitly so the verifier is independent of the runner's working dir).
+env = { CGO_ENABLED = "1", GOEXPERIMENT = "jsonv2", GOTOOLCHAIN = "local", GITEA_TEST_CONF = "tests/sqlite.ini" }

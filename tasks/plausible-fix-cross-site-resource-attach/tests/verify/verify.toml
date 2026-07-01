@@ -1,0 +1,15 @@
+# Plausible's `test` mix alias chains `ecto.create --quiet → ecto.migrate →
+# test`, so every invocation re-creates the test schema in Postgres + ClickHouse.
+[mix]
+app = ""
+
+# The runner appends the test path and `--trace --no-color`; MIX_ENV is set via
+# the env table below rather than a command prefix.
+command = "mix test"
+
+# 900s hard cap. A cold first run pays for ecto.create + ecto.migrate (~30-60s)
+# and incremental compile before the tests; later runs reuse the migrated DBs.
+timeout = 900
+
+[mix.env]
+MIX_ENV = "test"

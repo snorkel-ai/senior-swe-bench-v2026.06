@@ -1,0 +1,31 @@
+{
+  "files": [
+    "src/documents/permissions.py",
+    "src/documents/views.py",
+    "src/documents/serialisers.py"
+  ],
+  "fail_to_pass": [
+    {
+      "name": "count_uses_through_table_or_subquery_not_document_join",
+      "description": "The document_count annotation for Tags and CustomFields avoids a full outer JOIN through the documents_document table. Instead, it uses the M2M through table (Document.tags.through / CustomFieldInstance) or a correlated subquery of permitted document IDs, producing a query plan that does not require scanning or joining all document rows on every listing request."
+    },
+    {
+      "name": "permitted_document_ids_computed_index_friendly",
+      "description": "The set of document IDs a non-superuser is permitted to see is computed via a lean, index-friendly query — either a UNION of UserObjectPermission and GroupObjectPermission object_pk casts or a single-filter queryset — rather than the previous three-way OR union produced by get_objects_for_user_owner_aware that caused poor query plans at scale."
+    },
+    {
+      "name": "custom_field_viewset_uses_shared_mixin_and_serializer_updated",
+      "description": "CustomFieldViewSet uses the shared permission-aware document count mechanism (e.g., PermissionsAwareDocumentCountMixin or equivalent), and CustomFieldSerializer.__init__ has been updated (e.g., popping 'user' and 'full_perms' from kwargs before calling super().__init__) so that GET /api/custom_fields/ does not raise TypeError when the mixin chain passes those kwargs."
+    },
+    {
+      "name": "tag_hierarchy_descendant_branch_uses_optimized_counting",
+      "description": "The descendant-listing branch inside TagViewSet.list (the code path that recomputes document_count on the child queryset when tag hierarchy is requested) uses the same optimized counting approach as the main queryset path. It does not still use the old Count('documents', filter=get_document_count_filter_for_user(...)) pattern after the rest of the viewset has been updated."
+    }
+  ],
+  "pass_to_pass": [
+    {
+      "name": "permission_model_semantics_preserved",
+      "description": "The behavioral contract of document_count is unchanged: each user sees a count of non-deleted documents they own, documents with no owner, or documents they have explicit Guardian view_document permission on. Superusers see all non-deleted documents. Soft-deleted documents (deleted_at IS NOT NULL) are excluded for every user. The fix is a query-shape optimization only."
+    }
+  ]
+}

@@ -1,0 +1,197 @@
+version = "1.0"
+
+[environment]
+base_image = "posthog-feat-personhog-writer-add:latest"
+build_timeout_sec = 1800.0
+cpus = 4
+memory = "8G"
+storage = "20G"
+allow_internet = true
+
+[verifier]
+timeout_sec = 1800.0
+
+[verifier.env]
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY:-}"
+OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
+PORTKEY_API_KEY = "${PORTKEY_API_KEY:-}"
+SSB_OVERRIDE_ALL_JUDGE_MODEL = "${SSB_OVERRIDE_ALL_JUDGE_MODEL:-}"
+SSB_OVERRIDE_CLASSIFIER_MODEL = "${SSB_OVERRIDE_CLASSIFIER_MODEL:-}"
+SSB_OVERRIDE_VA_HARNESS = "${SSB_OVERRIDE_VA_HARNESS:-}"
+SSB_OVERRIDE_VA_MODEL = "${SSB_OVERRIDE_VA_MODEL:-}"
+FORCE_VA_HARNESS = "${FORCE_VA_HARNESS:-}"
+FORCE_VA_MODEL = "${FORCE_VA_MODEL:-}"
+REPO_NAME = "posthog"
+TIMEOUT_MULTIPLIER = "${TIMEOUT_MULTIPLIER:-1}"
+
+[agent]
+timeout_sec = 7200.0
+
+[solution.env]
+REPO_NAME = "posthog"
+
+[metadata]
+family = "posthog-feat-personhog-writer-add"
+variant = "hard"
+segment = "design"
+repo = "posthog"
+tags = ["posthog", "rust", "sql-database", "infrastructure"]
+visibility = "public"
+version = "2026.06"
+
+[metadata.narrative]
+description = """PostHog is moving person-state management out of the Node.js ingestion path
+and into a dedicated Rust pipeline. The `personhog-leader` service already
+keeps an in-memory cache of the latest person state and publishes
+deduplicated person-state updates (a `Person` protobuf from the
+`personhog-proto` crate) onto a Kafka topic. What is missing is a durable
+sink: nothing yet consumes that topic and writes the rows to Postgres, so the
+leader's cache cannot survive a restart.
+
+This task builds that sink — a brand-new Rust microservice
+(`rust/personhog-writer`) that consumes the person-state topic and
+batch-upserts rows into the canonical partitioned persons table in the persons
+Postgres database (the target table is supplied by configuration). The
+interesting work is not the plumbing but the
+correctness contracts the writer must honor against an at-least-once,
+high-throughput stream: it must apply updates idempotently with respect to a
+monotonically increasing (but nullable) `version`, collapse repeated updates
+for the same person within a flush window, tolerate individual poison records
+(invalid identifiers, out-of-range team ids, oversized property blobs) without
+failing the surrounding batch, commit Kafka offsets only after a durable
+write, and keep memory bounded under backpressure when Postgres is slow. The
+service must also be wired into the Rust workspace and the dev tooling exactly
+like the other personhog services.
+"""
+context = """Everything lives in PostHog's Rust workspace at `rust/`. The new crate sits
+alongside `personhog-leader` (the producer of the topic) and reuses the shared
+workspace crates: `common-database` (sqlx `PgPool` construction via
+`get_pool_with_config`), `common-kafka` (`KafkaConfig`, producer/consumer
+helpers, and an in-process `MockCluster` test helper), `common-metrics`
+(`setup_metrics_routes`), `common-alloc`, the `lifecycle` crate (`Manager` /
+`Handle` / `ComponentOptions` for graceful start/stop), and `health`. The
+message schema is the pre-existing `personhog-proto` `Person` type (protobuf;
+`properties` and the property-metadata fields are carried as raw JSON byte
+blobs).
+
+The persons store, the canonical `posthog_person` table, already exists in the
+`posthog_persons` database (created by an earlier persons migration, already
+applied in the image), alongside a mirror `personhog_person_tmp` validation
+table. The target table is config-driven (the reference validates it against an
+allowlist that includes both). Both tables are `PARTITION BY HASH(team_id)`
+across 64 partitions with `PRIMARY KEY (team_id, id)`, a
+`UNIQUE INDEX (team_id, uuid)`, a `version BIGINT` column that is **nullable**, a
+`team_id INTEGER` column (i32-width, narrower than the proto's i64 `team_id`),
+and a `CHECK (pg_column_size(properties) <= 655360)` constraint. The agent does
+NOT write a migration — the tables are given.
+
+Validation reads persisted state back through the pre-existing PersonHogReplica
+gRPC read API (the `personhog-replica` service, which reads `posthog_person`) —
+the same way the rest of the persons pipeline reads persons — rather than
+querying a table directly; the validation environment points the writer's
+configured target at `posthog_person` so the read API observes its output. The
+persisted robustness behaviors (idempotency, poison-record isolation, oversized
+trimming) are exercised as unstated embedded asserts inside higher-level product
+stories, not spelled out as separate requirements.
+
+The dev tooling drives the service via `bin/start-rust-service`
+(per-service env blocks) and `bin/mprocs.yaml` (the local process manager),
+both of which the existing personhog services already register in. The
+`personhog-leader` block already sets the person-state topic name. Testing the
+writer needs a real Postgres on `localhost:5432`
+(`postgres://posthog:posthog@localhost:5432/posthog_persons`, already
+migrated) and a Kafka broker; the crate can also be exercised in-process with
+`common-kafka`'s `MockCluster`.
+"""
+solution = """Reference example (PostHog PR #55158): a new `rust/personhog-writer` crate
+registered as a workspace member, plus `bin/start-rust-service` and
+`bin/mprocs.yaml` wiring.
+
+1. Consumer/writer split. A consumer task subscribes to the person-state
+   topic, decodes each `Person` proto, and accumulates updates in an in-memory
+   dedup buffer keyed by `(team_id, person_id)` that keeps the highest
+   `version` seen and tracks the max Kafka offset per partition. A separate
+   writer task receives flushed batches over a *bounded* mpsc channel and
+   performs the Postgres upsert; when the channel is full, the consumer blocks,
+   which bounds memory (backpressure). Flushes are triggered by a timer
+   (`FLUSH_INTERVAL_MS`), buffer size (`FLUSH_BUFFER_SIZE`), a hard capacity
+   ceiling (`BUFFER_CAPACITY`), and shutdown.
+
+2. Idempotent batch upsert. Rows are batch-upserted (the reference uses an
+   `UNNEST`-based multi-row INSERT) with `ON CONFLICT (team_id, id) DO UPDATE`
+   guarded so the update applies only when the incoming version is strictly
+   newer. Because `version` is nullable, the guard must coalesce the stored
+   value: `WHERE EXCLUDED.version > COALESCE({table}.version, -1)`. A naive
+   `EXCLUDED.version > {table}.version` silently drops every update against a
+   NULL-version row (Greptile flagged exactly this on the PR). `properties` and
+   the property-metadata fields are passed as `text[]` and cast `::jsonb`
+   in-statement (no parse/serialize on the hot path).
+
+3. Poison-record isolation. Before the batch INSERT, records with an invalid
+   UUID are filtered out (otherwise several nil/invalid UUIDs collide on the
+   `(team_id, uuid)` unique index and fail the whole INSERT — also flagged on
+   the PR), team_ids outside i32 range are skipped, and oversized `properties`
+   are trimmed: non-protected keys are dropped (the reference does so
+   alphabetically) until the blob is under a target size, preserving a
+   protected-properties allowlist (e.g. `email`); if only protected keys remain
+   and it is still too large, the person is skipped and an ingestion warning
+   emitted.
+
+4. Failure-class partitioning + at-least-once. The batch is chunked and
+   upserted with bounded parallelism; chunk outcomes are partitioned into
+   transient errors (retry the whole chunk with exponential backoff, ~1→2→4s
+   capped at 5s, fail after 3 attempts), data errors (fall back to per-row
+   inserts so one bad row does not poison the chunk), and fatal errors (panic /
+   signal failure and exit). Kafka offsets are committed (offset+1) only after
+   the batch is durably written. The configurable target table is interpolated
+   into SQL, so it is validated against an `ALLOWED_TABLES` allowlist.
+
+Valid alternatives:
+- A single-task design (recv-decode-write in one loop) instead of the
+  consumer/writer split, as long as memory stays bounded and offsets commit
+  only after a durable write.
+- Per-row inserts instead of UNNEST batch / chunk parallelism (slower, same
+  correctness).
+- The version guard expressed with `IS NOT DISTINCT FROM` / an explicit NULL
+  check instead of `COALESCE`, as long as a NULL-version row accepts the
+  update.
+- Property trimming that drops keys by size rather than alphabetically, as
+  long as protected keys survive and the size constraint is satisfied.
+- Different module layout, different (or non-English) identifiers, no
+  `PersonDb`/store trait — any internal structure is acceptable.
+
+What naive implementations get wrong:
+- `EXCLUDED.version > {table}.version` without COALESCE — every update against
+  a NULL-version row is silently dropped, so person state never converges.
+- Not filtering invalid/nil UUIDs — a single bad UUID collides on the unique
+  index and fails the entire batch INSERT, losing every good row with it.
+- Truncating/overflowing an out-of-range team_id instead of skipping it.
+- Letting an oversized-properties row hit the table's size CHECK and abort the
+  batch instead of trimming or skipping it.
+- Committing Kafka offsets before the write succeeds (data loss on crash) or
+  unbounded buffering (OOM under a slow Postgres).
+"""
+
+[metadata.taxonomy]
+task_type = "feature"
+stack = ["rust", "sql-database", "infrastructure"]
+runtime_dependence = "runtime-essential"
+skills = ["codebase-exploration", "interface-design", "framework-fluency", "data-model-design", "event-driven-design", "distributed-systems", "storage-design", "concurrency-reasoning", "build-tooling", "api-contract-design"]
+skill_breadth = "broad"
+
+[metadata.oracle_scope]
+sloc = 2173
+files = 16
+hunks = 18
+scope = "extensive"
+
+[metadata.origin]
+repo = "PostHog/posthog"
+pr_numbers = [55158]
+base_commit = "98873266340f3323060262d44a2f96413f3c393d"
+base_commit_date = "2026-04-22"
+merged_at = "2026-04-22"
+
+
+
+

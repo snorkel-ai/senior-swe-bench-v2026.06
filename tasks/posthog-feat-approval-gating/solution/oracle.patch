@@ -1,0 +1,1008 @@
+diff --git a/frontend/src/scenes/approvals/utils.ts b/frontend/src/scenes/approvals/utils.ts
+index 8db89b5d33..feba5ee0c2 100644
+--- a/frontend/src/scenes/approvals/utils.ts
++++ b/frontend/src/scenes/approvals/utils.ts
+@@ -2,6 +2,7 @@
+ export const ApprovalActionKey = {
+     FEATURE_FLAG_ENABLE: 'feature_flag.enable',
+     FEATURE_FLAG_DISABLE: 'feature_flag.disable',
++    FEATURE_FLAG_UPDATE: 'feature_flag.update',
+ } as const
+ 
+ export type ApprovalActionKeyType = (typeof ApprovalActionKey)[keyof typeof ApprovalActionKey]
+@@ -12,6 +13,10 @@ export const APPROVAL_ACTIONS: Record<string, { label: string; description: stri
+         label: 'Disable feature flag',
+         description: 'disable this feature flag',
+     },
++    [ApprovalActionKey.FEATURE_FLAG_UPDATE]: {
++        label: 'Update feature flag',
++        description: 'update feature flag fields',
++    },
+ }
+ 
+ export function getApprovalActionLabel(actionKey: string): string {
+diff --git a/frontend/src/scenes/settings/organization/Approvals/ApprovalPolicies.tsx b/frontend/src/scenes/settings/organization/Approvals/ApprovalPolicies.tsx
+index 18c112bef5..82abf9e62a 100644
+--- a/frontend/src/scenes/settings/organization/Approvals/ApprovalPolicies.tsx
++++ b/frontend/src/scenes/settings/organization/Approvals/ApprovalPolicies.tsx
+@@ -1,8 +1,16 @@
+ import { useActions, useValues } from 'kea'
+ import { useEffect, useState } from 'react'
+ 
+-import { IconInfo } from '@posthog/icons'
+-import { LemonButton, LemonInputSelect, LemonSelect, LemonSwitch, LemonTable, Tooltip } from '@posthog/lemon-ui'
++import { IconInfo, IconX } from '@posthog/icons'
++import {
++    LemonButton,
++    LemonInput,
++    LemonInputSelect,
++    LemonSelect,
++    LemonSwitch,
++    LemonTable,
++    Tooltip,
++} from '@posthog/lemon-ui'
+ 
+ import { useRestrictedArea } from 'lib/components/RestrictedArea'
+ import { OrganizationMembershipLevel } from 'lib/constants'
+@@ -11,7 +19,7 @@ import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
+ import { LemonModal } from 'lib/lemon-ui/LemonModal'
+ import { LemonTableColumn } from 'lib/lemon-ui/LemonTable'
+ import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+-import { APPROVAL_ACTIONS, getApprovalActionLabel } from 'scenes/approvals/utils'
++import { APPROVAL_ACTIONS, ApprovalActionKey, getApprovalActionLabel } from 'scenes/approvals/utils'
+ import { membersLogic } from 'scenes/organization/membersLogic'
+ import { rolesLogic } from 'scenes/settings/organization/Permissions/Roles/rolesLogic'
+ 
+@@ -19,6 +27,37 @@ import { ApprovalPolicy } from '~/types'
+ 
+ import { approvalPoliciesLogic } from './approvalPoliciesLogic'
+ 
++// Available fields that can be gated
++const GATEABLE_FIELDS: Record<string, { label: string; type: 'number' | 'boolean' | 'string' }> = {
++    rollout_percentage: { label: 'Rollout percentage', type: 'number' },
++}
++
++const CONDITION_TYPES = [
++    { value: 'any_change', label: 'changes' },
++    { value: 'before_after', label: 'new value is' },
++    { value: 'change_amount', label: 'changes by' },
++]
++
++const CONDITION_TYPES_TOOLTIP = `• changes – require approval whenever this field is modified
++• new value is – require approval when the new value meets a threshold (e.g., rollout > 50%)
++• changes by – require approval when the change amount meets a threshold (e.g., increased by more than 10%)`
++
++const OPERATORS = [
++    { value: '>', label: '>' },
++    { value: '>=', label: '>=' },
++    { value: '<', label: '<' },
++    { value: '<=', label: '<=' },
++    { value: '==', label: '=' },
++    { value: '!=', label: '≠' },
++]
++
++interface ConditionRule {
++    field: string
++    type: string
++    operator?: string
++    value?: number
++}
++
+ export function ApprovalPolicies(): JSX.Element {
+     const { policies, policiesLoading } = useValues(approvalPoliciesLogic)
+     const { loadPolicies, deletePolicy } = useActions(approvalPoliciesLogic)
+@@ -149,17 +188,70 @@ function ApprovalPolicyModal({ policy, onClose }: { policy?: ApprovalPolicy; onC
+     const [approverUserIds, setApproverUserIds] = useState<number[]>(policy?.approver_config?.users || [])
+     const [approverRoleIds, setApproverRoleIds] = useState<string[]>(policy?.approver_config?.roles || [])
+ 
++    // Parse existing conditions into rules
++    const parseExistingConditions = (): ConditionRule[] => {
++        const conditions = policy?.conditions as ConditionRule | undefined
++        if (conditions?.field) {
++            return [
++                {
++                    field: conditions.field,
++                    type: conditions.type || 'any_change',
++                    operator: conditions.operator,
++                    value: conditions.value,
++                },
++            ]
++        }
++        return []
++    }
++
++    const [rules, setRules] = useState<ConditionRule[]>(parseExistingConditions())
++
+     useEffect(() => {
+         loadAllMembers()
+         loadRoles()
+     }, [loadAllMembers, loadRoles])
+ 
++    const addRule = (field: string): void => {
++        setRules([...rules, { field, type: 'any_change' }])
++    }
++
++    const updateRule = (index: number, updates: Partial<ConditionRule>): void => {
++        const newRules = [...rules]
++        newRules[index] = { ...newRules[index], ...updates }
++        setRules(newRules)
++    }
++
++    const removeRule = (index: number): void => {
++        setRules(rules.filter((_, i) => i !== index))
++    }
++
++    const usedFields = new Set(rules.map((r) => r.field))
++    const availableFields = Object.entries(GATEABLE_FIELDS).filter(([key]) => !usedFields.has(key))
++
+     const handleSave = (): void => {
+         if (approverUserIds.length === 0 && approverRoleIds.length === 0) {
+             lemonToast.error('Please select at least one user or role')
+             return
+         }
+ 
++        // Build conditions from rules (for now, just take the first rule)
++        let conditions: Record<string, unknown> = {}
++        if (actionKey === ApprovalActionKey.FEATURE_FLAG_UPDATE && rules.length > 0) {
++            const rule = rules[0]
++            if (rule.type !== 'any_change' && rule.value === undefined) {
++                lemonToast.error('Please specify a threshold value')
++                return
++            }
++            conditions = {
++                type: rule.type,
++                field: rule.field,
++            }
++            if (rule.type !== 'any_change') {
++                conditions.operator = rule.operator
++                conditions.value = rule.value
++            }
++        }
++
+         const policyData = {
+             action_key: actionKey,
+             approver_config: {
+@@ -168,7 +260,7 @@ function ApprovalPolicyModal({ policy, onClose }: { policy?: ApprovalPolicy; onC
+                 roles: approverRoleIds,
+             },
+             allow_self_approve: allowSelfApprove,
+-            conditions: {},
++            conditions,
+             bypass_roles: [],
+             enabled: true,
+         }
+@@ -181,7 +273,6 @@ function ApprovalPolicyModal({ policy, onClose }: { policy?: ApprovalPolicy; onC
+         onClose()
+     }
+ 
+-    // Prepare user options for dropdown
+     const userOptions =
+         members?.map((member) => ({
+             key: member.user.id.toString(),
+@@ -194,7 +285,6 @@ function ApprovalPolicyModal({ policy, onClose }: { policy?: ApprovalPolicy; onC
+             ),
+         })) || []
+ 
+-    // Prepare role options for dropdown
+     const roleOptions =
+         roles?.map((role) => ({
+             key: role.id,
+@@ -205,7 +295,7 @@ function ApprovalPolicyModal({ policy, onClose }: { policy?: ApprovalPolicy; onC
+         <LemonModal
+             isOpen
+             onClose={onClose}
+-            width={520}
++            width={600}
+             title={policy ? 'Edit approval policy' : 'Create approval policy'}
+             footer={
+                 <>
+@@ -224,7 +314,12 @@ function ApprovalPolicyModal({ policy, onClose }: { policy?: ApprovalPolicy; onC
+                     <LemonSelect
+                         fullWidth
+                         value={actionKey}
+-                        onChange={setActionKey}
++                        onChange={(value) => {
++                            setActionKey(value)
++                            if (value !== ApprovalActionKey.FEATURE_FLAG_UPDATE) {
++                                setRules([])
++                            }
++                        }}
+                         options={Object.entries(APPROVAL_ACTIONS).map(([value, action]) => ({
+                             label: action.label,
+                             value,
+@@ -232,6 +327,51 @@ function ApprovalPolicyModal({ policy, onClose }: { policy?: ApprovalPolicy; onC
+                     />
+                 </div>
+ 
++                {actionKey === ApprovalActionKey.FEATURE_FLAG_UPDATE && (
++                    <div className="space-y-3">
++                        <div className="flex items-center gap-2">
++                            <label className="block text-sm font-medium">Require approval when</label>
++                            <Tooltip title={CONDITION_TYPES_TOOLTIP}>
++                                <IconInfo className="text-muted-alt w-4 h-4" />
++                            </Tooltip>
++                        </div>
++
++                        {rules.length === 0 ? (
++                            <div className="p-4 border border-dashed rounded text-center text-muted">
++                                No conditions configured. Add a field to require approval for specific changes.
++                            </div>
++                        ) : (
++                            <div className="space-y-2">
++                                {rules.map((rule, index) => (
++                                    <RuleRow
++                                        key={rule.field}
++                                        rule={rule}
++                                        onChange={(updates) => updateRule(index, updates)}
++                                        onRemove={() => removeRule(index)}
++                                    />
++                                ))}
++                            </div>
++                        )}
++
++                        {availableFields.length > 0 && (
++                            <LemonSelect
++                                placeholder="+ Add field"
++                                value={null}
++                                onChange={(value) => value && addRule(value)}
++                                options={availableFields.map(([key, config]) => ({
++                                    value: key,
++                                    label: config.label,
++                                }))}
++                                size="small"
++                            />
++                        )}
++
++                        <p className="text-xs text-secondary">
++                            If no conditions are set, all changes to this action type will require approval.
++                        </p>
++                    </div>
++                )}
++
+                 <div>
+                     <label className="block text-sm font-medium mb-1">Approver users</label>
+                     <LemonInputSelect
+@@ -290,3 +430,55 @@ function ApprovalPolicyModal({ policy, onClose }: { policy?: ApprovalPolicy; onC
+         </LemonModal>
+     )
+ }
++
++function RuleRow({
++    rule,
++    onChange,
++    onRemove,
++}: {
++    rule: ConditionRule
++    onChange: (updates: Partial<ConditionRule>) => void
++    onRemove: () => void
++}): JSX.Element {
++    const fieldConfig = GATEABLE_FIELDS[rule.field]
++    const isNumeric = fieldConfig?.type === 'number'
++
++    return (
++        <div className="flex items-center gap-2 p-2 bg-bg-light border rounded">
++            <span className="font-medium text-sm whitespace-nowrap">{fieldConfig?.label || rule.field}</span>
++
++            <LemonSelect
++                size="small"
++                value={rule.type}
++                onChange={(value) => onChange({ type: value })}
++                options={CONDITION_TYPES}
++            />
++
++            {rule.type !== 'any_change' && isNumeric && (
++                <>
++                    <LemonSelect
++                        size="small"
++                        value={rule.operator || '>'}
++                        onChange={(value) => onChange({ operator: value })}
++                        options={OPERATORS}
++                    />
++                    <LemonInput
++                        size="small"
++                        type="number"
++                        min={rule.type === 'change_amount' ? -100 : 0}
++                        max={100}
++                        value={rule.value}
++                        onChange={(val) => onChange({ value: val })}
++                        placeholder="%"
++                        className="w-20"
++                    />
++                    <span className="text-sm text-muted">%</span>
++                </>
++            )}
++
++            <div className="flex-1" />
++
++            <LemonButton size="small" icon={<IconX />} onClick={onRemove} tooltip="Remove rule" />
++        </div>
++    )
++}
+diff --git a/posthog/api/feature_flag.py b/posthog/api/feature_flag.py
+index fca4dcce45..c061fbdb8e 100644
+--- a/posthog/api/feature_flag.py
++++ b/posthog/api/feature_flag.py
+@@ -833,7 +833,7 @@ class FeatureFlagSerializer(
+ 
+         return instance
+ 
+-    @approval_gate(["feature_flag.enable", "feature_flag.disable"])
++    @approval_gate(["feature_flag.enable", "feature_flag.disable", "feature_flag.update"])
+     def update(self, instance: FeatureFlag, validated_data: dict, *args: Any, **kwargs: Any) -> FeatureFlag:
+         request = self.context["request"]
+         # This is a workaround to ensure update works when called from a scheduled task.
+diff --git a/posthog/approvals/actions/feature_flags.py b/posthog/approvals/actions/feature_flags.py
+index 24eeeeb3ce..d7fd5ee048 100644
+--- a/posthog/approvals/actions/feature_flags.py
++++ b/posthog/approvals/actions/feature_flags.py
+@@ -177,3 +177,271 @@ class DisableFeatureFlagAction(FeatureFlagActionBase):
+             "before": intent_data.get("current_state", {}),
+             "after": intent_data.get("gated_changes", {}),
+         }
++
++
++class UpdateFeatureFlagAction(BaseAction):
++    """Gate feature flag field-level updates based on policy conditions."""
++
++    key = "feature_flag.update"
++    version = 1
++    description = "Update feature flag fields"
++    resource_type = "feature_flag"
++    endpoint_serializer_class = FeatureFlagSerializer
++
++    GATEABLE_FIELDS: dict[str, dict[str, str]] = {
++        "rollout_percentage": {
++            "type": "number",
++            "display_name": "rollout percentage",
++        }
++    }
++
++    ROLLOUT_PERCENTAGE_PATHS = [
++        ("groups", "rollout_percentage"),
++        ("super_groups", "rollout_percentage"),
++        ("holdout_groups", "rollout_percentage"),
++        ("multivariate", "variants", "rollout_percentage"),
++    ]
++
++    intent_fields = ["rollout_percentage"]
++
++    @classmethod
++    def _extract_rollout_percentages(cls, filters: dict[str, Any]) -> list[dict[str, Any]]:
++        """
++        Extract all rollout_percentage values from the filter structure.
++
++        Locations checked are defined in ROLLOUT_PERCENTAGE_PATHS.
++        Each path is a tuple of (keys_to_array..., field_name).
++
++        Returns list of dicts with 'path' and 'value' for each found value.
++        """
++        results: list[dict[str, Any]] = []
++
++        for path_spec in cls.ROLLOUT_PERCENTAGE_PATHS:
++            array_path, field_name = path_spec[:-1], path_spec[-1]
++
++            current: Any = filters
++            for key in array_path:
++                current = current.get(key) if isinstance(current, dict) else None
++                if current is None:
++                    break
++
++            if not isinstance(current, list):
++                continue
++
++            path_str = ".".join(array_path)
++            for idx, item in enumerate(current):
++                if isinstance(item, dict) and field_name in item:
++                    results.append(
++                        {
++                            "path": f"{path_str}[{idx}].{field_name}",
++                            "value": item[field_name],
++                        }
++                    )
++
++        return results
++
++    @classmethod
++    def _has_gateable_field_changes(cls, old_filters: dict[str, Any], new_filters: dict[str, Any]) -> bool:
++        """Check if any gateable field has changed between old and new filters."""
++        old_values = cls._extract_rollout_percentages(old_filters)
++        new_values = cls._extract_rollout_percentages(new_filters)
++
++        old_by_path = {v["path"]: v["value"] for v in old_values}
++        new_by_path = {v["path"]: v["value"] for v in new_values}
++
++        all_paths = set(old_by_path.keys()) | set(new_by_path.keys())
++
++        for path in all_paths:
++            old_val = old_by_path.get(path)
++            new_val = new_by_path.get(path)
++            if old_val != new_val:
++                return True
++
++        return False
++
++    @classmethod
++    def _get_triggered_paths(cls, old_filters: dict[str, Any], new_filters: dict[str, Any]) -> list[str]:
++        """Get list of field paths that have changed."""
++        old_values = cls._extract_rollout_percentages(old_filters)
++        new_values = cls._extract_rollout_percentages(new_filters)
++
++        old_by_path = {v["path"]: v["value"] for v in old_values}
++        new_by_path = {v["path"]: v["value"] for v in new_values}
++
++        all_paths = set(old_by_path.keys()) | set(new_by_path.keys())
++        triggered = []
++
++        for path in all_paths:
++            old_val = old_by_path.get(path)
++            new_val = new_by_path.get(path)
++            if old_val != new_val:
++                triggered.append(path)
++
++        return triggered
++
++    @classmethod
++    def detect(cls, request, view, *args, **kwargs) -> bool:
++        if request.method not in ["PATCH", "PUT"]:
++            return False
++
++        try:
++            flag = cls._get_instance(view, *args, **kwargs)
++            if not flag:
++                return False
++        except Exception:
++            return False
++
++        desired_active = request.data.get("active")
++        current_active = flag.active
++
++        if desired_active is not None and desired_active != current_active:
++            if "filters" not in request.data:
++                return False
++
++        new_filters = request.data.get("filters")
++        if not new_filters:
++            return False
++
++        old_filters = flag.filters or {}
++
++        if not cls._has_gateable_field_changes(old_filters, new_filters):
++            return False
++
++        team = cls._get_team(view)
++        if not team:
++            return False
++
++        return True
++
++    @classmethod
++    def extract_intent(cls, request, view, *args, **kwargs) -> dict[str, Any]:
++        flag = cls._get_instance(view, *args, **kwargs)
++
++        old_filters = flag.filters or {}
++        new_filters = request.data.get("filters", {})
++
++        old_rollout_percentages = cls._extract_rollout_percentages(old_filters)
++        new_rollout_percentages = cls._extract_rollout_percentages(new_filters)
++
++        triggered_paths = cls._get_triggered_paths(old_filters, new_filters)
++
++        return {
++            "flag_id": flag.id,
++            "flag_key": flag.key,
++            "current_state": {
++                "rollout_percentage": old_rollout_percentages,
++            },
++            "gated_changes": {
++                "rollout_percentage": new_rollout_percentages,
++            },
++            "triggered_paths": triggered_paths,
++            "full_request_data": dict(request.data),
++            "preconditions": {
++                "version": flag.version,
++                "updated_at": flag.updated_at.isoformat() if flag.updated_at else None,
++            },
++        }
++
++    @classmethod
++    def validate_intent(
++        cls,
++        intent_data: dict[str, Any],
++        context: Optional[dict[str, Any]] = None,
++    ) -> tuple[bool, Optional[dict[str, Any]]]:
++        data_to_validate = intent_data.get("full_request_data", {})
++        instance = context.get("instance") if context else None
++
++        serializer = cls.endpoint_serializer_class(
++            instance=instance,
++            data=data_to_validate,
++            partial=True,
++            context=context or {},
++        )
++
++        is_valid = serializer.is_valid()
++        return is_valid, None if is_valid else serializer.errors
++
++    @classmethod
++    def prepare_context(cls, change_request, base_context: dict) -> dict:
++        context = base_context.copy()
++
++        flag_id = change_request.intent.get("flag_id") or change_request.resource_id
++        if flag_id:
++            try:
++                instance = FeatureFlag.objects.get(id=flag_id, team_id=change_request.team_id)
++                context["instance"] = instance
++            except FeatureFlag.DoesNotExist:
++                pass
++
++        return context
++
++    @classmethod
++    def apply(cls, validated_intent: dict[str, Any], user, context: Optional[dict[str, Any]] = None) -> FeatureFlag:
++        with transaction.atomic():
++            flag = FeatureFlag.objects.select_for_update().get(id=validated_intent["flag_id"])
++
++            if flag.version != validated_intent["preconditions"]["version"]:
++                raise PreconditionFailed(
++                    f"Flag version mismatch: expected {validated_intent['preconditions']['version']}, "
++                    f"got {flag.version}"
++                )
++
++            serializer_context = {
++                "team": context.get("team") if context else flag.team,
++                "team_id": context.get("team_id") if context else flag.team_id,
++                "project_id": context.get("project_id") if context else flag.team.project_id,
++            }
++
++            if context and "request" in context:
++                serializer_context["request"] = context["request"]
++
++            serializer = FeatureFlagSerializer(
++                instance=flag,
++                data=validated_intent["full_request_data"],
++                partial=True,
++                context=serializer_context,
++            )
++
++            if not serializer.is_valid():
++                raise ApplyFailed(f"Serializer validation failed: {serializer.errors}")
++
++            try:
++                flag = serializer.save(last_modified_by=user)
++            except Exception as e:
++                raise ApplyFailed(f"Serializer save failed: {str(e)}")
++
++        return flag
++
++    @classmethod
++    def get_display_data(cls, intent_data: dict[str, Any]) -> dict[str, Any]:
++        """Generate human-readable diff showing before/after for gated fields."""
++        flag_key = intent_data.get("flag_key", "unknown")
++        current_state = intent_data.get("current_state", {})
++        gated_changes = intent_data.get("gated_changes", {})
++        triggered_paths = intent_data.get("triggered_paths", [])
++
++        changes_description = []
++        before_values = current_state.get("rollout_percentage", [])
++        after_values = gated_changes.get("rollout_percentage", [])
++
++        before_by_path = {v["path"]: v["value"] for v in before_values}
++        after_by_path = {v["path"]: v["value"] for v in after_values}
++
++        for path in triggered_paths:
++            before_val = before_by_path.get(path, "N/A")
++            after_val = after_by_path.get(path, "N/A")
++            field_display_name = cls.GATEABLE_FIELDS["rollout_percentage"]["display_name"]
++            changes_description.append(f"{field_display_name} at {path}: {before_val}% -> {after_val}%")
++
++        description = (
++            f"Update {cls.GATEABLE_FIELDS['rollout_percentage']['display_name']} for feature flag '{flag_key}'"
++        )
++        if changes_description:
++            description = f"{description}: {'; '.join(changes_description)}"
++
++        return {
++            "description": description,
++            "before": current_state,
++            "after": gated_changes,
++            "triggered_paths": triggered_paths,
++        }
+diff --git a/posthog/approvals/actions/registry.py b/posthog/approvals/actions/registry.py
+index d31c13ee09..acfc9572ff 100644
+--- a/posthog/approvals/actions/registry.py
++++ b/posthog/approvals/actions/registry.py
+@@ -6,10 +6,15 @@ ACTION_REGISTRY: dict[str, type[BaseAction]] = {}
+ 
+ 
+ def register_actions():
+-    from posthog.approvals.actions.feature_flags import DisableFeatureFlagAction, EnableFeatureFlagAction
++    from posthog.approvals.actions.feature_flags import (
++        DisableFeatureFlagAction,
++        EnableFeatureFlagAction,
++        UpdateFeatureFlagAction,
++    )
+ 
+     ACTION_REGISTRY[EnableFeatureFlagAction.key] = EnableFeatureFlagAction
+     ACTION_REGISTRY[DisableFeatureFlagAction.key] = DisableFeatureFlagAction
++    ACTION_REGISTRY[UpdateFeatureFlagAction.key] = UpdateFeatureFlagAction
+ 
+ 
+ def get_action(action_key: str) -> Optional[type[BaseAction]]:
+diff --git a/posthog/approvals/decorators.py b/posthog/approvals/decorators.py
+index ae1d12da09..40202f1fd8 100644
+--- a/posthog/approvals/decorators.py
++++ b/posthog/approvals/decorators.py
+@@ -14,6 +14,7 @@ from rest_framework.response import Response
+ from posthog.approvals.actions.registry import get_action
+ from posthog.approvals.exceptions import ApprovalRequired
+ from posthog.approvals.models import ChangeRequest, ChangeRequestState
++from posthog.approvals.notifications import send_approval_requested_notification
+ from posthog.approvals.policies import PolicyDecision, PolicyEngine
+ from posthog.approvals.serializers import ChangeRequestSerializer
+ from posthog.event_usage import report_user_action
+@@ -25,7 +26,9 @@ logger = logging.getLogger(__name__)
+ class GateResult:
+     """Result of evaluating the approval gate - pure data, no HTTP concerns."""
+ 
+-    action: Literal["passthrough", "deny", "require_approval", "duplicate", "validation_error", "error"]
++    action: Literal[
++        "passthrough", "deny", "require_approval", "duplicate", "validation_error", "error", "policy_conflict"
++    ]
+     change_request: Optional[ChangeRequest] = None
+     decision: Optional[PolicyDecision] = None
+     error_message: Optional[str] = None
+@@ -33,6 +36,7 @@ class GateResult:
+     resource_id: Optional[str] = None
+     resource_type: Optional[str] = None
+     approvers: dict = field(default_factory=dict)
++    conflicting_policies: list = field(default_factory=list)
+ 
+ 
+ def _extract_context(view_or_serializer, request=None) -> tuple[Optional[Any], Optional[Any], Optional[Any]]:
+@@ -81,6 +85,25 @@ def _check_for_duplicate(action_class, team, resource_id: Optional[str]) -> Opti
+     ).first()
+ 
+ 
++def _check_for_policy_conflicts(action_class, team, organization, intent_data: dict[str, Any]) -> list[dict[str, Any]]:
++    """
++    Check if multiple policies match the same change.
++    Returns list of conflicting policy info dicts if more than one policy matches.
++    """
++    policy_engine = PolicyEngine()
++    matching_policies = policy_engine.get_all_matching_policies(
++        action_key=action_class.key,
++        team=team,
++        organization=organization,
++        intent=intent_data,
++    )
++
++    if len(matching_policies) > 1:
++        return [{"id": str(p.id), "name": str(p)} for p in matching_policies]
++
++    return []
++
++
+ def _create_change_request(
+     action_class,
+     team,
+@@ -127,6 +150,8 @@ def _create_change_request(
+         },
+     )
+ 
++    send_approval_requested_notification(change_request)
++
+     return change_request
+ 
+ 
+@@ -206,7 +231,23 @@ def _evaluate_gate(
+         logger.warning("Intent validation failed", extra={"action": action_class.key, "errors": errors})
+         return GateResult(action="validation_error", validation_errors=errors)
+ 
+-    # Step 3: Evaluate policy
++    # Step 3: Check for policy conflicts BEFORE creating ChangeRequest
++    conflicting_policies = _check_for_policy_conflicts(action_class, team, organization, intent_data)
++    if conflicting_policies:
++        logger.warning(
++            "Multiple policies match this change",
++            extra={
++                "action": action_class.key,
++                "conflicting_policies": conflicting_policies,
++            },
++        )
++        return GateResult(
++            action="policy_conflict",
++            conflicting_policies=conflicting_policies,
++            error_message="This change matches multiple approval policies",
++        )
++
++    # Step 4: Evaluate policy
+     policy_engine = PolicyEngine()
+     decision = policy_engine.evaluate(
+         policy=policy,
+@@ -226,7 +267,7 @@ def _evaluate_gate(
+         logger.warning("Policy denied request", extra={"action": action_class.key, "reason": decision.reason})
+         return GateResult(action="deny", error_message=decision.reason)
+ 
+-    # Step 4: REQUIRE_APPROVAL - check for duplicates and create change request
++    # Step 5: REQUIRE_APPROVAL - check for duplicates and create change request
+     resource_id = _extract_resource_id(request, args, kwargs)
+ 
+     existing = _check_for_duplicate(action_class, team, resource_id)
+@@ -300,6 +341,16 @@ def _result_to_exception(result: GateResult) -> None:
+     if result.action == "error":
+         raise APIException(result.error_message)
+ 
++    if result.action == "policy_conflict":
++        raise ValidationError(
++            {
++                "code": "policy_conflict",
++                "error": result.error_message,
++                "conflicting_policies": result.conflicting_policies,
++                "guidance": "Split your changes into separate API calls to address each policy independently",
++            }
++        )
++
+     if result.action == "duplicate":
+         raise ApprovalRequired(
+             change_request=result.change_request,
+@@ -333,6 +384,17 @@ def _result_to_response(result: GateResult) -> Optional[Response]:
+     if result.action == "error":
+         return Response({"error": result.error_message}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+ 
++    if result.action == "policy_conflict":
++        return Response(
++            {
++                "code": "policy_conflict",
++                "error": result.error_message,
++                "conflicting_policies": result.conflicting_policies,
++                "guidance": "Split your changes into separate API calls to address each policy independently",
++            },
++            status=status.HTTP_400_BAD_REQUEST,
++        )
++
+     if result.action == "duplicate" and result.change_request:
+         return Response(
+             {
+diff --git a/posthog/approvals/policies.py b/posthog/approvals/policies.py
+index 38effd7864..171596ff96 100644
+--- a/posthog/approvals/policies.py
++++ b/posthog/approvals/policies.py
+@@ -1,4 +1,5 @@
+ from dataclasses import dataclass
++from typing import Any
+ 
+ 
+ @dataclass
+@@ -15,6 +16,15 @@ class PolicyDecision:
+ class PolicyEngine:
+     """Evaluates approval policies"""
+ 
++    COMPARISON_OPERATORS = {
++        ">": lambda a, b: a > b,
++        "<": lambda a, b: a < b,
++        ">=": lambda a, b: a >= b,
++        "<=": lambda a, b: a <= b,
++        "==": lambda a, b: a == b,
++        "!=": lambda a, b: a != b,
++    }
++
+     def get_policy(self, action_key: str, team, organization):
+         """
+         Get the active policy for an action.
+@@ -51,12 +61,42 @@ class PolicyEngine:
+ 
+         return policy
+ 
++    def get_all_matching_policies(self, action_key: str, team, organization, intent: dict):
++        """
++        Get all active policies for an action that match the given intent.
++        Used for conflict detection.
++        """
++        from posthog.approvals.models import ApprovalPolicy
++
++        policies = []
++
++        if team:
++            team_policies = ApprovalPolicy.objects.enabled().filter(
++                action_key=action_key,
++                organization=organization,
++                team=team,
++            )
++            for policy in team_policies:
++                if self._evaluate_conditions(policy.conditions, intent):
++                    policies.append(policy)
++
++        org_policies = ApprovalPolicy.objects.enabled().filter(
++            action_key=action_key,
++            organization=organization,
++            team__isnull=True,
++        )
++        for policy in org_policies:
++            if self._evaluate_conditions(policy.conditions, intent):
++                policies.append(policy)
++
++        return policies
++
+     def evaluate(self, policy, actor, intent: dict, context: dict) -> PolicyDecision:
+         """
+         Evaluate if an action requires approval.
+ 
+         Returns PolicyDecision with:
+-        - ALLOW: User can execute immediately (bypass role)
++        - ALLOW: User can execute immediately (bypass role or conditions don't match)
+         - DENY: Action not allowed
+         - REQUIRE_APPROVAL: Must get approvals
+         """
+@@ -69,6 +109,15 @@ class PolicyEngine:
+                 policy_snapshot={},
+             )
+ 
++        if not self._evaluate_conditions(policy.conditions, intent):
++            return PolicyDecision(
++                result="ALLOW",
++                reason="Conditions not matched",
++                message="Change does not require approval",
++                approvers={},
++                policy_snapshot={},
++            )
++
+         approver_config = policy.approver_config
+ 
+         if not policy.allow_self_approve and self._actor_is_approver(actor, approver_config, context):
+@@ -86,9 +135,144 @@ class PolicyEngine:
+                 "users": approver_config.get("users", []),
+                 "roles": approver_config.get("roles", []),
+                 "allow_self_approve": policy.allow_self_approve,
++                "conditions": policy.conditions or {},
+             },
+         )
+ 
++    def _evaluate_conditions(self, conditions: dict[str, Any], intent: dict) -> bool:
++        """
++        Evaluate policy conditions against the intent.
++
++        Returns True if conditions match (gating applies), False otherwise.
++        If conditions is empty/None, returns True (gate all changes for that action).
++
++        Condition types:
++        - before_after: Compare field values before and after change
++        - change_amount: Compare delta between before/after values
++        - any_change: Gate if the field changes at all
++        """
++        if not conditions:
++            return True
++
++        condition_type = conditions.get("type")
++
++        if condition_type == "before_after":
++            return self._evaluate_before_after(conditions, intent)
++        elif condition_type == "change_amount":
++            return self._evaluate_change_amount(conditions, intent)
++        elif condition_type == "any_change":
++            return self._evaluate_any_change(conditions, intent)
++
++        return True
++
++    def _evaluate_before_after(self, conditions: dict[str, Any], intent: dict) -> bool:
++        """
++        Evaluate before_after condition type.
++
++        Structure: {"type": "before_after", "field": "rollout_percentage", "operator": ">", "value": 50}
++        Compares the "after" value against the condition value using the operator.
++        Checks ALL paths where the field appears, returns True if ANY match.
++        """
++        field = conditions.get("field")
++        operator = conditions.get("operator")
++        threshold = conditions.get("value")
++
++        if not field or not operator or threshold is None:
++            return True
++
++        compare_fn = self.COMPARISON_OPERATORS.get(operator)
++        if not compare_fn:
++            return True
++
++        gated_changes = intent.get("gated_changes", {})
++        field_values = gated_changes.get(field, [])
++
++        for item in field_values:
++            after_value = item.get("value")
++            if after_value is not None:
++                try:
++                    if compare_fn(after_value, threshold):
++                        return True
++                except (TypeError, ValueError):
++                    pass
++
++        return False
++
++    def _evaluate_change_amount(self, conditions: dict[str, Any], intent: dict) -> bool:
++        """
++        Evaluate change_amount condition type.
++
++        Structure: {"type": "change_amount", "field": "rollout_percentage", "operator": ">", "value": 10}
++        Calculates delta = after_value - before_value and compares against threshold.
++        Only valid for numeric field types.
++        """
++        field = conditions.get("field")
++        operator = conditions.get("operator")
++        threshold = conditions.get("value")
++
++        if not field or not operator or threshold is None:
++            return True
++
++        compare_fn = self.COMPARISON_OPERATORS.get(operator)
++        if not compare_fn:
++            return True
++
++        current_state = intent.get("current_state", {})
++        gated_changes = intent.get("gated_changes", {})
++
++        before_values = current_state.get(field, [])
++        after_values = gated_changes.get(field, [])
++
++        before_by_path = {v["path"]: v["value"] for v in before_values}
++        after_by_path = {v["path"]: v["value"] for v in after_values}
++
++        all_paths = set(before_by_path.keys()) | set(after_by_path.keys())
++
++        for path in all_paths:
++            before_val = before_by_path.get(path)
++            after_val = after_by_path.get(path)
++
++            if before_val is not None and after_val is not None:
++                try:
++                    delta = after_val - before_val
++                    if compare_fn(delta, threshold):
++                        return True
++                except (TypeError, ValueError):
++                    pass
++
++        return False
++
++    def _evaluate_any_change(self, conditions: dict[str, Any], intent: dict) -> bool:
++        """
++        Evaluate any_change condition type.
++
++        Structure: {"type": "any_change", "field": "rollout_percentage"}
++        Returns True if the field value differs between before and after.
++        """
++        field = conditions.get("field")
++
++        if not field:
++            return True
++
++        current_state = intent.get("current_state", {})
++        gated_changes = intent.get("gated_changes", {})
++
++        before_values = current_state.get(field, [])
++        after_values = gated_changes.get(field, [])
++
++        before_by_path = {v["path"]: v["value"] for v in before_values}
++        after_by_path = {v["path"]: v["value"] for v in after_values}
++
++        all_paths = set(before_by_path.keys()) | set(after_by_path.keys())
++
++        for path in all_paths:
++            before_val = before_by_path.get(path)
++            after_val = after_by_path.get(path)
++            if before_val != after_val:
++                return True
++
++        return False
++
+     def _has_bypass_role(self, actor, policy, context: dict) -> bool:
+         """Check if user has a bypass role"""
+         if not policy.bypass_roles:
+@@ -112,11 +296,9 @@ class PolicyEngine:
+ 
+         Returns True if actor matches either users OR roles.
+         """
+-        # Check direct user IDs
+         if "users" in approver_config and actor.id in approver_config["users"]:
+             return True
+ 
+-        # Check role membership
+         if approver_config.get("roles"):
+             try:
+                 from ee.models.rbac.role import RoleMembership

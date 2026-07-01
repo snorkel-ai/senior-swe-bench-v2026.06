@@ -1,0 +1,2954 @@
+diff --git a/bin/mprocs.yaml b/bin/mprocs.yaml
+index 96a31ed2df5..d865b472037 100755
+--- a/bin/mprocs.yaml
++++ b/bin/mprocs.yaml
+@@ -323,6 +323,22 @@ procs:
+             layer: Product services
+             tech: Rust
+ 
++    personhog-etcd-init:
++        shell: |-
++            bin/wait-for-docker && \
++            docker exec posthog-etcd-1 etcdctl put /personhog/config/total_partitions 4 && \
++            echo 'etcd init complete'
++        capability: personhog
++        ready_pattern: 'etcd init complete'
++        autostart: true
++
++    personhog-router-leader:
++        shell: |-
++            bin/wait-for-docker && \
++            bin/start-rust-service personhog-router-leader
++        capability: personhog
++        ready_pattern: 'Metrics server listening on *'
++
+     personhog-leader:
+         shell: |-
+             bin/wait-for-docker && \
+@@ -333,6 +349,13 @@ procs:
+             layer: Product services
+             tech: Rust
+ 
++    personhog-writer:
++        shell: |-
++            bin/wait-for-docker && \
++            bin/start-rust-service personhog-writer
++        capability: personhog
++        ready_pattern: 'Metrics server listening on *'
++
+     llm-gateway:
+         shell: 'bin/wait-for-docker && bin/start-llm-gateway'
+         capability: llm_gateway
+diff --git a/bin/start-rust-service b/bin/start-rust-service
+index b5ead9f558a..986d99abe1c 100755
+--- a/bin/start-rust-service
++++ b/bin/start-rust-service
+@@ -186,6 +186,20 @@ case "$RS_SVC" in
+     export METRICS_PORT=9101
+     ;;
+ 
++  personhog-router-leader)
++    export RUST_LOG=debug
++    export RUST_BACKTRACE=1
++    export GRPC_ADDRESS=127.0.0.1:50054
++    export REPLICA_URL=http://127.0.0.1:50051
++    export ROUTER_MODE=leader
++    export ETCD_ENDPOINTS=http://localhost:2379
++    export ETCD_PREFIX=/personhog/
++    export BACKEND_TIMEOUT_MS=5000
++    export METRICS_PORT=9104
++    # The router binary is the same as personhog-router
++    export DEV_RUST_SVC_OVERRIDE=personhog-router
++    ;;
++
+   personhog-leader)
+     export RUST_LOG=debug
+     export RUST_BACKTRACE=1
+@@ -193,11 +207,27 @@ case "$RS_SVC" in
+     export CACHE_MEMORY_CAPACITY=100000
+     export ETCD_ENDPOINTS=http://localhost:2379
+     export ETCD_PREFIX=/personhog/
++    # Register as 127.0.0.1 so the router can resolve the pod address locally.
++    # In production, pod names resolve via K8s DNS.
++    export POD_NAME=127.0.0.1
+     export KAFKA_HOSTS="${KAFKA_HOSTS:-localhost:9092}"
+     export KAFKA_PERSON_STATE_TOPIC=personhog_updates
+     export METRICS_PORT=9102
+     ;;
+ 
++  personhog-writer)
++    export RUST_LOG=debug
++    export RUST_BACKTRACE=1
++    export DATABASE_URL="postgres://posthog:posthog@${PGHOST:-localhost}:${PGPORT:-5432}/posthog_persons"
++    export KAFKA_HOSTS="${KAFKA_HOSTS:-localhost:9092}"
++    export KAFKA_TOPIC=personhog_updates
++    export KAFKA_CONSUMER_GROUP=personhog-writer
++    export FLUSH_INTERVAL_MS=5000
++    export FLUSH_BUFFER_SIZE=1000
++    export BUFFER_CAPACITY=50000
++    export METRICS_PORT=9103
++    ;;
++
+   *)
+     echo "ERROR unknown posthog/rust service '$RS_SVC' please register in: $0" >&2
+     exit 1
+diff --git a/rust/Cargo.lock b/rust/Cargo.lock
+index dc92eb9b242..f205bae8839 100644
+--- a/rust/Cargo.lock
++++ b/rust/Cargo.lock
+@@ -6717,6 +6717,33 @@ dependencies = [
+  "tracing-subscriber",
+ ]
+ 
++[[package]]
++name = "personhog-writer"
++version = "0.1.0"
++dependencies = [
++ "async-trait",
++ "axum 0.7.9",
++ "chrono",
++ "common-alloc",
++ "common-database",
++ "common-kafka",
++ "common-metrics",
++ "envconfig",
++ "futures",
++ "health",
++ "lifecycle",
++ "metrics",
++ "personhog-proto",
++ "prost 0.13.5",
++ "rdkafka",
++ "serde_json",
++ "sqlx",
++ "tokio",
++ "tracing",
++ "tracing-subscriber",
++ "uuid",
++]
++
+ [[package]]
+ name = "pest"
+ version = "2.8.6"
+diff --git a/rust/Cargo.toml b/rust/Cargo.toml
+index 007644409c3..655811eba40 100644
+--- a/rust/Cargo.toml
++++ b/rust/Cargo.toml
+@@ -44,6 +44,7 @@ members = [
+     "personhog-common",
+     "personhog-coordination",
+     "personhog-leader",
++    "personhog-writer",
+     "personhog-proto",
+     "personhog-replica",
+     "personhog-router",
+diff --git a/rust/personhog-writer/Cargo.toml b/rust/personhog-writer/Cargo.toml
+new file mode 100644
+index 00000000000..c31a7ad7537
+--- /dev/null
++++ b/rust/personhog-writer/Cargo.toml
+@@ -0,0 +1,35 @@
++[package]
++name = "personhog-writer"
++version = "0.1.0"
++edition = "2021"
++publish = false
++
++[dependencies]
++personhog-proto = { path = "../personhog-proto" }
++common-database = { path = "../common/database" }
++common-kafka = { path = "../common/kafka" }
++common-alloc = { path = "../common/alloc" }
++common-metrics = { path = "../common/metrics" }
++lifecycle = { path = "../common/lifecycle" }
++
++async-trait = { workspace = true }
++axum = { workspace = true }
++chrono = { workspace = true }
++envconfig = { workspace = true }
++futures = { workspace = true }
++metrics = { workspace = true }
++prost = { workspace = true }
++rdkafka = { workspace = true }
++serde_json = { workspace = true }
++sqlx = { workspace = true }
++tokio = { workspace = true }
++tracing = { workspace = true }
++tracing-subscriber = { workspace = true }
++uuid = { workspace = true }
++
++[dev-dependencies]
++health = { path = "../common/health" }
++tokio = { workspace = true, features = ["test-util"] }
++
++[lints]
++workspace = true
+diff --git a/rust/personhog-writer/src/buffer.rs b/rust/personhog-writer/src/buffer.rs
+new file mode 100644
+index 00000000000..871e3e19dcd
+--- /dev/null
++++ b/rust/personhog-writer/src/buffer.rs
+@@ -0,0 +1,152 @@
++use std::collections::hash_map::Entry;
++use std::collections::HashMap;
++
++use metrics::{counter, gauge};
++use personhog_proto::personhog::types::v1::Person;
++
++/// In-memory dedup buffer keyed by (team_id, person_id).
++/// Later messages for the same person overwrite earlier ones.
++pub struct PersonBuffer {
++    entries: HashMap<(i64, i64), Person>,
++    /// Max offset seen per partition for offset commits.
++    offsets: HashMap<i32, i64>,
++    capacity: usize,
++}
++
++impl PersonBuffer {
++    pub fn new(capacity: usize) -> Self {
++        Self {
++            entries: HashMap::new(),
++            offsets: HashMap::new(),
++            capacity,
++        }
++    }
++
++    /// Insert a person into the buffer. Later messages for the same person
++    /// overwrite earlier ones -- Kafka partition ordering guarantees the
++    /// latest version always arrives last.
++    pub fn insert(&mut self, person: Person, partition: i32, offset: i64) {
++        self.offsets
++            .entry(partition)
++            .and_modify(|o| {
++                if offset > *o {
++                    *o = offset;
++                }
++            })
++            .or_insert(offset);
++
++        let key = (person.team_id, person.id);
++        match self.entries.entry(key) {
++            Entry::Occupied(mut e) => {
++                e.insert(person);
++                counter!("personhog_writer_messages_deduped_total").increment(1);
++            }
++            Entry::Vacant(e) => {
++                e.insert(person);
++            }
++        }
++
++        gauge!("personhog_writer_buffer_size").set(self.entries.len() as f64);
++    }
++
++    pub fn len(&self) -> usize {
++        self.entries.len()
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.entries.is_empty()
++    }
++
++    pub fn is_full(&self) -> bool {
++        self.entries.len() >= self.capacity
++    }
++
++    /// Get the current offset for a partition, if tracked.
++    pub fn partition_offset(&self, partition: i32) -> Option<i64> {
++        self.offsets.get(&partition).copied()
++    }
++
++    /// Drain all entries and offsets for flushing.
++    pub fn drain(&mut self) -> (Vec<Person>, HashMap<i32, i64>) {
++        let persons: Vec<Person> = self.entries.drain().map(|(_, p)| p).collect();
++        let offsets = std::mem::take(&mut self.offsets);
++        gauge!("personhog_writer_buffer_size").set(0.0);
++        (persons, offsets)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn make_person(team_id: i64, person_id: i64, version: i64) -> Person {
++        Person {
++            id: person_id,
++            team_id,
++            uuid: format!("uuid-{team_id}-{person_id}"),
++            properties: vec![],
++            properties_last_updated_at: vec![],
++            properties_last_operation: vec![],
++            created_at: 1700000000,
++            version,
++            is_identified: false,
++            is_user_id: None,
++            last_seen_at: None,
++        }
++    }
++
++    #[test]
++    fn insert_and_drain() {
++        let mut buf = PersonBuffer::new(100);
++        buf.insert(make_person(1, 42, 1), 0, 0);
++        buf.insert(make_person(1, 43, 1), 0, 1);
++
++        assert_eq!(buf.len(), 2);
++
++        let (persons, offsets) = buf.drain();
++        assert_eq!(persons.len(), 2);
++        assert_eq!(offsets[&0], 1);
++        assert_eq!(buf.len(), 0);
++    }
++
++    #[test]
++    fn dedup_keeps_latest_message() {
++        let mut buf = PersonBuffer::new(100);
++        buf.insert(make_person(1, 42, 1), 0, 0);
++        buf.insert(make_person(1, 42, 2), 0, 1);
++        buf.insert(make_person(1, 42, 3), 0, 2);
++
++        assert_eq!(buf.len(), 1);
++
++        let (persons, _) = buf.drain();
++        assert_eq!(persons[0].version, 3);
++    }
++
++    #[test]
++    fn is_full_respects_capacity() {
++        let mut buf = PersonBuffer::new(2);
++        assert!(!buf.is_full());
++
++        buf.insert(make_person(1, 1, 1), 0, 0);
++        assert!(!buf.is_full());
++
++        buf.insert(make_person(1, 2, 1), 0, 1);
++        assert!(buf.is_full());
++    }
++
++    #[test]
++    fn tracks_max_offset_per_partition() {
++        let mut buf = PersonBuffer::new(100);
++        buf.insert(make_person(1, 1, 1), 0, 10);
++        buf.insert(make_person(1, 2, 1), 0, 5);
++        buf.insert(make_person(1, 3, 1), 1, 3);
++
++        assert_eq!(buf.partition_offset(0), Some(10));
++        assert_eq!(buf.partition_offset(1), Some(3));
++        assert_eq!(buf.partition_offset(2), None);
++
++        let (_, offsets) = buf.drain();
++        assert_eq!(offsets[&0], 10);
++        assert_eq!(offsets[&1], 3);
++    }
++}
+diff --git a/rust/personhog-writer/src/config.rs b/rust/personhog-writer/src/config.rs
+new file mode 100644
+index 00000000000..93625d1789e
+--- /dev/null
++++ b/rust/personhog-writer/src/config.rs
+@@ -0,0 +1,92 @@
++use std::time::Duration;
++
++use common_kafka::config::KafkaConfig;
++use envconfig::Envconfig;
++
++#[derive(Envconfig, Clone)]
++pub struct Config {
++    // ── Kafka ────────────────────────────────────────────────────
++    #[envconfig(nested = true)]
++    pub kafka: KafkaConfig,
++
++    #[envconfig(default = "personhog_updates")]
++    pub kafka_topic: String,
++
++    #[envconfig(default = "personhog-writer")]
++    pub kafka_consumer_group: String,
++
++    #[envconfig(default = "earliest")]
++    pub kafka_consumer_offset_reset: String,
++
++    // ── Postgres ─────────────────────────────────────────────────
++    pub database_url: String,
++
++    #[envconfig(default = "20")]
++    pub pg_max_connections: u32,
++
++    /// Target table for person upserts. Set to "posthog_person" for
++    /// production cutover, "personhog_person_tmp" for validation.
++    #[envconfig(default = "personhog_person_tmp")]
++    pub pg_target_table: String,
++
++    // ── Flush tuning ─────────────────────────────────────────────
++    /// How often to flush the buffer to Postgres, in milliseconds. Longer
++    /// windows trade latency for better dedup on hot persons.
++    #[envconfig(default = "30000")]
++    pub flush_interval_ms: u64,
++
++    /// Flush when the buffer reaches this many entries. Sized to produce
++    /// multi-chunk batches that exercise the parallel chunk path.
++    #[envconfig(default = "10000")]
++    pub flush_buffer_size: usize,
++
++    /// Hard cap on buffer entries. When full, stop consuming from
++    /// Kafka until a flush completes (backpressure). ~10× flush_buffer_size
++    /// worth of headroom for bursts.
++    #[envconfig(default = "100000")]
++    pub buffer_capacity: usize,
++
++    /// Max rows per INSERT statement. Chunks larger than this are
++    /// executed as parallel statements.
++    #[envconfig(default = "5000")]
++    pub upsert_batch_size: usize,
++
++    /// Max concurrent per-row upserts when a batch falls back to the
++    /// per-row path. Size against `pg_max_connections`; pgbouncer handles
++    /// backpressure to PG itself.
++    #[envconfig(default = "16")]
++    pub row_fallback_concurrency: usize,
++
++    /// Raw-bytes threshold for the properties field above which a person
++    /// is trimmed preflight (before the batch upsert). Matches the PG
++    /// `check_properties_size` constraint; trimmed persons rejoin the
++    /// main batch so a single oversized row can't torpedo the whole write.
++    #[envconfig(default = "655360")]
++    pub properties_size_threshold: usize,
++
++    /// Target raw-bytes size to trim oversized properties down to. Should
++    /// be comfortably below `properties_size_threshold` so the trim result
++    /// definitely fits the PG constraint even if JSONB encoding inflates
++    /// the stored size relative to the raw JSON we trimmed.
++    #[envconfig(default = "524288")]
++    pub properties_trim_target: usize,
++
++    /// Channel capacity between consumer and writer tasks.
++    /// Higher values allow more buffered batches but use more memory.
++    #[envconfig(default = "8")]
++    pub flush_channel_capacity: usize,
++
++    // ── Ingestion warnings ────────────────────────────────────────
++    #[envconfig(default = "client_iwarnings_ingestion")]
++    pub kafka_ingestion_warnings_topic: String,
++
++    // ── Service ──────────────────────────────────────────────────
++    #[envconfig(default = "9103")]
++    pub metrics_port: u16,
++}
++
++impl Config {
++    pub fn flush_interval(&self) -> Duration {
++        Duration::from_millis(self.flush_interval_ms)
++    }
++}
+diff --git a/rust/personhog-writer/src/consumer.rs b/rust/personhog-writer/src/consumer.rs
+new file mode 100644
+index 00000000000..3fa094c9120
+--- /dev/null
++++ b/rust/personhog-writer/src/consumer.rs
+@@ -0,0 +1,183 @@
++use std::collections::HashMap;
++use std::sync::Arc;
++use std::time::Duration;
++
++use lifecycle::Handle;
++use metrics::{counter, gauge, histogram};
++use personhog_proto::personhog::types::v1::Person;
++use prost::Message;
++use rdkafka::message::Message as KafkaMessage;
++use tokio::sync::mpsc;
++use tracing::{error, info, warn};
++
++use crate::buffer::PersonBuffer;
++use crate::kafka::PersonConsumer;
++
++/// Batch of persons and their Kafka offsets, sent from consumer to writer.
++pub struct FlushBatch {
++    pub persons: Vec<Person>,
++    pub offsets: HashMap<i32, i64>,
++    /// Timestamp of the oldest Kafka message in this batch (millis since epoch).
++    /// Used to compute end-to-end latency from ingestion to PG commit.
++    pub oldest_message_ts_ms: Option<i64>,
++}
++
++/// Reads from Kafka, decodes Person protos, buffers with dedup, and
++/// sends batches to the writer task for PG upsert + offset commit.
++pub struct ConsumerTask {
++    consumer: Arc<PersonConsumer>,
++    buffer: PersonBuffer,
++    flush_tx: mpsc::Sender<FlushBatch>,
++    flush_interval: Duration,
++    flush_buffer_size: usize,
++    handle: Handle,
++    /// Oldest message timestamp in the current buffer (millis since epoch).
++    oldest_message_ts_ms: Option<i64>,
++}
++
++impl ConsumerTask {
++    pub fn new(
++        consumer: Arc<PersonConsumer>,
++        buffer: PersonBuffer,
++        flush_tx: mpsc::Sender<FlushBatch>,
++        flush_interval: Duration,
++        flush_buffer_size: usize,
++        handle: Handle,
++    ) -> Self {
++        Self {
++            consumer,
++            buffer,
++            flush_tx,
++            flush_interval,
++            flush_buffer_size,
++            handle,
++            oldest_message_ts_ms: None,
++        }
++    }
++
++    pub async fn run(mut self) {
++        let _guard = self.handle.process_scope();
++        let mut flush_timer = tokio::time::interval(self.flush_interval);
++
++        info!("Consumer task starting");
++
++        loop {
++            // Backpressure: flush immediately when buffer is full
++            if self.buffer.is_full() {
++                counter!("personhog_writer_flushes_by_trigger_total", "trigger" => "backpressure")
++                    .increment(1);
++                self.send_flush().await;
++                continue;
++            }
++
++            tokio::select! {
++                biased;
++
++                _ = self.handle.shutdown_recv() => {
++                    info!("Shutdown signal, flushing remaining buffer");
++                    counter!("personhog_writer_flushes_by_trigger_total", "trigger" => "shutdown")
++                        .increment(1);
++                    self.send_flush().await;
++                    break;
++                }
++
++                _ = flush_timer.tick() => {
++                    if !self.buffer.is_empty() {
++                        counter!("personhog_writer_flushes_by_trigger_total", "trigger" => "timer")
++                            .increment(1);
++                        self.send_flush().await;
++                    }
++                }
++
++                msg = self.consumer.recv() => {
++                    match msg {
++                        Ok(borrowed_msg) => {
++                            let partition = borrowed_msg.partition();
++                            let offset = borrowed_msg.offset();
++
++                            gauge!(
++                                "personhog_writer_partition_offset",
++                                "partition" => partition.to_string()
++                            )
++                            .set(offset as f64);
++
++                            // Track the oldest message timestamp for e2e latency
++                            if let Some(ts_ms) = borrowed_msg.timestamp().to_millis() {
++                                match self.oldest_message_ts_ms {
++                                    Some(existing) if ts_ms < existing => {
++                                        self.oldest_message_ts_ms = Some(ts_ms);
++                                    }
++                                    None => {
++                                        self.oldest_message_ts_ms = Some(ts_ms);
++                                    }
++                                    _ => {}
++                                }
++                            }
++
++                            if let Some(payload) = borrowed_msg.payload() {
++                                match Person::decode(payload) {
++                                    Ok(person) => {
++                                        counter!("personhog_writer_messages_consumed_total")
++                                            .increment(1);
++                                        self.buffer.insert(person, partition, offset);
++                                        gauge!("personhog_writer_buffer_size")
++                                            .set(self.buffer.len() as f64);
++
++                                        if self.buffer.len() >= self.flush_buffer_size {
++                                            counter!(
++                                                "personhog_writer_flushes_by_trigger_total",
++                                                "trigger" => "size"
++                                            )
++                                            .increment(1);
++                                            self.send_flush().await;
++                                        }
++                                    }
++                                    Err(e) => {
++                                        counter!("personhog_writer_decode_errors_total")
++                                            .increment(1);
++                                        warn!(
++                                            error = %e, partition, offset,
++                                            "failed to decode Person proto"
++                                        );
++                                    }
++                                }
++                            }
++                        }
++                        Err(e) => {
++                            counter!("personhog_writer_kafka_errors_total").increment(1);
++                            warn!(error = %e, "Kafka recv error");
++                        }
++                    }
++                }
++            }
++        }
++
++        info!("Consumer task stopped");
++    }
++
++    /// Drain the buffer and send to the writer task. The bounded channel
++    /// provides backpressure -- if the writer is busy, this blocks.
++    async fn send_flush(&mut self) {
++        let (persons, offsets) = self.buffer.drain();
++        gauge!("personhog_writer_buffer_size").set(self.buffer.len() as f64);
++        if persons.is_empty() {
++            return;
++        }
++
++        let count = persons.len();
++        let batch = FlushBatch {
++            persons,
++            offsets,
++            oldest_message_ts_ms: self.oldest_message_ts_ms.take(),
++        };
++
++        let start = std::time::Instant::now();
++        if self.flush_tx.send(batch).await.is_err() {
++            error!(rows = count, "writer task gone, dropping batch");
++            self.handle
++                .signal_failure("Writer task channel closed".to_string());
++        }
++        histogram!("personhog_writer_channel_send_duration_seconds")
++            .record(start.elapsed().as_secs_f64());
++    }
++}
+diff --git a/rust/personhog-writer/src/error.rs b/rust/personhog-writer/src/error.rs
+new file mode 100644
+index 00000000000..66498c64425
+--- /dev/null
++++ b/rust/personhog-writer/src/error.rs
+@@ -0,0 +1,44 @@
++//! Error vocabulary shared across the pg, store, and writer layers.
++//!
++//! Error *sources* (sqlx, tokio JoinError) are translated into these types
++//! in the modules that own them: `pg::classify_error` for sqlx errors and
++//! `store::classify_join_error` for task panics.
++
++/// Classification of write errors. Determines retry strategy.
++#[derive(Debug, Clone, Copy)]
++pub enum WriteErrorKind {
++    /// Retrying the same operation may succeed.
++    Transient,
++    /// Properties exceed the DB size constraint. Trimming may help.
++    PropertiesSizeViolation,
++    /// Unrecoverable data error. Skip this record.
++    Data,
++}
++
++/// Error from a per-row or per-chunk write operation. Carries the DB error
++/// message so it can surface in ingestion warnings for user-facing debugging.
++#[derive(Debug)]
++pub struct WriteError {
++    pub message: String,
++    pub kind: WriteErrorKind,
++}
++
++impl std::fmt::Display for WriteError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "{}", self.message)
++    }
++}
++
++/// Unrecoverable error from a batch operation — typically a chunk task panic.
++/// The caller must escalate; the underlying records will be redelivered from
++/// Kafka after restart since the offset has not been committed.
++#[derive(Debug)]
++pub struct FatalError {
++    pub message: String,
++}
++
++impl std::fmt::Display for FatalError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str(&self.message)
++    }
++}
+diff --git a/rust/personhog-writer/src/kafka.rs b/rust/personhog-writer/src/kafka.rs
+new file mode 100644
+index 00000000000..646c03b28d7
+--- /dev/null
++++ b/rust/personhog-writer/src/kafka.rs
+@@ -0,0 +1,159 @@
++use std::collections::HashMap;
++use std::time::Duration;
++
++use common_kafka::config::KafkaConfig;
++use common_kafka::kafka_producer::KafkaContext;
++use metrics::counter;
++use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
++use rdkafka::message::BorrowedMessage;
++use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
++use rdkafka::{ClientConfig, TopicPartitionList};
++use tracing::warn;
++
++use crate::store::IngestionWarning;
++
++// ── Consumer ────────────────────────────────────────────────────
++
++/// Wraps a Kafka StreamConsumer with its topic, providing a clean
++/// interface for receiving messages and committing offsets.
++pub struct PersonConsumer {
++    consumer: StreamConsumer,
++    topic: String,
++}
++
++impl PersonConsumer {
++    pub fn from_config(
++        kafka: &KafkaConfig,
++        consumer_group: &str,
++        offset_reset: &str,
++        topic: String,
++    ) -> Result<Self, rdkafka::error::KafkaError> {
++        let mut client_config = ClientConfig::new();
++        client_config
++            .set("bootstrap.servers", &kafka.kafka_hosts)
++            .set("group.id", consumer_group)
++            .set("auto.offset.reset", offset_reset)
++            .set("enable.auto.commit", "false")
++            .set("enable.auto.offset.store", "false")
++            // Cooperative-sticky: during scale events, only partitions that need
++            // to move are revoked. Non-moving partitions keep being consumed.
++            .set("partition.assignment.strategy", "cooperative-sticky");
++
++        // Static group membership: the broker holds partition assignments for
++        // session.timeout.ms after a pod disappears, so quick restarts
++        // (deploys, OOM kills) don't trigger a rebalance at all.
++        // Requires stable pod names (StatefulSet) so the same ID reconnects.
++        if !kafka.kafka_client_id.is_empty() {
++            client_config
++                .set("client.id", &kafka.kafka_client_id)
++                .set("group.instance.id", &kafka.kafka_client_id);
++        }
++
++        if kafka.kafka_tls {
++            client_config
++                .set("security.protocol", "ssl")
++                .set("enable.ssl.certificate.verification", "false");
++        }
++
++        if !kafka.kafka_client_rack.is_empty() {
++            client_config.set("client.rack", &kafka.kafka_client_rack);
++        }
++
++        let consumer: StreamConsumer = client_config.create()?;
++        consumer.subscribe(&[&topic])?;
++        Ok(Self { consumer, topic })
++    }
++
++    /// Create from a raw `ClientConfig`. Useful in tests where you control
++    /// the config directly (e.g., mock clusters).
++    pub fn new(config: &ClientConfig, topic: String) -> Result<Self, rdkafka::error::KafkaError> {
++        let consumer: StreamConsumer = config.create()?;
++        consumer.subscribe(&[&topic])?;
++        Ok(Self { consumer, topic })
++    }
++
++    pub async fn recv(&self) -> Result<BorrowedMessage<'_>, rdkafka::error::KafkaError> {
++        self.consumer.recv().await
++    }
++
++    pub fn commit_offsets(
++        &self,
++        offsets: &HashMap<i32, i64>,
++    ) -> Result<(), rdkafka::error::KafkaError> {
++        if offsets.is_empty() {
++            return Ok(());
++        }
++
++        let mut tpl = TopicPartitionList::new();
++        for (partition, offset) in offsets {
++            tpl.add_partition_offset(&self.topic, *partition, rdkafka::Offset::Offset(offset + 1))?;
++        }
++
++        self.consumer.commit(&tpl, CommitMode::Async)?;
++        Ok(())
++    }
++
++    pub fn topic(&self) -> &str {
++        &self.topic
++    }
++}
++
++// ── Warnings producer ───────────────────────────────────────────
++
++/// Produces ingestion warnings to Kafka so users see property size
++/// violations in-product.
++pub struct WarningsProducer {
++    producer: FutureProducer<KafkaContext>,
++    topic: String,
++}
++
++impl WarningsProducer {
++    pub fn new(producer: FutureProducer<KafkaContext>, topic: String) -> Self {
++        Self { producer, topic }
++    }
++
++    /// Enqueue an ingestion warning into rdkafka's internal buffer.
++    /// Fire-and-forget: rdkafka handles retries and delivery in the
++    /// background. Call `flush()` on shutdown to drain pending messages.
++    pub fn emit(&self, warning: &IngestionWarning) {
++        let now = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .unwrap_or_default()
++            .as_secs();
++
++        let details = serde_json::json!({
++            "personId": warning.person_id.to_string(),
++            "teamId": warning.team_id,
++            "message": warning.message,
++        });
++
++        let payload = serde_json::json!({
++            "team_id": warning.team_id,
++            "type": "person_properties_size_violation",
++            "source": "personhog-writer",
++            "details": details.to_string(),
++            "timestamp": now.to_string(),
++        });
++
++        let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
++        let key = warning.team_id.to_string();
++        let record = FutureRecord::to(&self.topic)
++            .payload(&payload_bytes)
++            .key(&key);
++
++        match self.producer.send_result(record) {
++            Ok(_future) => {
++                counter!("personhog_writer_ingestion_warnings_emitted_total").increment(1);
++            }
++            Err((e, _)) => {
++                warn!(error = %e, "failed to enqueue ingestion warning");
++            }
++        }
++    }
++
++    /// Flush any buffered messages, waiting up to the given timeout for
++    /// delivery. Called during graceful shutdown.
++    pub fn flush(&self, timeout: Duration) {
++        self.producer.flush(timeout).ok();
++    }
++}
+diff --git a/rust/personhog-writer/src/lib.rs b/rust/personhog-writer/src/lib.rs
+new file mode 100644
+index 00000000000..53c8db10513
+--- /dev/null
++++ b/rust/personhog-writer/src/lib.rs
+@@ -0,0 +1,9 @@
++pub mod buffer;
++pub mod config;
++pub mod consumer;
++pub mod error;
++pub mod kafka;
++pub mod pg;
++pub mod properties;
++pub mod store;
++pub mod writer;
+diff --git a/rust/personhog-writer/src/main.rs b/rust/personhog-writer/src/main.rs
+new file mode 100644
+index 00000000000..a9dfeeed44c
+--- /dev/null
++++ b/rust/personhog-writer/src/main.rs
+@@ -0,0 +1,196 @@
++use std::sync::Arc;
++use std::time::Duration;
++
++use axum::{routing::get, Router};
++use common_database::{get_pool_with_config, PoolConfig};
++use common_metrics::setup_metrics_routes;
++use envconfig::Envconfig;
++use lifecycle::{ComponentOptions, Manager};
++use tokio::sync::mpsc;
++use tracing::level_filters::LevelFilter;
++use tracing_subscriber::fmt;
++use tracing_subscriber::layer::SubscriberExt;
++use tracing_subscriber::util::SubscriberInitExt;
++use tracing_subscriber::EnvFilter;
++
++use common_kafka::kafka_producer::create_kafka_producer;
++use personhog_writer::buffer::PersonBuffer;
++use personhog_writer::config::Config;
++use personhog_writer::consumer::ConsumerTask;
++use personhog_writer::kafka::{PersonConsumer, WarningsProducer};
++use personhog_writer::pg::PgStore;
++use personhog_writer::store::PersonWriteStore;
++use personhog_writer::writer::WriterTask;
++
++common_alloc::used!();
++
++#[tokio::main]
++async fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let config = Config::init_from_env().expect("Invalid configuration");
++
++    let log_layer = fmt::layer()
++        .with_target(true)
++        .with_thread_ids(true)
++        .with_level(true);
++
++    tracing_subscriber::registry()
++        .with(log_layer)
++        .with(
++            EnvFilter::builder()
++                .with_default_directive(LevelFilter::INFO.into())
++                .from_env_lossy(),
++        )
++        .init();
++
++    tracing::info!("Starting personhog-writer");
++    tracing::info!("Kafka topic: {}", config.kafka_topic);
++    tracing::info!("Consumer group: {}", config.kafka_consumer_group);
++    tracing::info!("Flush interval: {}ms", config.flush_interval_ms);
++    tracing::info!("Flush buffer size: {}", config.flush_buffer_size);
++    tracing::info!("Buffer capacity: {}", config.buffer_capacity);
++    tracing::info!("Metrics port: {}", config.metrics_port);
++
++    let mut manager = Manager::builder("personhog-writer")
++        .with_global_shutdown_timeout(Duration::from_secs(30))
++        .build();
++
++    let consumer_handle = manager.register(
++        "consumer",
++        ComponentOptions::new()
++            .with_graceful_shutdown(Duration::from_secs(15))
++            .with_liveness_deadline(Duration::from_secs(30)),
++    );
++    let writer_handle = manager.register(
++        "writer",
++        ComponentOptions::new()
++            .with_graceful_shutdown(Duration::from_secs(15))
++            .with_liveness_deadline(Duration::from_secs(30)),
++    );
++    let metrics_handle = manager.register(
++        "metrics-server",
++        ComponentOptions::new().is_observability(true),
++    );
++
++    let readiness = manager.readiness_handler();
++    let liveness = manager.liveness_handler();
++
++    let monitor_guard = manager.monitor_background();
++
++    // Metrics/health HTTP server
++    let metrics_port = config.metrics_port;
++    tokio::spawn(async move {
++        let _guard = metrics_handle.process_scope();
++
++        let health_router = Router::new()
++            .route(
++                "/_readiness",
++                get(move || {
++                    let r = readiness.clone();
++                    async move { r.check().await }
++                }),
++            )
++            .route("/_liveness", get(move || async move { liveness.check() }));
++        let metrics_router = setup_metrics_routes(health_router);
++
++        let bind = format!("0.0.0.0:{metrics_port}");
++        let listener = tokio::net::TcpListener::bind(&bind)
++            .await
++            .expect("Failed to bind metrics port");
++        tracing::info!("Metrics server listening on {}", bind);
++        axum::serve(listener, metrics_router)
++            .with_graceful_shutdown(metrics_handle.shutdown_signal())
++            .await
++            .expect("Metrics server error");
++    });
++
++    // Postgres pool
++    let pool_config = PoolConfig {
++        max_connections: config.pg_max_connections,
++        pool_name: Some("personhog-writer".to_string()),
++        statement_timeout_ms: Some(30_000),
++        ..Default::default()
++    };
++    let pool = get_pool_with_config(&config.database_url, pool_config)?;
++
++    // Sample pool state into Prometheus gauges every 5s. Useful for tuning
++    // PG_MAX_CONNECTIONS against observed utilization during fallback.
++    {
++        let pool = pool.clone();
++        tokio::spawn(async move {
++            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
++            loop {
++                ticker.tick().await;
++                metrics::gauge!("personhog_writer_pg_pool_size").set(pool.size() as f64);
++                metrics::gauge!("personhog_writer_pg_pool_idle").set(pool.num_idle() as f64);
++            }
++        });
++    }
++
++    let (flush_tx, flush_rx) = mpsc::channel(config.flush_channel_capacity);
++
++    // Kafka consumer
++    let kafka_consumer = Arc::new(PersonConsumer::from_config(
++        &config.kafka,
++        &config.kafka_consumer_group,
++        &config.kafka_consumer_offset_reset,
++        config.kafka_topic.clone(),
++    )?);
++    tracing::info!("Subscribed to Kafka topic: {}", config.kafka_topic);
++
++    // Ingestion warnings producer
++    let warnings_producer = create_kafka_producer(&config.kafka, writer_handle.clone())
++        .await
++        .map(|producer| {
++            WarningsProducer::new(producer, config.kafka_ingestion_warnings_topic.clone())
++        })
++        .ok();
++
++    if warnings_producer.is_some() {
++        tracing::info!(
++            "Ingestion warnings enabled (topic: {})",
++            config.kafka_ingestion_warnings_topic
++        );
++    } else {
++        tracing::warn!("Ingestion warnings disabled (Kafka producer creation failed)");
++    }
++
++    // Writer task
++    let pg_store = PgStore::new(pool, config.pg_target_table.clone());
++    let store = PersonWriteStore::new(
++        pg_store,
++        personhog_writer::store::StoreConfig {
++            chunk_size: config.upsert_batch_size,
++            row_fallback_concurrency: config.row_fallback_concurrency,
++            properties_size_threshold: config.properties_size_threshold,
++            properties_trim_target: config.properties_trim_target,
++        },
++    );
++    let writer_task = WriterTask::new(
++        Arc::clone(&kafka_consumer),
++        store,
++        flush_rx,
++        writer_handle,
++        warnings_producer,
++    );
++
++    tokio::spawn(async move {
++        writer_task.run().await;
++    });
++
++    // Consumer task
++    let consumer_task = ConsumerTask::new(
++        kafka_consumer,
++        PersonBuffer::new(config.buffer_capacity),
++        flush_tx,
++        config.flush_interval(),
++        config.flush_buffer_size,
++        consumer_handle,
++    );
++
++    tokio::spawn(async move {
++        consumer_task.run().await;
++    });
++
++    monitor_guard.wait().await?;
++    Ok(())
++}
+diff --git a/rust/personhog-writer/src/pg.rs b/rust/personhog-writer/src/pg.rs
+new file mode 100644
+index 00000000000..3343c9d49cf
+--- /dev/null
++++ b/rust/personhog-writer/src/pg.rs
+@@ -0,0 +1,461 @@
++use async_trait::async_trait;
++use chrono::{DateTime, TimeZone, Utc};
++use metrics::counter;
++use personhog_proto::personhog::types::v1::Person;
++use sqlx::postgres::PgPool;
++use tracing::{error, warn};
++
++use crate::error::{WriteError, WriteErrorKind};
++use crate::store::PersonDb;
++
++/// Allowed target tables for person upserts.
++const ALLOWED_TABLES: &[&str] = &["personhog_person_tmp", "posthog_person"];
++
++/// Low-level Postgres execution layer. Runs single upsert statements and
++/// classifies sqlx errors. No batching, no parallelism, no retry — those
++/// live in the store layer.
++pub struct PgStore {
++    pool: PgPool,
++    upsert_sql: String,
++}
++
++#[async_trait]
++impl PersonDb for PgStore {
++    async fn execute_chunk(&self, chunk: &[Person]) -> Result<(), WriteError> {
++        let arrays = prepare_chunk(chunk);
++        run_upsert(&self.pool, &self.upsert_sql, &arrays, "chunk").await
++    }
++
++    async fn execute_row(
++        &self,
++        person: &Person,
++        properties_override: Option<&str>,
++    ) -> Result<(), WriteError> {
++        let Some(arrays) = prepare_single(person, properties_override) else {
++            return Ok(()); // Invalid input, already logged
++        };
++        run_upsert(&self.pool, &self.upsert_sql, &arrays, "row").await
++    }
++}
++
++impl PgStore {
++    pub fn new(pool: PgPool, table_name: String) -> Self {
++        assert!(
++            ALLOWED_TABLES.contains(&table_name.as_str()),
++            "PG_TARGET_TABLE must be one of {:?}, got: {table_name}",
++            ALLOWED_TABLES
++        );
++
++        let upsert_sql = format!(
++            "INSERT INTO {table} (
++                id, team_id, uuid, properties, properties_last_updated_at,
++                properties_last_operation, created_at, version, is_identified,
++                last_seen_at
++            )
++            SELECT id, team_id, uuid, properties::jsonb,
++                   properties_last_updated_at::jsonb, properties_last_operation::jsonb,
++                   created_at, version, is_identified, last_seen_at
++            FROM UNNEST(
++                $1::bigint[], $2::int[], $3::uuid[],
++                $4::text[], $5::text[], $6::text[],
++                $7::timestamptz[], $8::bigint[], $9::bool[], $10::timestamptz[]
++            ) AS u(id, team_id, uuid, properties, properties_last_updated_at,
++                   properties_last_operation, created_at, version, is_identified, last_seen_at)
++            ON CONFLICT (team_id, id) DO UPDATE SET
++                uuid = EXCLUDED.uuid,
++                properties = EXCLUDED.properties,
++                properties_last_updated_at = EXCLUDED.properties_last_updated_at,
++                properties_last_operation = EXCLUDED.properties_last_operation,
++                created_at = EXCLUDED.created_at,
++                version = EXCLUDED.version,
++                is_identified = EXCLUDED.is_identified,
++                last_seen_at = EXCLUDED.last_seen_at
++            WHERE EXCLUDED.version > COALESCE({table}.version, -1)",
++            table = table_name
++        );
++
++        Self { pool, upsert_sql }
++    }
++}
++
++/// Build bind arrays from a slice of persons. Borrows string data directly
++/// from each Person's byte buffers; `PreparedArrays` is tied to the slice's
++/// lifetime and must not outlive `persons`.
++fn prepare_chunk(persons: &[Person]) -> PreparedArrays<'_> {
++    let cap = persons.len();
++    let mut arrays = PreparedArrays::with_capacity(cap);
++
++    for p in persons {
++        let uuid = match uuid::Uuid::parse_str(&p.uuid) {
++            Ok(u) => u,
++            Err(e) => {
++                counter!("personhog_writer_invalid_uuid_total").increment(1);
++                warn!(
++                    team_id = p.team_id,
++                    person_id = p.id,
++                    uuid = %p.uuid,
++                    error = %e,
++                    "skipping person with invalid UUID"
++                );
++                continue;
++            }
++        };
++
++        let team_id = match i32::try_from(p.team_id) {
++            Ok(t) => t,
++            Err(_) => {
++                counter!("personhog_writer_invalid_team_id_total").increment(1);
++                warn!(
++                    team_id = p.team_id,
++                    person_id = p.id,
++                    "skipping person with out-of-range team_id (exceeds i32)"
++                );
++                continue;
++            }
++        };
++
++        arrays.push(
++            p.id,
++            team_id,
++            uuid,
++            bytes_to_json_str(&p.properties, "{}"),
++            bytes_to_optional_json_str(&p.properties_last_updated_at),
++            bytes_to_optional_json_str(&p.properties_last_operation),
++            epoch_secs_to_datetime(p.created_at),
++            Some(p.version),
++            p.is_identified,
++            p.last_seen_at.map(epoch_secs_to_datetime),
++        );
++    }
++
++    arrays
++}
++
++/// Build a single-row PreparedArrays for the per-row path. Returns None if
++/// the person has an invalid UUID (already logged).
++fn prepare_single<'a>(
++    person: &'a Person,
++    properties_override: Option<&'a str>,
++) -> Option<PreparedArrays<'a>> {
++    let uuid = match uuid::Uuid::parse_str(&person.uuid) {
++        Ok(u) => u,
++        Err(e) => {
++            counter!("personhog_writer_invalid_uuid_total").increment(1);
++            warn!(
++                team_id = person.team_id,
++                person_id = person.id,
++                uuid = %person.uuid,
++                error = %e,
++                "skipping person with invalid UUID"
++            );
++            return None;
++        }
++    };
++
++    let team_id = match i32::try_from(person.team_id) {
++        Ok(t) => t,
++        Err(_) => {
++            counter!("personhog_writer_invalid_team_id_total").increment(1);
++            warn!(
++                team_id = person.team_id,
++                person_id = person.id,
++                "skipping person with out-of-range team_id (exceeds i32)"
++            );
++            return None;
++        }
++    };
++
++    let properties = match properties_override {
++        Some(s) => s,
++        None => bytes_to_json_str(&person.properties, "{}"),
++    };
++
++    let mut arrays = PreparedArrays::with_capacity(1);
++    arrays.push(
++        person.id,
++        team_id,
++        uuid,
++        properties,
++        bytes_to_optional_json_str(&person.properties_last_updated_at),
++        bytes_to_optional_json_str(&person.properties_last_operation),
++        epoch_secs_to_datetime(person.created_at),
++        Some(person.version),
++        person.is_identified,
++        person.last_seen_at.map(epoch_secs_to_datetime),
++    );
++    Some(arrays)
++}
++
++async fn run_upsert(
++    pool: &PgPool,
++    sql: &str,
++    arrays: &PreparedArrays<'_>,
++    mode: &'static str,
++) -> Result<(), WriteError> {
++    let chunk_size = arrays.ids.len() as u64;
++    if chunk_size == 0 {
++        return Ok(());
++    }
++
++    match sqlx::query(sql)
++        .bind(&arrays.ids)
++        .bind(&arrays.team_ids)
++        .bind(&arrays.uuids)
++        .bind(&arrays.properties)
++        .bind(&arrays.properties_last_updated_at)
++        .bind(&arrays.properties_last_operation)
++        .bind(&arrays.created_at)
++        .bind(&arrays.versions)
++        .bind(&arrays.is_identified)
++        .bind(&arrays.last_seen_at)
++        .execute(pool)
++        .await
++    {
++        Ok(result) => {
++            let affected = result.rows_affected();
++            counter!("personhog_writer_rows_upserted_total", "mode" => mode).increment(affected);
++            let skipped = chunk_size.saturating_sub(affected);
++            if skipped > 0 {
++                counter!("personhog_writer_rows_version_skipped_total", "mode" => mode)
++                    .increment(skipped);
++            }
++            Ok(())
++        }
++        Err(e) => {
++            let kind = classify_error(&e);
++            counter!("personhog_writer_upsert_errors_total", "mode" => mode).increment(1);
++            error!(error = %e, error_kind = ?kind, mode, "upsert failed");
++            Err(WriteError {
++                message: e.to_string(),
++                kind,
++            })
++        }
++    }
++}
++
++fn classify_error(e: &sqlx::Error) -> WriteErrorKind {
++    match e {
++        sqlx::Error::Io(_)
++        | sqlx::Error::PoolTimedOut
++        | sqlx::Error::PoolClosed
++        | sqlx::Error::WorkerCrashed => WriteErrorKind::Transient,
++
++        sqlx::Error::Database(db_err) => {
++            if let Some(code) = db_err.code() {
++                let code_str = code.as_ref();
++                if code_str == "23514" {
++                    if let Some(constraint) = db_err.constraint() {
++                        if constraint.contains("check_properties_size") {
++                            return WriteErrorKind::PropertiesSizeViolation;
++                        }
++                    }
++                }
++                if code_str.starts_with("08")
++                    || code_str.starts_with("53")
++                    || code_str.starts_with("57")
++                    || code_str == "40P01"
++                {
++                    return WriteErrorKind::Transient;
++                }
++            }
++            WriteErrorKind::Data
++        }
++
++        _ => WriteErrorKind::Data,
++    }
++}
++
++// ── Bind arrays ─────────────────────────────────────────────────
++
++/// Column-oriented bind arrays for the upsert statement. String fields
++/// borrow from each Person's byte buffer to avoid per-row allocations; the
++/// struct's lifetime is tied to the source slice.
++struct PreparedArrays<'a> {
++    ids: Vec<i64>,
++    team_ids: Vec<i32>,
++    uuids: Vec<uuid::Uuid>,
++    properties: Vec<&'a str>,
++    properties_last_updated_at: Vec<Option<&'a str>>,
++    properties_last_operation: Vec<Option<&'a str>>,
++    created_at: Vec<DateTime<Utc>>,
++    versions: Vec<Option<i64>>,
++    is_identified: Vec<bool>,
++    last_seen_at: Vec<Option<DateTime<Utc>>>,
++}
++
++impl<'a> PreparedArrays<'a> {
++    fn with_capacity(cap: usize) -> Self {
++        Self {
++            ids: Vec::with_capacity(cap),
++            team_ids: Vec::with_capacity(cap),
++            uuids: Vec::with_capacity(cap),
++            properties: Vec::with_capacity(cap),
++            properties_last_updated_at: Vec::with_capacity(cap),
++            properties_last_operation: Vec::with_capacity(cap),
++            created_at: Vec::with_capacity(cap),
++            versions: Vec::with_capacity(cap),
++            is_identified: Vec::with_capacity(cap),
++            last_seen_at: Vec::with_capacity(cap),
++        }
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn push(
++        &mut self,
++        id: i64,
++        team_id: i32,
++        uuid: uuid::Uuid,
++        properties: &'a str,
++        properties_last_updated_at: Option<&'a str>,
++        properties_last_operation: Option<&'a str>,
++        created_at: DateTime<Utc>,
++        version: Option<i64>,
++        is_identified: bool,
++        last_seen_at: Option<DateTime<Utc>>,
++    ) {
++        self.ids.push(id);
++        self.team_ids.push(team_id);
++        self.uuids.push(uuid);
++        self.properties.push(properties);
++        self.properties_last_updated_at
++            .push(properties_last_updated_at);
++        self.properties_last_operation
++            .push(properties_last_operation);
++        self.created_at.push(created_at);
++        self.versions.push(version);
++        self.is_identified.push(is_identified);
++        self.last_seen_at.push(last_seen_at);
++    }
++}
++
++/// Interpret proto bytes as a JSON string. The leader serializes via
++/// serde_json::RawValue, so these are already valid JSON UTF-8. We pass
++/// them through to PG as text and let the `::jsonb` cast validate. Returns
++/// a borrow into `bytes`; on invalid UTF-8 or empty input, the static
++/// default (coerces to any lifetime).
++fn bytes_to_json_str<'a>(bytes: &'a [u8], default: &'static str) -> &'a str {
++    if bytes.is_empty() {
++        return default;
++    }
++    match std::str::from_utf8(bytes) {
++        Ok(s) => s,
++        Err(e) => {
++            counter!("personhog_writer_invalid_json_total").increment(1);
++            warn!(error = %e, "non-UTF8 in JSON field, using default");
++            default
++        }
++    }
++}
++
++fn bytes_to_optional_json_str(bytes: &[u8]) -> Option<&str> {
++    if bytes.is_empty() {
++        return None;
++    }
++    match std::str::from_utf8(bytes) {
++        Ok(s) => Some(s),
++        Err(e) => {
++            counter!("personhog_writer_invalid_json_total").increment(1);
++            warn!(error = %e, "non-UTF8 in optional JSON field, treating as null");
++            None
++        }
++    }
++}
++
++fn epoch_secs_to_datetime(epoch_secs: i64) -> DateTime<Utc> {
++    Utc.timestamp_opt(epoch_secs, 0)
++        .single()
++        .unwrap_or_default()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn classify_pool_timeout_as_transient() {
++        assert!(matches!(
++            classify_error(&sqlx::Error::PoolTimedOut),
++            WriteErrorKind::Transient
++        ));
++    }
++
++    #[test]
++    fn classify_io_error_as_transient() {
++        let err = sqlx::Error::Io(std::io::Error::new(
++            std::io::ErrorKind::ConnectionReset,
++            "connection reset",
++        ));
++        assert!(matches!(classify_error(&err), WriteErrorKind::Transient));
++    }
++
++    #[test]
++    fn bytes_to_json_str_valid() {
++        let s = bytes_to_json_str(b"{\"email\":\"test@example.com\"}", "{}");
++        assert_eq!(s, "{\"email\":\"test@example.com\"}");
++    }
++
++    #[test]
++    fn bytes_to_json_str_empty_returns_default() {
++        let s = bytes_to_json_str(b"", "{}");
++        assert_eq!(s, "{}");
++    }
++
++    #[test]
++    fn bytes_to_optional_json_str_empty_returns_none() {
++        assert!(bytes_to_optional_json_str(b"").is_none());
++    }
++
++    #[test]
++    fn bytes_to_optional_json_str_valid() {
++        let s = bytes_to_optional_json_str(b"{\"key\":\"val\"}");
++        assert_eq!(s.unwrap(), "{\"key\":\"val\"}");
++    }
++
++    #[test]
++    fn epoch_secs_conversion() {
++        let dt = epoch_secs_to_datetime(1700000000);
++        assert_eq!(dt.timestamp(), 1700000000);
++    }
++
++    #[tokio::test]
++    async fn table_name_allowlist_accepts_valid() {
++        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
++        let _store = PgStore::new(pool.clone(), "personhog_person_tmp".to_string());
++        let _store = PgStore::new(pool, "posthog_person".to_string());
++    }
++
++    #[tokio::test]
++    #[should_panic(expected = "PG_TARGET_TABLE must be one of")]
++    async fn table_name_allowlist_rejects_invalid() {
++        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
++        let _store = PgStore::new(pool, "evil_table; DROP TABLE posthog_person".to_string());
++    }
++
++    fn person_with(id: i64, team_id: i64) -> Person {
++        Person {
++            id,
++            team_id,
++            uuid: uuid::Uuid::new_v4().to_string(),
++            version: 1,
++            ..Default::default()
++        }
++    }
++
++    #[test]
++    fn prepare_chunk_skips_out_of_range_team_id() {
++        let good = person_with(1, 42);
++        let bad = person_with(2, (i32::MAX as i64) + 1);
++
++        let persons = [good, bad];
++        let arrays = prepare_chunk(&persons);
++        // Only the in-range person made it into the bind arrays.
++        assert_eq!(arrays.ids, vec![1]);
++        assert_eq!(arrays.team_ids, vec![42]);
++    }
++
++    #[test]
++    fn prepare_single_rejects_out_of_range_team_id() {
++        let bad = person_with(1, (i32::MAX as i64) + 1);
++        assert!(prepare_single(&bad, None).is_none());
++    }
++}
+diff --git a/rust/personhog-writer/src/properties.rs b/rust/personhog-writer/src/properties.rs
+new file mode 100644
+index 00000000000..24a84ac9902
+--- /dev/null
++++ b/rust/personhog-writer/src/properties.rs
+@@ -0,0 +1,241 @@
++use std::collections::HashSet;
++use std::sync::LazyLock;
++
++use metrics::counter;
++use tracing::debug;
++
++/// Properties that must never be trimmed, matching the Node.js ingestion
++/// pipeline's `ALL_PROTECTED_PROPERTIES` in `person-property-utils.ts`.
++static PROTECTED_PROPERTIES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
++    HashSet::from([
++        // Core person properties
++        "email",
++        "name",
++        // Event-to-person properties (mobile)
++        "$app_build",
++        "$app_name",
++        "$app_namespace",
++        "$app_version",
++        // Event-to-person properties (web)
++        "$browser",
++        "$browser_version",
++        "$device_type",
++        "$current_url",
++        "$pathname",
++        "$os",
++        "$os_name",
++        "$os_version",
++        "$referring_domain",
++        "$referrer",
++        "$screen_height",
++        "$screen_width",
++        "$viewport_height",
++        "$viewport_width",
++        "$raw_user_agent",
++        // UTM and campaign tracking
++        "utm_source",
++        "utm_medium",
++        "utm_campaign",
++        "utm_content",
++        "utm_name",
++        "utm_term",
++        "gclid",
++        "gad_source",
++        "gclsrc",
++        "dclid",
++        "gbraid",
++        "wbraid",
++        "fbclid",
++        "msclkid",
++        "twclid",
++        "li_fat_id",
++        "mc_cid",
++        "igshid",
++        "ttclid",
++        "rdt_cid",
++        "irclid",
++        "_kx",
++        "epik",
++        "qclid",
++        "sccid",
++        // Session and page tracking
++        "$session_id",
++        "$window_id",
++        "$pageview_id",
++        "$host",
++        // Identity and device tracking
++        "$user_id",
++        "$device_id",
++        "$anon_distinct_id",
++        // Initial/first-touch properties
++        "$initial_referrer",
++        "$initial_referring_domain",
++        "$initial_utm_source",
++        "$initial_utm_medium",
++        "$initial_utm_campaign",
++        "$initial_utm_content",
++        "$initial_utm_term",
++    ])
++});
++
++/// Returns true if the property can be trimmed (is not protected).
++pub fn can_trim_property(name: &str) -> bool {
++    !PROTECTED_PROPERTIES.contains(name)
++}
++
++/// Trim person properties to fit within the target size by removing
++/// non-protected properties in alphabetical order.
++///
++/// Matches the Node.js `trimPropertiesToFitSize` algorithm:
++/// 1. Sort all property keys alphabetically
++/// 2. For each trimmable property, delete it and recalculate size
++/// 3. Stop when under target size
++///
++/// Returns the trimmed properties and whether any trimming occurred.
++pub fn trim_properties_to_fit_size(
++    properties: &serde_json::Value,
++    team_id: i64,
++    person_id: i64,
++    target_bytes: usize,
++) -> Option<serde_json::Value> {
++    let map = properties.as_object()?;
++
++    let json_str = serde_json::to_string(properties).ok()?;
++    let current_size = json_str.len();
++
++    if current_size <= target_bytes {
++        return None; // Already fits, no trimming needed
++    }
++
++    let mut trimmed = map.clone();
++    let mut keys: Vec<&String> = map.keys().collect();
++    keys.sort();
++
++    let mut removed_count = 0;
++
++    for key in keys {
++        if !can_trim_property(key) {
++            continue;
++        }
++
++        trimmed.remove(key.as_str());
++        removed_count += 1;
++
++        let new_size = serde_json::to_string(&trimmed)
++            .map(|s| s.len())
++            .unwrap_or(current_size);
++
++        if new_size <= target_bytes {
++            break;
++        }
++    }
++
++    let final_size = serde_json::to_string(&trimmed)
++        .map(|s| s.len())
++        .unwrap_or(0);
++
++    // If trimmable keys were exhausted and the result still exceeds the
++    // target, the person can't fit — typically means protected properties
++    // alone are oversized. Signal this as `None` so the caller skips without
++    // attempting another doomed PG write.
++    if final_size > target_bytes {
++        debug!(
++            team_id,
++            person_id,
++            original_size = current_size,
++            final_size,
++            target_size = target_bytes,
++            properties_removed = removed_count,
++            final_property_count = trimmed.len(),
++            "person properties still exceed target after trimming all trimmable keys; giving up"
++        );
++        return None;
++    }
++
++    debug!(
++        team_id,
++        person_id,
++        original_size = current_size,
++        final_size,
++        target_size = target_bytes,
++        properties_removed = removed_count,
++        final_property_count = trimmed.len(),
++        "trimmed person properties to fit size"
++    );
++
++    counter!("personhog_writer_properties_trimmed_total").increment(1);
++
++    Some(serde_json::Value::Object(trimmed))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    #[test]
++    fn protected_properties_are_not_trimmable() {
++        assert!(!can_trim_property("email"));
++        assert!(!can_trim_property("$browser"));
++        assert!(!can_trim_property("utm_source"));
++        assert!(!can_trim_property("$user_id"));
++        assert!(!can_trim_property("$initial_referrer"));
++    }
++
++    #[test]
++    fn custom_properties_are_trimmable() {
++        assert!(can_trim_property("custom_field"));
++        assert!(can_trim_property("my_property"));
++        assert!(can_trim_property("some_random_key"));
++    }
++
++    #[test]
++    fn trim_returns_none_when_already_fits() {
++        let props = json!({"email": "test@example.com", "name": "Test"});
++        assert!(trim_properties_to_fit_size(&props, 1, 1, 1024).is_none());
++    }
++
++    #[test]
++    fn trim_removes_custom_properties_alphabetically() {
++        // Small target so the test runs with small data.
++        let target = 1024;
++        let mut map = serde_json::Map::new();
++        map.insert("email".to_string(), json!("test@example.com")); // protected
++        map.insert("$browser".to_string(), json!("Chrome")); // protected
++
++        // Add large custom properties that push us over the target.
++        let big_value = "x".repeat(500);
++        map.insert("aaa_custom".to_string(), json!(big_value.clone()));
++        map.insert("bbb_custom".to_string(), json!(big_value.clone()));
++        map.insert("ccc_custom".to_string(), json!(big_value));
++
++        let props = serde_json::Value::Object(map);
++        let result = trim_properties_to_fit_size(&props, 1, 1, target);
++
++        assert!(result.is_some());
++        let trimmed = result.unwrap();
++        let trimmed_map = trimmed.as_object().unwrap();
++
++        // Protected properties are preserved
++        assert!(trimmed_map.contains_key("email"));
++        assert!(trimmed_map.contains_key("$browser"));
++
++        // Custom properties are removed alphabetically until under target.
++        assert!(!trimmed_map.contains_key("aaa_custom"));
++    }
++
++    #[test]
++    fn trim_returns_none_when_only_protected_keys_exceed_target() {
++        // If protected properties alone exceed the target, trim can't fit and
++        // signals failure via `None`. Caller skips straight to skipped.
++        let target = 1024;
++        let mut map = serde_json::Map::new();
++        let big_value = "x".repeat(2_000);
++        map.insert("email".to_string(), json!(big_value)); // protected, over target
++
++        let props = serde_json::Value::Object(map);
++        let result = trim_properties_to_fit_size(&props, 1, 1, target);
++
++        assert!(result.is_none());
++    }
++}
+diff --git a/rust/personhog-writer/src/store.rs b/rust/personhog-writer/src/store.rs
+new file mode 100644
+index 00000000000..054009fc241
+--- /dev/null
++++ b/rust/personhog-writer/src/store.rs
+@@ -0,0 +1,935 @@
++//! Write store layer: orchestrates batch execution across parallel chunks,
++//! handles per-row fallback with property trimming, and surfaces outcomes
++//! as `BatchOutcome` (for batches) or `RowResult` (for single rows).
++//!
++//! The `PersonDb` trait abstracts the DB layer so orchestration can be
++//! unit-tested against a mock. `PgStore` in `pg.rs` is the production impl.
++//!
++//! The per-row path uses `Result<(), WriteError>` because each row has a
++//! single atomic outcome. The per-batch path uses `BatchOutcome` because a
++//! batch can partially succeed — some chunks commit while others need
++//! transient retry or per-row fallback. Both share the `WriteErrorKind`
++//! taxonomy from the DB layer.
++
++use std::str::from_utf8;
++use std::sync::Arc;
++use std::time::Instant;
++
++use async_trait::async_trait;
++use futures::stream::{self, StreamExt};
++use metrics::{counter, gauge, histogram};
++use personhog_proto::personhog::types::v1::Person;
++use tokio::task::{JoinError, JoinSet};
++use tracing::{error, warn};
++
++// Re-exported so callers importing from `store::` keep working.
++pub use crate::error::{FatalError, WriteError, WriteErrorKind};
++
++use crate::properties;
++
++/// The database primitive the store layer orchestrates against. Implemented
++/// by `PgStore` for production and by mocks for testing.
++#[async_trait]
++pub trait PersonDb: Send + Sync {
++    /// Execute a single upsert statement covering a chunk of persons.
++    async fn execute_chunk(&self, chunk: &[Person]) -> Result<(), WriteError>;
++
++    /// Execute a single-row upsert. If `properties_override` is provided,
++    /// that JSON string is used instead of the person's proto bytes.
++    async fn execute_row(
++        &self,
++        person: &Person,
++        properties_override: Option<&str>,
++    ) -> Result<(), WriteError>;
++}
++
++/// Outcome of a batch upsert. Reports which chunks (if any) need retry,
++/// grouped by failure class so the caller picks the right strategy:
++/// transient chunks are retried as batches after backoff, data-failed
++/// chunks fall through to per-row inserts to isolate bad records.
++#[derive(Debug)]
++pub enum BatchOutcome {
++    Success,
++    Partial {
++        transient: Vec<Person>,
++        data_failed: Vec<Person>,
++    },
++    /// A chunk task panicked. The persons in that chunk are unrecoverable;
++    /// the writer must escalate. The Kafka offset has not been committed, so
++    /// the underlying records will be redelivered on restart.
++    Fatal(FatalError),
++}
++
++/// Outcome of writing a single person.
++#[derive(Debug)]
++pub enum RowResult {
++    Written,
++    Trimmed(IngestionWarning),
++    Skipped(IngestionWarning),
++}
++
++/// Information needed to emit an ingestion warning.
++#[derive(Debug)]
++pub struct IngestionWarning {
++    pub team_id: i64,
++    pub person_id: i64,
++    pub message: String,
++}
++
++/// Knobs that shape how the store batches, parallelizes, and trims. Scoped
++/// to just what the store needs so the store doesn't depend on the
++/// service-wide `Config` type.
++///
++/// No `Default` impl: production values live in envconfig (and are mapped
++/// via `Config`), and test values are in test-only helpers. Keeping these
++/// apart prevents accidental reliance on hardcoded defaults in prod code.
++#[derive(Debug, Clone)]
++pub struct StoreConfig {
++    pub chunk_size: usize,
++    pub row_fallback_concurrency: usize,
++    pub properties_size_threshold: usize,
++    pub properties_trim_target: usize,
++}
++
++/// Production person write store. Splits batches into chunks, runs them in
++/// parallel against a `PersonDb`, partitions outcomes by failure class, and
++/// handles per-row fallback with property trimming.
++pub struct PersonWriteStore<D: PersonDb> {
++    db: Arc<D>,
++    chunk_size: usize,
++    row_fallback_concurrency: usize,
++    properties_size_threshold: usize,
++    properties_trim_target: usize,
++}
++
++impl<D: PersonDb + 'static> PersonWriteStore<D> {
++    pub fn new(db: D, cfg: StoreConfig) -> Self {
++        Self {
++            db: Arc::new(db),
++            chunk_size: cfg.chunk_size.max(1),
++            row_fallback_concurrency: cfg.row_fallback_concurrency.max(1),
++            properties_size_threshold: cfg.properties_size_threshold,
++            properties_trim_target: cfg.properties_trim_target,
++        }
++    }
++
++    /// Preflight oversized persons out of a batch. For each person whose raw
++    /// properties bytes exceed the configured threshold, attempt to trim via
++    /// `properties::trim_properties_to_fit_size`; if the trim brings it below
++    /// the threshold the person rejoins the batch with its properties replaced,
++    /// otherwise it's skipped with an ingestion warning.
++    ///
++    /// This avoids a single oversized row forcing the whole chunk down the
++    /// per-row fallback path.
++    pub fn preflight_trim_batch(
++        &self,
++        persons: Vec<Person>,
++    ) -> (Vec<Person>, Vec<IngestionWarning>) {
++        let mut kept = Vec::with_capacity(persons.len());
++        let mut warnings = Vec::new();
++
++        for mut person in persons {
++            if person.properties.len() <= self.properties_size_threshold {
++                kept.push(person);
++                continue;
++            }
++
++            counter!("personhog_writer_properties_preempted_total").increment(1);
++
++            match self.try_trim_properties(&person) {
++                TrimOutcome::Trimmed(bytes) => {
++                    counter!("personhog_writer_properties_trimmed_writes_total").increment(1);
++                    person.properties = bytes;
++                    warnings.push(trimmed_warning(&person));
++                    kept.push(person);
++                }
++                TrimOutcome::InvalidJson => {
++                    counter!("personhog_writer_invalid_json_total").increment(1);
++                    counter!("personhog_writer_rows_skipped_total").increment(1);
++                    warn!(
++                        team_id = person.team_id,
++                        person_id = person.id,
++                        "oversized person has invalid JSON properties, skipping"
++                    );
++                    warnings.push(invalid_json_warning(&person));
++                }
++                TrimOutcome::CannotFit => {
++                    counter!("personhog_writer_rows_skipped_total").increment(1);
++                    warnings.push(rejected_warning(&person));
++                }
++            }
++        }
++
++        (kept, warnings)
++    }
++
++    /// Attempt to trim a person's properties to fit under `properties_trim_target`.
++    /// `trim_properties_to_fit_size` returns `None` when it can't reach the
++    /// target (e.g. protected-only keys exceed it), so we don't need a
++    /// second post-trim size check here.
++    ///
++    /// Pure computation (no IO); used by both the preflight batch path and
++    /// the defensive per-row fallback after a PG size-violation error.
++    fn try_trim_properties(&self, person: &Person) -> TrimOutcome {
++        let value: serde_json::Value = match serde_json::from_slice(&person.properties) {
++            Ok(v) => v,
++            Err(_) => return TrimOutcome::InvalidJson,
++        };
++
++        let Some(trimmed) = properties::trim_properties_to_fit_size(
++            &value,
++            person.team_id,
++            person.id,
++            self.properties_trim_target,
++        ) else {
++            return TrimOutcome::CannotFit;
++        };
++
++        let bytes = serde_json::to_vec(&trimmed).unwrap_or_default();
++        if bytes.is_empty() {
++            return TrimOutcome::CannotFit;
++        }
++        TrimOutcome::Trimmed(bytes)
++    }
++
++    pub async fn upsert_batch(&self, persons: Vec<Person>) -> BatchOutcome {
++        if persons.is_empty() {
++            return BatchOutcome::Success;
++        }
++
++        let start = Instant::now();
++        let total = persons.len();
++        let chunks = split_into_owned_chunks(persons, self.chunk_size);
++
++        // Single-chunk fast path: no spawn, no JoinSet. Normal flushes land
++        // here since chunk_size is tuned to match the aggregator flush size.
++        let outcome = if chunks.len() == 1 {
++            let chunk = chunks.into_iter().next().unwrap();
++            match self.db.execute_chunk(&chunk).await {
++                Ok(()) => BatchOutcome::Success,
++                Err(e) => partial_from_failed_chunk(chunk, e.kind),
++            }
++        } else {
++            self.run_parallel_chunks(chunks).await
++        };
++
++        histogram!("personhog_writer_flush_duration_seconds").record(start.elapsed().as_secs_f64());
++        histogram!("personhog_writer_flush_rows").record(total as f64);
++        outcome
++    }
++
++    pub async fn upsert_row(&self, person: &Person) -> RowResult {
++        match self.db.execute_row(person, None).await {
++            Ok(()) => return RowResult::Written,
++            Err(e) if matches!(e.kind, WriteErrorKind::PropertiesSizeViolation) => {
++                // Fall through to trim logic
++            }
++            Err(e) => {
++                counter!("personhog_writer_rows_skipped_total").increment(1);
++                warn!(
++                    team_id = person.team_id,
++                    person_id = person.id,
++                    error = %e.message,
++                    "per-row upsert failed, skipping"
++                );
++                return RowResult::Skipped(IngestionWarning {
++                    team_id: person.team_id,
++                    person_id: person.id,
++                    message: format!("Person upsert failed: {}", e.message),
++                });
++            }
++        }
++
++        // Size violation: defensive trim-and-retry. The preflight path usually
++        // catches oversized persons first; this branch fires for the edge case
++        // where raw bytes fit the threshold but JSONB encoding pushes us over.
++        //
++        // `try_trim_properties` may return `CannotFit` for either the "untrimable
++        // (protected keys already oversized)" case or the rare "raw bytes look
++        // fine but JSONB is big" case. Either way skipping is correct: the same
++        // raw bytes already failed at PG, and we have no smaller version to try.
++        match self.try_trim_properties(person) {
++            TrimOutcome::Trimmed(bytes) => {
++                let trimmed_str = from_utf8(&bytes).unwrap_or("{}");
++                match self.db.execute_row(person, Some(trimmed_str)).await {
++                    Ok(()) => {
++                        counter!("personhog_writer_properties_trimmed_writes_total").increment(1);
++                        RowResult::Trimmed(trimmed_warning(person))
++                    }
++                    Err(_) => {
++                        counter!("personhog_writer_rows_skipped_total").increment(1);
++                        RowResult::Skipped(rejected_warning(person))
++                    }
++                }
++            }
++            TrimOutcome::InvalidJson | TrimOutcome::CannotFit => {
++                counter!("personhog_writer_rows_skipped_total").increment(1);
++                RowResult::Skipped(rejected_warning(person))
++            }
++        }
++    }
++
++    /// Run per-row upserts for a batch of persons with bounded concurrency.
++    /// Used by the writer when a batch falls back to the per-row path after
++    /// chunk-level data failures. pgbouncer handles PG-side backpressure;
++    /// our bound is to keep sqlx pool turnover reasonable and cap memory of
++    /// in-flight futures.
++    pub async fn upsert_rows_parallel(&self, persons: Vec<Person>) -> Vec<RowResult> {
++        let start = Instant::now();
++        let concurrency = self.row_fallback_concurrency;
++        let results: Vec<RowResult> = stream::iter(persons)
++            .map(|p| async move {
++                gauge!("personhog_writer_row_fallback_in_flight").increment(1.0);
++                let res = self.upsert_row(&p).await;
++                gauge!("personhog_writer_row_fallback_in_flight").decrement(1.0);
++                res
++            })
++            .buffer_unordered(concurrency)
++            .collect()
++            .await;
++        histogram!("personhog_writer_row_fallback_duration_seconds")
++            .record(start.elapsed().as_secs_f64());
++        results
++    }
++
++    async fn run_parallel_chunks(&self, chunks: Vec<Vec<Person>>) -> BatchOutcome {
++        let mut set: JoinSet<(Vec<Person>, Result<(), WriteError>)> = JoinSet::new();
++        for chunk in chunks {
++            let db = Arc::clone(&self.db);
++            set.spawn(async move {
++                let res = db.execute_chunk(&chunk).await;
++                (chunk, res)
++            });
++        }
++
++        let mut transient = Vec::new();
++        let mut data_failed = Vec::new();
++
++        while let Some(joined) = set.join_next().await {
++            match joined {
++                Ok((_chunk, Ok(()))) => {}
++                Ok((chunk, Err(e))) => match e.kind {
++                    WriteErrorKind::Transient => transient.extend(chunk),
++                    WriteErrorKind::Data | WriteErrorKind::PropertiesSizeViolation => {
++                        data_failed.extend(chunk);
++                    }
++                },
++                Err(join_err) => {
++                    // A spawned task panicked. Abort remaining chunks and
++                    // drain so nothing lingers past our return.
++                    set.abort_all();
++                    while set.join_next().await.is_some() {}
++                    return BatchOutcome::Fatal(classify_join_error(join_err));
++                }
++            }
++        }
++
++        if !transient.is_empty() {
++            counter!("personhog_writer_chunk_retry_rows_total").increment(transient.len() as u64);
++        }
++        if !data_failed.is_empty() {
++            counter!("personhog_writer_chunk_fallback_rows_total")
++                .increment(data_failed.len() as u64);
++        }
++
++        if transient.is_empty() && data_failed.is_empty() {
++            BatchOutcome::Success
++        } else {
++            BatchOutcome::Partial {
++                transient,
++                data_failed,
++            }
++        }
++    }
++}
++
++fn split_into_owned_chunks(mut persons: Vec<Person>, chunk_size: usize) -> Vec<Vec<Person>> {
++    let chunk_size = chunk_size.max(1);
++    let expected = persons.len().div_ceil(chunk_size);
++    let mut out = Vec::with_capacity(expected);
++    while !persons.is_empty() {
++        let take = chunk_size.min(persons.len());
++        out.push(persons.drain(..take).collect());
++    }
++    out
++}
++
++fn partial_from_failed_chunk(chunk: Vec<Person>, kind: WriteErrorKind) -> BatchOutcome {
++    match kind {
++        WriteErrorKind::Transient => {
++            counter!("personhog_writer_chunk_retry_rows_total").increment(chunk.len() as u64);
++            BatchOutcome::Partial {
++                transient: chunk,
++                data_failed: Vec::new(),
++            }
++        }
++        WriteErrorKind::Data | WriteErrorKind::PropertiesSizeViolation => {
++            counter!("personhog_writer_chunk_fallback_rows_total").increment(chunk.len() as u64);
++            BatchOutcome::Partial {
++                transient: Vec::new(),
++                data_failed: chunk,
++            }
++        }
++    }
++}
++
++/// Result of attempting to trim a person's properties down to a size that
++/// fits the configured threshold. Used by both the preflight batch path
++/// and the defensive per-row fallback.
++enum TrimOutcome {
++    /// Trim succeeded; these bytes are guaranteed to be under the threshold.
++    Trimmed(Vec<u8>),
++    /// The person's properties weren't valid JSON. Skip.
++    InvalidJson,
++    /// Trim ran but the result still exceeds the threshold. Typically means
++    /// protected properties alone are oversized, or the value wasn't a JSON
++    /// object. Skip.
++    CannotFit,
++}
++
++fn trimmed_warning(p: &Person) -> IngestionWarning {
++    IngestionWarning {
++        team_id: p.team_id,
++        person_id: p.id,
++        message: "Person properties exceeded size limit and were trimmed".to_string(),
++    }
++}
++
++fn rejected_warning(p: &Person) -> IngestionWarning {
++    IngestionWarning {
++        team_id: p.team_id,
++        person_id: p.id,
++        message: "Person properties exceeds size limit and was rejected".to_string(),
++    }
++}
++
++fn invalid_json_warning(p: &Person) -> IngestionWarning {
++    IngestionWarning {
++        team_id: p.team_id,
++        person_id: p.id,
++        message: "Person properties are invalid JSON and exceed size limit — rejected".to_string(),
++    }
++}
++
++fn classify_join_error(e: JoinError) -> FatalError {
++    let message = match e.try_into_panic() {
++        Ok(payload) => {
++            let msg = payload
++                .downcast_ref::<&'static str>()
++                .map(|s| (*s).to_string())
++                .or_else(|| payload.downcast_ref::<String>().cloned())
++                .unwrap_or_else(|| "non-string panic payload".to_string());
++            format!("chunk task panicked: {msg}")
++        }
++        Err(e) => format!("chunk task failed unexpectedly: {e}"),
++    };
++    counter!("personhog_writer_chunk_fatal_total").increment(1);
++    error!(%message, "batch chunk task failed fatally");
++    FatalError { message }
++}
++
++// ── Test-only helpers ────────────────────────────────────────────
++//
++// `test_default` provides a `StoreConfig` with values tuned for unit tests
++// (small chunk sizes, small concurrency). It's gated on `#[cfg(test)]` so it
++// can never be reached from production code. Integration tests (separate
++// crate) have their own helper in `tests/common/mod.rs`.
++
++#[cfg(test)]
++impl StoreConfig {
++    pub(crate) fn test_default() -> Self {
++        Self {
++            chunk_size: 100,
++            row_fallback_concurrency: 4,
++            properties_size_threshold: 655_360,
++            properties_trim_target: 524_288,
++        }
++    }
++}
++
++// ── Unit tests ───────────────────────────────────────────────────
++//
++// These tests exercise the orchestration layer (chunking, parallel
++// execution, outcome partitioning, per-row fallback) against a stub DB
++// that produces scripted responses. PG correctness is covered separately
++// by the integration tests.
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    use std::collections::HashMap;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::sync::Mutex;
++
++    /// Stub DB for unit-testing orchestration. Responses can be scripted
++    /// per-chunk (by first-person id) or as a FIFO by call order, with a
++    /// default fallback. Per-row responses are separate.
++    #[derive(Debug, Clone, Copy)]
++    enum ChunkResponse {
++        Ok,
++        Err(WriteErrorKind),
++        Panic,
++    }
++
++    struct StubDb {
++        chunk_by_first_id: Mutex<HashMap<i64, ChunkResponse>>,
++        chunk_fifo: Mutex<Vec<ChunkResponse>>,
++        chunk_default: ChunkResponse,
++        chunk_calls: AtomicUsize,
++        row_fifo: Mutex<Vec<ChunkResponse>>,
++        row_default: ChunkResponse,
++        row_calls: AtomicUsize,
++    }
++
++    impl StubDb {
++        fn new() -> Self {
++            Self {
++                chunk_by_first_id: Mutex::new(HashMap::new()),
++                chunk_fifo: Mutex::new(Vec::new()),
++                chunk_default: ChunkResponse::Ok,
++                chunk_calls: AtomicUsize::new(0),
++                row_fifo: Mutex::new(Vec::new()),
++                row_default: ChunkResponse::Ok,
++                row_calls: AtomicUsize::new(0),
++            }
++        }
++
++        fn with_chunk_default(mut self, r: ChunkResponse) -> Self {
++            self.chunk_default = r;
++            self
++        }
++
++        fn with_row_default(mut self, r: ChunkResponse) -> Self {
++            self.row_default = r;
++            self
++        }
++
++        fn script_chunk_for_id(self, id: i64, r: ChunkResponse) -> Self {
++            self.chunk_by_first_id.lock().unwrap().insert(id, r);
++            self
++        }
++
++        fn lookup_chunk_response(&self, chunk: &[Person]) -> ChunkResponse {
++            if let Some(first) = chunk.first() {
++                if let Some(r) = self.chunk_by_first_id.lock().unwrap().get(&first.id) {
++                    return *r;
++                }
++            }
++            let mut fifo = self.chunk_fifo.lock().unwrap();
++            if !fifo.is_empty() {
++                return fifo.remove(0);
++            }
++            self.chunk_default
++        }
++
++        fn lookup_row_response(&self) -> ChunkResponse {
++            let mut fifo = self.row_fifo.lock().unwrap();
++            if !fifo.is_empty() {
++                return fifo.remove(0);
++            }
++            self.row_default
++        }
++    }
++
++    #[async_trait]
++    impl PersonDb for StubDb {
++        async fn execute_chunk(&self, chunk: &[Person]) -> Result<(), WriteError> {
++            self.chunk_calls.fetch_add(1, Ordering::SeqCst);
++            match self.lookup_chunk_response(chunk) {
++                ChunkResponse::Ok => Ok(()),
++                ChunkResponse::Err(kind) => Err(WriteError {
++                    message: format!("stub error: {kind:?}"),
++                    kind,
++                }),
++                ChunkResponse::Panic => panic!("stub db chunk panic"),
++            }
++        }
++
++        async fn execute_row(
++            &self,
++            _person: &Person,
++            _override: Option<&str>,
++        ) -> Result<(), WriteError> {
++            self.row_calls.fetch_add(1, Ordering::SeqCst);
++            match self.lookup_row_response() {
++                ChunkResponse::Ok => Ok(()),
++                ChunkResponse::Err(kind) => Err(WriteError {
++                    message: format!("stub row error: {kind:?}"),
++                    kind,
++                }),
++                ChunkResponse::Panic => panic!("stub db row panic"),
++            }
++        }
++    }
++
++    fn p(id: i64) -> Person {
++        Person {
++            id,
++            team_id: 1,
++            uuid: uuid::Uuid::new_v4().to_string(),
++            version: 1,
++            ..Default::default()
++        }
++    }
++
++    // ── Split helper ────────────────────────────────────────────
++
++    #[test]
++    fn split_preserves_order_and_count() {
++        let persons: Vec<Person> = (0..11).map(p).collect();
++        let chunks = split_into_owned_chunks(persons, 4);
++        assert_eq!(chunks.len(), 3);
++        assert_eq!(chunks[0].len(), 4);
++        assert_eq!(chunks[1].len(), 4);
++        assert_eq!(chunks[2].len(), 3);
++        assert_eq!(chunks[0][0].id, 0);
++        assert_eq!(chunks[2][2].id, 10);
++    }
++
++    #[test]
++    fn split_exact_multiple() {
++        let persons: Vec<Person> = (0..6).map(p).collect();
++        let chunks = split_into_owned_chunks(persons, 3);
++        assert_eq!(chunks.len(), 2);
++        assert_eq!(chunks[0].len(), 3);
++        assert_eq!(chunks[1].len(), 3);
++    }
++
++    #[test]
++    fn split_empty() {
++        let chunks = split_into_owned_chunks(Vec::<Person>::new(), 5);
++        assert!(chunks.is_empty());
++    }
++
++    // ── Empty + success paths ───────────────────────────────────
++
++    #[tokio::test]
++    async fn upsert_batch_empty_returns_success() {
++        let store = PersonWriteStore::new(StubDb::new(), StoreConfig::test_default());
++        assert!(matches!(
++            store.upsert_batch(Vec::new()).await,
++            BatchOutcome::Success
++        ));
++    }
++
++    #[tokio::test]
++    async fn upsert_batch_single_chunk_success() {
++        let store = PersonWriteStore::new(StubDb::new(), StoreConfig::test_default());
++        let persons: Vec<Person> = (0..5).map(p).collect();
++        assert!(matches!(
++            store.upsert_batch(persons).await,
++            BatchOutcome::Success
++        ));
++    }
++
++    #[tokio::test]
++    async fn upsert_batch_parallel_all_succeed() {
++        // 6 persons, chunk_size 2 → 3 parallel chunks
++        let store = PersonWriteStore::new(
++            StubDb::new(),
++            StoreConfig {
++                chunk_size: 2,
++                ..StoreConfig::test_default()
++            },
++        );
++        let persons: Vec<Person> = (0..6).map(p).collect();
++        assert!(matches!(
++            store.upsert_batch(persons).await,
++            BatchOutcome::Success
++        ));
++    }
++
++    // ── Single-chunk fast path, each failure kind ──────────────
++
++    #[tokio::test]
++    async fn upsert_batch_transient_routes_to_transient_bucket() {
++        let db = StubDb::new().with_chunk_default(ChunkResponse::Err(WriteErrorKind::Transient));
++        let store = PersonWriteStore::new(db, StoreConfig::test_default());
++        let persons: Vec<Person> = (0..3).map(p).collect();
++        match store.upsert_batch(persons).await {
++            BatchOutcome::Partial {
++                transient,
++                data_failed,
++            } => {
++                assert_eq!(transient.len(), 3);
++                assert!(data_failed.is_empty());
++            }
++            other => panic!("expected Partial, got {other:?}"),
++        }
++    }
++
++    #[tokio::test]
++    async fn upsert_batch_data_error_routes_to_data_bucket() {
++        let db = StubDb::new().with_chunk_default(ChunkResponse::Err(WriteErrorKind::Data));
++        let store = PersonWriteStore::new(db, StoreConfig::test_default());
++        let persons: Vec<Person> = (0..3).map(p).collect();
++        match store.upsert_batch(persons).await {
++            BatchOutcome::Partial {
++                transient,
++                data_failed,
++            } => {
++                assert!(transient.is_empty());
++                assert_eq!(data_failed.len(), 3);
++            }
++            other => panic!("expected Partial, got {other:?}"),
++        }
++    }
++
++    #[tokio::test]
++    async fn upsert_batch_size_violation_routes_to_data_bucket() {
++        let db = StubDb::new()
++            .with_chunk_default(ChunkResponse::Err(WriteErrorKind::PropertiesSizeViolation));
++        let store = PersonWriteStore::new(db, StoreConfig::test_default());
++        let persons: Vec<Person> = (0..3).map(p).collect();
++        match store.upsert_batch(persons).await {
++            BatchOutcome::Partial {
++                transient,
++                data_failed,
++            } => {
++                assert!(transient.is_empty());
++                assert_eq!(data_failed.len(), 3);
++            }
++            other => panic!("expected Partial, got {other:?}"),
++        }
++    }
++
++    // ── Parallel mixed outcomes ────────────────────────────────
++
++    #[tokio::test]
++    async fn upsert_batch_parallel_mixed_partitions_correctly() {
++        // 6 persons with ids 0..5, chunk_size 2 → chunks [0,1], [2,3], [4,5]
++        // Script first-id 0 → Ok, first-id 2 → transient, first-id 4 → data
++        let db = StubDb::new()
++            .script_chunk_for_id(0, ChunkResponse::Ok)
++            .script_chunk_for_id(2, ChunkResponse::Err(WriteErrorKind::Transient))
++            .script_chunk_for_id(4, ChunkResponse::Err(WriteErrorKind::Data));
++        let store = PersonWriteStore::new(
++            db,
++            StoreConfig {
++                chunk_size: 2,
++                ..StoreConfig::test_default()
++            },
++        );
++        let persons: Vec<Person> = (0..6).map(p).collect();
++
++        match store.upsert_batch(persons).await {
++            BatchOutcome::Partial {
++                transient,
++                data_failed,
++            } => {
++                assert_eq!(transient.len(), 2);
++                assert_eq!(transient[0].id, 2);
++                assert_eq!(transient[1].id, 3);
++                assert_eq!(data_failed.len(), 2);
++                assert_eq!(data_failed[0].id, 4);
++                assert_eq!(data_failed[1].id, 5);
++            }
++            other => panic!("expected Partial, got {other:?}"),
++        }
++    }
++
++    #[tokio::test]
++    async fn upsert_batch_parallel_all_transient_returns_all_rows() {
++        let db = StubDb::new().with_chunk_default(ChunkResponse::Err(WriteErrorKind::Transient));
++        let store = PersonWriteStore::new(
++            db,
++            StoreConfig {
++                chunk_size: 2,
++                ..StoreConfig::test_default()
++            },
++        );
++        let persons: Vec<Person> = (0..6).map(p).collect();
++        match store.upsert_batch(persons).await {
++            BatchOutcome::Partial {
++                transient,
++                data_failed,
++            } => {
++                assert_eq!(transient.len(), 6);
++                assert!(data_failed.is_empty());
++            }
++            other => panic!("expected Partial, got {other:?}"),
++        }
++    }
++
++    // ── Panic handling ─────────────────────────────────────────
++
++    #[tokio::test]
++    async fn upsert_batch_chunk_panic_returns_fatal() {
++        // One chunk panics, others return Ok. In parallel path we expect Fatal.
++        let db = StubDb::new()
++            .script_chunk_for_id(0, ChunkResponse::Ok)
++            .script_chunk_for_id(2, ChunkResponse::Panic)
++            .script_chunk_for_id(4, ChunkResponse::Ok);
++        let store = PersonWriteStore::new(
++            db,
++            StoreConfig {
++                chunk_size: 2,
++                ..StoreConfig::test_default()
++            },
++        );
++        let persons: Vec<Person> = (0..6).map(p).collect();
++        match store.upsert_batch(persons).await {
++            BatchOutcome::Fatal(fatal) => {
++                assert!(
++                    fatal.message.contains("panicked"),
++                    "fatal message should reference panic, got: {}",
++                    fatal.message
++                );
++            }
++            other => panic!("expected Fatal, got {other:?}"),
++        }
++    }
++
++    // ── upsert_row ─────────────────────────────────────────────
++
++    #[tokio::test]
++    async fn upsert_row_success_returns_written() {
++        let store = PersonWriteStore::new(StubDb::new(), StoreConfig::test_default());
++        assert!(matches!(store.upsert_row(&p(1)).await, RowResult::Written));
++    }
++
++    #[tokio::test]
++    async fn upsert_row_transient_returns_skipped() {
++        let db = StubDb::new().with_row_default(ChunkResponse::Err(WriteErrorKind::Transient));
++        let store = PersonWriteStore::new(db, StoreConfig::test_default());
++        match store.upsert_row(&p(1)).await {
++            RowResult::Skipped(warning) => {
++                assert_eq!(warning.person_id, 1);
++                assert!(warning.message.contains("Person upsert failed"));
++            }
++            other => panic!("expected Skipped, got {other:?}"),
++        }
++    }
++
++    #[tokio::test]
++    async fn upsert_row_data_error_returns_skipped() {
++        let db = StubDb::new().with_row_default(ChunkResponse::Err(WriteErrorKind::Data));
++        let store = PersonWriteStore::new(db, StoreConfig::test_default());
++        assert!(matches!(
++            store.upsert_row(&p(1)).await,
++            RowResult::Skipped(_)
++        ));
++    }
++
++    // ── upsert_rows_parallel ──────────────────────────────────
++
++    #[tokio::test]
++    async fn upsert_rows_parallel_returns_a_result_per_person() {
++        let store = PersonWriteStore::new(StubDb::new(), StoreConfig::test_default());
++        let persons: Vec<Person> = (0..10).map(p).collect();
++        let results = store.upsert_rows_parallel(persons).await;
++        assert_eq!(results.len(), 10);
++        assert!(results.iter().all(|r| matches!(r, RowResult::Written)));
++    }
++
++    #[tokio::test]
++    async fn upsert_rows_parallel_surfaces_errors_as_skipped() {
++        let db = StubDb::new().with_row_default(ChunkResponse::Err(WriteErrorKind::Data));
++        let store = PersonWriteStore::new(db, StoreConfig::test_default());
++        let persons: Vec<Person> = (0..5).map(p).collect();
++        let results = store.upsert_rows_parallel(persons).await;
++        assert_eq!(results.len(), 5);
++        assert!(results.iter().all(|r| matches!(r, RowResult::Skipped(_))));
++    }
++
++    // ── preflight_trim_batch ───────────────────────────────────
++
++    #[test]
++    fn preflight_leaves_normal_persons_untouched() {
++        let store = PersonWriteStore::new(StubDb::new(), StoreConfig::test_default());
++        let persons: Vec<Person> = (0..5).map(p).collect();
++        let (kept, warnings) = store.preflight_trim_batch(persons);
++        assert_eq!(kept.len(), 5);
++        assert!(warnings.is_empty());
++    }
++
++    #[test]
++    fn preflight_trims_oversized_and_keeps_them_in_batch() {
++        // Small threshold so we can exercise the path without megabytes of JSON.
++        let store = PersonWriteStore::new(
++            StubDb::new(),
++            StoreConfig {
++                properties_size_threshold: 1024,
++                properties_trim_target: 512,
++                ..StoreConfig::test_default()
++            },
++        );
++        let normal = p(1);
++        // Oversized person: a single trimmable key with lots of content.
++        let mut oversized = p(2);
++        oversized.properties = serde_json::to_vec(&serde_json::json!({
++            "email": "protected@example.com",
++            "bloat": "x".repeat(2_000),
++        }))
++        .unwrap();
++
++        let (kept, warnings) = store.preflight_trim_batch(vec![normal, oversized]);
++
++        assert_eq!(kept.len(), 2, "both persons should remain after trim");
++        // The trimmed person's properties should now be within threshold.
++        let trimmed = kept.iter().find(|p| p.id == 2).unwrap();
++        assert!(trimmed.properties.len() <= 1024);
++        assert_eq!(warnings.len(), 1);
++        assert!(warnings[0].message.contains("trimmed"));
++    }
++
++    #[test]
++    fn preflight_skips_oversized_when_only_protected_keys_exceed() {
++        // 1 KiB threshold; protected `email` alone exceeds it.
++        let store = PersonWriteStore::new(
++            StubDb::new(),
++            StoreConfig {
++                properties_size_threshold: 1024,
++                properties_trim_target: 512,
++                ..StoreConfig::test_default()
++            },
++        );
++        let mut untrimable = p(1);
++        untrimable.properties = serde_json::to_vec(&serde_json::json!({
++            "email": "x".repeat(2_000),
++        }))
++        .unwrap();
++
++        let (kept, warnings) = store.preflight_trim_batch(vec![untrimable]);
++
++        assert!(kept.is_empty());
++        assert_eq!(warnings.len(), 1);
++        assert!(warnings[0].message.contains("rejected"));
++    }
++
++    #[test]
++    fn preflight_skips_invalid_json() {
++        let store = PersonWriteStore::new(
++            StubDb::new(),
++            StoreConfig {
++                properties_size_threshold: 16,
++                properties_trim_target: 8,
++                ..StoreConfig::test_default()
++            },
++        );
++        let mut bad = p(1);
++        bad.properties = vec![b'n'; 32]; // "nnnn..." — not valid JSON and > 16 bytes
++
++        let (kept, warnings) = store.preflight_trim_batch(vec![bad]);
++
++        assert!(kept.is_empty());
++        assert_eq!(warnings.len(), 1);
++        assert!(warnings[0].message.contains("invalid JSON"));
++    }
++
++    #[test]
++    fn preflight_preserves_content_for_untouched_persons() {
++        let store = PersonWriteStore::new(StubDb::new(), StoreConfig::test_default());
++        let original: Vec<Person> = (0..3).map(p).collect();
++
++        let (kept, warnings) = store.preflight_trim_batch(original.clone());
++
++        assert_eq!(kept.len(), 3);
++        assert!(warnings.is_empty());
++        for (a, b) in original.iter().zip(kept.iter()) {
++            assert_eq!(a.id, b.id);
++            assert_eq!(a.properties, b.properties);
++        }
++    }
++}
+diff --git a/rust/personhog-writer/src/writer.rs b/rust/personhog-writer/src/writer.rs
+new file mode 100644
+index 00000000000..0a147a964c8
+--- /dev/null
++++ b/rust/personhog-writer/src/writer.rs
+@@ -0,0 +1,231 @@
++use std::collections::HashMap;
++use std::sync::Arc;
++use std::time::Duration;
++
++use lifecycle::Handle;
++use metrics::{counter, histogram};
++use personhog_proto::personhog::types::v1::Person;
++use tokio::sync::mpsc;
++use tracing::{debug, error, info, warn};
++
++use crate::consumer::FlushBatch;
++use crate::kafka::{PersonConsumer, WarningsProducer};
++use crate::store::{BatchOutcome, IngestionWarning, PersonDb, PersonWriteStore, RowResult};
++
++/// Receives batches from the consumer task, writes to the persistent
++/// store, and commits Kafka offsets. Runs on its own tokio task so
++/// writes don't block consumption.
++pub struct WriterTask<D: PersonDb + 'static> {
++    consumer: Arc<PersonConsumer>,
++    store: PersonWriteStore<D>,
++    flush_rx: mpsc::Receiver<FlushBatch>,
++    handle: Handle,
++    warnings: Option<WarningsProducer>,
++    consecutive_failures: u32,
++}
++
++const MAX_CONSECUTIVE_FAILURES: u32 = 3;
++const BASE_BACKOFF: Duration = Duration::from_secs(1);
++const MAX_BACKOFF: Duration = Duration::from_secs(5);
++
++impl<D: PersonDb + 'static> WriterTask<D> {
++    pub fn new(
++        consumer: Arc<PersonConsumer>,
++        store: PersonWriteStore<D>,
++        flush_rx: mpsc::Receiver<FlushBatch>,
++        handle: Handle,
++        warnings: Option<WarningsProducer>,
++    ) -> Self {
++        Self {
++            consumer,
++            store,
++            flush_rx,
++            handle,
++            warnings,
++            consecutive_failures: 0,
++        }
++    }
++
++    pub async fn run(mut self) {
++        info!("Writer task starting");
++        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
++
++        loop {
++            tokio::select! {
++                biased;
++
++                batch = self.flush_rx.recv() => {
++                    let Some(batch) = batch else {
++                        break;
++                    };
++                    self.process_batch(batch).await;
++                }
++
++                _ = heartbeat.tick() => {
++                    self.handle.report_healthy();
++                }
++            }
++        }
++
++        if let Some(producer) = &self.warnings {
++            producer.flush(Duration::from_secs(5));
++        }
++        info!("Writer task stopped");
++    }
++
++    async fn process_batch(&mut self, batch: FlushBatch) {
++        let FlushBatch {
++            persons,
++            offsets,
++            oldest_message_ts_ms,
++        } = batch;
++        let total_rows = persons.len();
++        counter!("personhog_writer_flushes_total").increment(1);
++
++        // Preflight oversized persons out of the batch. Trimmed survivors
++        // rejoin the main path; untrimable ones produce skip warnings.
++        let (persons, mut warnings) = self.store.preflight_trim_batch(persons);
++        let mut remaining: Vec<Person> = persons;
++
++        loop {
++            let to_process = std::mem::take(&mut remaining);
++            match self.store.upsert_batch(to_process).await {
++                BatchOutcome::Success => {
++                    self.finish(total_rows, &offsets, oldest_message_ts_ms, warnings);
++                    return;
++                }
++
++                BatchOutcome::Partial {
++                    transient,
++                    data_failed,
++                } => {
++                    if !data_failed.is_empty() {
++                        counter!("personhog_writer_batch_fallback_total").increment(1);
++                        warn!(
++                            rows = data_failed.len(),
++                            "batch had data-failed chunks, falling back to per-row"
++                        );
++                        for r in self.store.upsert_rows_parallel(data_failed).await {
++                            match r {
++                                RowResult::Written => {}
++                                RowResult::Trimmed(w) | RowResult::Skipped(w) => warnings.push(w),
++                            }
++                        }
++                    }
++
++                    if transient.is_empty() {
++                        self.finish(total_rows, &offsets, oldest_message_ts_ms, warnings);
++                        return;
++                    }
++
++                    // Transient chunks remain — retry just those with backoff.
++                    self.consecutive_failures += 1;
++                    let backoff = backoff_duration(self.consecutive_failures);
++                    error!(
++                        consecutive_failures = self.consecutive_failures,
++                        transient_rows = transient.len(),
++                        backoff_ms = backoff.as_millis() as u64,
++                        "transient chunk failures, retrying"
++                    );
++
++                    if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
++                        // Emit warnings for data_failed rows that were already
++                        // written in this iteration before we bail. Offsets
++                        // won't commit, so Kafka replay will re-emit them, but
++                        // losing them when we have them is wrong.
++                        self.emit_warnings(&warnings);
++                        self.handle.signal_failure(format!(
++                            "store flush failed {MAX_CONSECUTIVE_FAILURES} consecutive times"
++                        ));
++                        return;
++                    }
++
++                    tokio::time::sleep(backoff).await;
++                    remaining = transient;
++                }
++
++                BatchOutcome::Fatal(fatal) => {
++                    self.emit_warnings(&warnings);
++                    self.handle
++                        .signal_failure(format!("upsert_batch fatal: {fatal}"));
++                    return;
++                }
++            }
++        }
++    }
++
++    fn emit_warnings(&self, warnings: &[IngestionWarning]) {
++        if let Some(producer) = &self.warnings {
++            for w in warnings {
++                producer.emit(w);
++            }
++        }
++    }
++
++    fn finish(
++        &mut self,
++        rows: usize,
++        offsets: &HashMap<i32, i64>,
++        oldest_ts_ms: Option<i64>,
++        warnings: Vec<IngestionWarning>,
++    ) {
++        self.emit_warnings(&warnings);
++        self.consecutive_failures = 0;
++        self.handle.report_healthy();
++        self.commit_and_record(offsets, oldest_ts_ms, rows);
++    }
++
++    fn commit_and_record(
++        &self,
++        offsets: &HashMap<i32, i64>,
++        oldest_ts_ms: Option<i64>,
++        rows_written: usize,
++    ) {
++        if let Err(e) = self.consumer.commit_offsets(offsets) {
++            counter!("personhog_writer_offset_commit_errors_total").increment(1);
++            error!(error = %e, "failed to commit offsets");
++        }
++
++        counter!("personhog_writer_offset_commits_total").increment(1);
++
++        if let Some(ts_ms) = oldest_ts_ms {
++            let now_ms = std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap_or_default()
++                .as_millis() as i64;
++            let latency_ms = now_ms.saturating_sub(ts_ms);
++            histogram!("personhog_writer_e2e_latency_seconds").record(latency_ms as f64 / 1000.0);
++        }
++
++        debug!(rows = rows_written, "flushed to store");
++    }
++}
++
++fn backoff_duration(consecutive_failures: u32) -> Duration {
++    let backoff = BASE_BACKOFF * 2u32.saturating_pow(consecutive_failures.saturating_sub(1));
++    backoff.min(MAX_BACKOFF)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn backoff_doubles_each_failure() {
++        assert_eq!(backoff_duration(1), Duration::from_secs(1));
++        assert_eq!(backoff_duration(2), Duration::from_secs(2));
++        assert_eq!(backoff_duration(3), Duration::from_secs(4));
++    }
++
++    #[test]
++    fn backoff_caps_at_max() {
++        assert_eq!(backoff_duration(4), Duration::from_secs(5));
++        assert_eq!(backoff_duration(10), Duration::from_secs(5));
++        assert_eq!(backoff_duration(100), Duration::from_secs(5));
++    }
++
++    #[test]
++    fn backoff_zero_failures_returns_base() {
++        assert_eq!(backoff_duration(0), Duration::from_secs(1));
++    }
++}

@@ -1,0 +1,160 @@
+diff --git a/lib/plausible/goal.ex b/lib/plausible/goal.ex
+index f5900aff9b..04c0407bab 100644
+--- a/lib/plausible/goal.ex
++++ b/lib/plausible/goal.ex
+@@ -38,8 +38,6 @@ defmodule Plausible.Goal do
+   end
+ 
+   @fields [
+-            :id,
+-            :site_id,
+             :event_name,
+             :page_path,
+             :scroll_threshold,
+@@ -59,8 +57,6 @@ defmodule Plausible.Goal do
+   def changeset(goal, attrs \\ %{}) do
+     goal
+     |> cast(attrs, @fields)
+-    |> validate_required([:site_id])
+-    |> cast_assoc(:site)
+     |> update_leading_slash()
+     |> validate_event_name_and_page_path()
+     |> validate_page_path_for_scroll_goal()
+diff --git a/lib/plausible/goals/goals.ex b/lib/plausible/goals/goals.ex
+index d6d3db86a1..e79e278927 100644
+--- a/lib/plausible/goals/goals.ex
++++ b/lib/plausible/goals/goals.ex
+@@ -1,4 +1,8 @@
+ defmodule Plausible.Goals do
++  @moduledoc """
++  Goals API.
++  """
++
+   use Plausible
+   use Plausible.Repo
+   use Plausible.Funnel.Const
+@@ -371,7 +375,10 @@ defmodule Plausible.Goals do
+         []
+       end
+ 
+-    changeset = Goal.changeset(%Goal{site_id: site.id}, params)
++    changeset =
++      %Goal{}
++      |> Goal.changeset(params)
++      |> Ecto.Changeset.put_assoc(:site, site)
+ 
+     with :ok <- maybe_check_feature_access(site, changeset),
+          :ok <- check_no_currency_if_consolidated(site, changeset),
+diff --git a/lib/plausible/segments/segment.ex b/lib/plausible/segments/segment.ex
+index 8fd5b8ac2e..1187714013 100644
+--- a/lib/plausible/segments/segment.ex
++++ b/lib/plausible/segments/segment.ex
+@@ -29,7 +29,6 @@ defmodule Plausible.Segments.Segment do
+     |> cast(attrs, [
+       :name,
+       :segment_data,
+-      :site_id,
+       :type,
+       :owner_id
+     ])
+diff --git a/lib/plausible/segments/segments.ex b/lib/plausible/segments/segments.ex
+index bf50d72b3b..de247316b4 100644
+--- a/lib/plausible/segments/segments.ex
++++ b/lib/plausible/segments/segments.ex
+@@ -158,8 +158,8 @@ defmodule Plausible.Segments do
+     with :ok <- can_insert_one?(site, site_role, params),
+          %{valid?: true} = changeset <-
+            Segment.changeset(
+-             %Segment{},
+-             Map.merge(params, %{"site_id" => site.id, "owner_id" => user_id})
++             %Segment{site_id: site.id},
++             Map.merge(params, %{"owner_id" => user_id})
+            ),
+          :ok <-
+            Segment.validate_segment_data(site, params["segment_data"], true) do
+diff --git a/lib/plausible/shield/country_rule.ex b/lib/plausible/shield/country_rule.ex
+index 1329f74bda..a9234363eb 100644
+--- a/lib/plausible/shield/country_rule.ex
++++ b/lib/plausible/shield/country_rule.ex
+@@ -26,8 +26,8 @@ defmodule Plausible.Shield.CountryRule do
+ 
+   def changeset(rule, attrs) do
+     rule
+-    |> cast(attrs, [:site_id, :country_code])
+-    |> validate_required([:site_id, :country_code])
++    |> cast(attrs, [:country_code])
++    |> validate_required([:country_code])
+     |> validate_length(:country_code, is: 2)
+     |> validate_change(:country_code, fn :country_code, cc ->
+       valid_codes = [@unknown_country_code | Enum.map(Location.Country.all(), & &1.alpha_2)]
+diff --git a/lib/plausible/shield/hostname_rule.ex b/lib/plausible/shield/hostname_rule.ex
+index 27d212ff5c..2f7f5295cd 100644
+--- a/lib/plausible/shield/hostname_rule.ex
++++ b/lib/plausible/shield/hostname_rule.ex
+@@ -22,8 +22,8 @@ defmodule Plausible.Shield.HostnameRule do
+ 
+   def changeset(rule \\ %__MODULE__{}, attrs) do
+     rule
+-    |> cast(attrs, [:site_id, :hostname])
+-    |> validate_required([:site_id, :hostname])
++    |> cast(attrs, [:hostname])
++    |> validate_required([:hostname])
+     |> validate_length(:hostname, max: 250)
+     |> store_regex()
+     |> unique_constraint(:hostname_pattern,
+diff --git a/lib/plausible/shield/ip_rule.ex b/lib/plausible/shield/ip_rule.ex
+index 9f160f2f6d..fa725e99e3 100644
+--- a/lib/plausible/shield/ip_rule.ex
++++ b/lib/plausible/shield/ip_rule.ex
+@@ -22,8 +22,8 @@ defmodule Plausible.Shield.IPRule do
+ 
+   def changeset(rule, attrs) do
+     rule
+-    |> cast(attrs, [:site_id, :inet, :description])
+-    |> validate_required([:site_id, :inet])
++    |> cast(attrs, [:inet, :description])
++    |> validate_required([:inet])
+     |> disallow_netmask(:inet)
+     |> unique_constraint(:inet,
+       name: :shield_rules_ip_site_id_inet_index
+diff --git a/lib/plausible/shield/page_rule.ex b/lib/plausible/shield/page_rule.ex
+index 0a238b75b6..d56c8f2fec 100644
+--- a/lib/plausible/shield/page_rule.ex
++++ b/lib/plausible/shield/page_rule.ex
+@@ -22,8 +22,8 @@ defmodule Plausible.Shield.PageRule do
+ 
+   def changeset(rule \\ %__MODULE__{}, attrs) do
+     rule
+-    |> cast(attrs, [:site_id, :page_path])
+-    |> validate_required([:site_id, :page_path])
++    |> cast(attrs, [:page_path])
++    |> validate_required([:page_path])
+     |> validate_length(:page_path, max: 250)
+     |> validate_change(:page_path, fn :page_path, p ->
+       if not String.starts_with?(p, "/") do
+diff --git a/lib/plausible_web/live/shared_link_settings.ex b/lib/plausible_web/live/shared_link_settings.ex
+index ba87d3edd9..dabe7478b6 100644
+--- a/lib/plausible_web/live/shared_link_settings.ex
++++ b/lib/plausible_web/live/shared_link_settings.ex
+@@ -185,13 +185,19 @@ defmodule PlausibleWeb.Live.SharedLinkSettings do
+   end
+ 
+   def handle_event("edit-shared-link", %{"slug" => slug}, socket) do
++    site_id = socket.assigns.site.id
++
+     shared_link =
+       Plausible.Site.SharedLink
+-      |> Plausible.Repo.get_by(slug: slug)
++      |> Plausible.Repo.get_by(slug: slug, site_id: site_id)
+       |> Plausible.Repo.preload(:segment)
+ 
+     socket =
+-      socket |> assign(form_shared_link: shared_link) |> Modal.open("shared-links-form-modal")
++      if shared_link do
++        socket |> assign(form_shared_link: shared_link) |> Modal.open("shared-links-form-modal")
++      else
++        put_live_flash(socket, :error, "Could not find Shared Link")
++      end
+ 
+     {:noreply, socket}
+   end

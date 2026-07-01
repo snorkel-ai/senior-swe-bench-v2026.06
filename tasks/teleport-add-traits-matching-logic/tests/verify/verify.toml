@@ -1,0 +1,20 @@
+# Verifier runner configuration.
+#
+# Two runners ship for this task and run independently:
+#   * the go runner picks up verify_test.go and runs it as a native
+#     `go test` in the api/ sub-module against the api/types package;
+#   * the shell runner picks up verify_build.sh (the multi-module
+#     compilation gate).
+#
+# verify_test.go is injected into /repo/teleport/api/types and exercises the
+# pre-existing, stable UserFilter.Match surface only.
+
+[go]
+module_dir = "api"
+package = "api/types"
+timeout = 600
+env = { GOFLAGS = "-mod=mod", CGO_ENABLED = "1", GOTOOLCHAIN = "local" }
+
+[shell]
+timeout = 600
+env = { GOFLAGS = "-mod=mod", CGO_ENABLED = "1", GOTOOLCHAIN = "local" }

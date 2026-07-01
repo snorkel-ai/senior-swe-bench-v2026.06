@@ -1,0 +1,8 @@
+{
+  "files": [
+    "lib/plausible_web/controllers/stats_controller.ex",
+    "lib/plausible_web/router.ex"
+  ],
+  "fail_to_pass": [],
+  "pass_to_pass": []
+}
