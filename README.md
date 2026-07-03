@@ -16,7 +16,7 @@ Once you [install Harbor](https://www.harborframework.com/docs/getting-started),
 # export MY_PROVIDERS_API_KEY=...
 
 # [Optional] Set the models for the test stage (defaults below)
-# export SSB_OVERRIDE_VA_HARNESS=mini-swe-bench
+# export SSB_OVERRIDE_VA_HARNESS=mini-swe-agent
 # export SSB_OVERRIDE_VA_MODEL=anthropic/claude-sonnet-4-6
 # export SSB_OVERRIDE_ALL_JUDGE_MODEL=anthropic/claude-sonnet-4-6
 # export SSB_OVERRIDE_CLASSIFIER_MODEL=anthropic/claude-haiku-4-5
