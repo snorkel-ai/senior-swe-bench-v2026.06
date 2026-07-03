@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/firezone-fix-connlib-align-device"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "firezone", "rust"]
+
 [environment]
 base_image = "firezone-fix-connlib-align-device:latest"
 build_timeout_sec = 1800.0

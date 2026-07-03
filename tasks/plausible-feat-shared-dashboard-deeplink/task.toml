@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/plausible-feat-shared-dashboard-deeplink"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "plausible", "elixir"]
+
 [environment]
 base_image = "plausible-feat-shared-dashboard-deeplink:latest"
 build_timeout_sec = 1800.0

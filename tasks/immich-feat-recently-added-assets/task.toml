@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/immich-feat-recently-added-assets"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "immich", "typescript-service", "sql-database"]
+
 [environment]
 base_image = "immich-feat-recently-added-assets:latest"
 build_timeout_sec = 2400.0

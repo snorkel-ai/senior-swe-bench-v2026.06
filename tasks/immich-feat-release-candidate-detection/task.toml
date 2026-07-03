@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/immich-feat-release-candidate-detection"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "immich", "typescript-service"]
+
 [environment]
 base_image = "immich-feat-release-candidate-detection:latest"
 build_timeout_sec = 2400.0

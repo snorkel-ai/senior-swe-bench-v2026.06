@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/posthog-feat-approval-gating"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "posthog", "python-service", "typescript-frontend"]
+
 [environment]
 base_image = "posthog-feat-approval-gating:latest"
 build_timeout_sec = 1200.0

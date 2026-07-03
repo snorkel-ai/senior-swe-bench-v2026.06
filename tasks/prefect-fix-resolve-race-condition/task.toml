@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/prefect-fix-resolve-race-condition"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "prefect", "python-service", "sql-database"]
+
 [environment]
 base_image = "prefect-fix-resolve-race-condition:latest"
 build_timeout_sec = 1200.0

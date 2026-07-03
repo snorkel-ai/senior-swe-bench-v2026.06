@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/posthog-fix-llm-gateway-add"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "posthog", "python-service"]
+
 [environment]
 base_image = "posthog-fix-llm-gateway-add:latest"
 build_timeout_sec = 1500.0

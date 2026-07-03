@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/gitea-fix-force-push-timeline"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "gitea", "go"]
+
 [environment]
 base_image = "gitea-fix-force-push-timeline:latest"
 build_timeout_sec = 1800.0

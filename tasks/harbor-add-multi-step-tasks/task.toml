@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/harbor-add-multi-step-tasks"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "harbor", "python-lib"]
+
 [environment]
 base_image = "harbor-add-multi-step-tasks:latest"
 build_timeout_sec = 1200.0

@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/gitea-add-project-column-picker"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "gitea", "go", "html-css"]
+
 [environment]
 base_image = "gitea-add-project-column-picker:latest"
 build_timeout_sec = 1800.0

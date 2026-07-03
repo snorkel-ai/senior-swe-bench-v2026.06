@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/paperless-ngx-refactor-task-system"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "paperless-ngx", "python-service", "sql-database"]
+
 [environment]
 base_image = "paperless-ngx-refactor-task-system:latest"
 build_timeout_sec = 1800.0

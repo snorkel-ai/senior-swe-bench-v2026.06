@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/electric-fix-resolve-pending-shapes"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "electric", "elixir"]
+
 [environment]
 base_image = "electric-fix-resolve-pending-shapes:latest"
 build_timeout_sec = 1800.0

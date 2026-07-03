@@ -1,0 +1,213 @@
+[dataset]
+name = "snorkel-ai/senior-swe-bench-v2026.06"
+description = "Senior SWE-Bench (v2026.06) public dataset"
+keywords = [ "senior-swe-bench",]
+[[dataset.authors]]
+name = "senior-swe-bench"
+email = "seniorswebench@snorkel.ai"
+
+[[dataset.authors]]
+name = "Henry Ehrenberg"
+email = "henry@snorkel.ai"
+
+
+[[tasks]]
+name = "snorkel-ai/better-auth-fix-api-key-run"
+digest = "sha256:864fd323b17aa56bb64819577cbd2818467b1f8458c6490688910875e2c339e2"
+
+[[tasks]]
+name = "snorkel-ai/better-auth-fix-api-return-response"
+digest = "sha256:23a81480d9b813d3b3eeded8863bc47c60f607f05e0a89b6450b56a72966b97e"
+
+[[tasks]]
+name = "snorkel-ai/better-auth-fix-oauth-provider-return"
+digest = "sha256:ad95c955f6852e0ef9a82c9eaee5c74ffb5e4981dcecf1dcb581e25b8c8f1797"
+
+[[tasks]]
+name = "snorkel-ai/better-auth-fix-resolve-dynamic-baseurl"
+digest = "sha256:6511c66a61794dcf0bf4fc3d121e2fb2f261b417f55b9d79effe6ca4104338fa"
+
+[[tasks]]
+name = "snorkel-ai/electric-feat-add-variadic-function"
+digest = "sha256:30e43608f616001fd59d39a99443181b9fa993c673680e7f6f03deece595ce01"
+
+[[tasks]]
+name = "snorkel-ai/electric-feat-sync-service-start"
+digest = "sha256:a1ee14254c794ca0f581e53c6dba06def42ebe0176363cb95b4cb156813b42a8"
+
+[[tasks]]
+name = "snorkel-ai/electric-fix-classify-admission-control"
+digest = "sha256:0fa302c641508c37f3c3e47356ffe634137f4321085a8abe306e9ef225f07d7e"
+
+[[tasks]]
+name = "snorkel-ai/electric-fix-elixir-client-cache"
+digest = "sha256:a4d743e8f9813d0a9b7cb3fdf2c0f521a04dd592689cafb843ec9f7edad2bab2"
+
+[[tasks]]
+name = "snorkel-ai/electric-fix-resolve-pending-shapes"
+digest = "sha256:269e95c71e1c90d13e67a709045f4763fa35a39e00f1a834cfe57ffb7dbcbbed"
+
+[[tasks]]
+name = "snorkel-ai/electric-perf-array-filter-eval"
+digest = "sha256:a22fa117865f325dc47fbc6855569ac23f9b3e2ebe4488d5975a430251d96b50"
+
+[[tasks]]
+name = "snorkel-ai/firezone-feat-portal-add-recent"
+digest = "sha256:a23a94ce2ffdbc99029138c80c5bf064f5b99512cd42a2e5375355557aee4c27"
+
+[[tasks]]
+name = "snorkel-ai/firezone-fix-connlib-align-device"
+digest = "sha256:72063dc73ae0be1fc9de2e780a652677f4681cf3c50c2b624d064999b537215e"
+
+[[tasks]]
+name = "snorkel-ai/gitea-add-project-column-picker"
+digest = "sha256:82bef43af9cdfb4c79dad12fbd4c8ccd27b374057a5e980656cf72a63b2c1101"
+
+[[tasks]]
+name = "snorkel-ai/gitea-feat-fast-forward-only"
+digest = "sha256:687199e7d418c2e3d1ec3fc98f05ac7ee08909aa6764d3e16cd2a1625811caa5"
+
+[[tasks]]
+name = "snorkel-ai/gitea-fix-codeql-code-scanning"
+digest = "sha256:356291d5fbad4be7c04f82815cd35f1bc46979a3a16701fe5daecc772964f71e"
+
+[[tasks]]
+name = "snorkel-ai/gitea-fix-diff-highlight-overlap"
+digest = "sha256:65ebfd93b3deacaea48de8dd5eab95a5ffddad4db71d27acf59747c3f405c74f"
+
+[[tasks]]
+name = "snorkel-ai/gitea-fix-force-push-timeline"
+digest = "sha256:3d16132264785338fee36c67bf12e5fec1626d44cd675c44472cbadb71a0fa83"
+
+[[tasks]]
+name = "snorkel-ai/gitea-refactor-auth-middleware"
+digest = "sha256:c1275b97cfd7cd6eccdac44a16caf4202af08cb26f1e29fb6da13137bad1f387"
+
+[[tasks]]
+name = "snorkel-ai/harbor-add-agent-file-retention"
+digest = "sha256:85ade79293fcae6207fad5fe9b64bd3da7e7e3520bae302e5bf5f958445e828b"
+
+[[tasks]]
+name = "snorkel-ai/harbor-add-multi-step-tasks"
+digest = "sha256:452c9fb458e89de6d613c2388464b7dc02ef92dea7d4944ff3a9a79e15cfef98"
+
+[[tasks]]
+name = "snorkel-ai/harbor-add-windows-tasks-support"
+digest = "sha256:a4060d40961cc796aec2e8189eb792c20e0f3d814c9b47aaf73c859bd15e0f0e"
+
+[[tasks]]
+name = "snorkel-ai/harbor-refactor-optional-sandbox-deps"
+digest = "sha256:5203dd5490df5ba5d5be0f9700b87a723e6da41e601db45861d54d780d2efb32"
+
+[[tasks]]
+name = "snorkel-ai/immich-feat-recently-added-assets"
+digest = "sha256:1e1cf4a599cb9d42240cf857f86f6bea1cb4f098d2d87115fa0855d4c01814a5"
+
+[[tasks]]
+name = "snorkel-ai/immich-feat-release-candidate-detection"
+digest = "sha256:fe447ebf28a4fb3aabf5b7a0691f1efa8fcbab6a3a8376e46ea97df54b98b8c5"
+
+[[tasks]]
+name = "snorkel-ai/immich-fix-server-live-photo"
+digest = "sha256:8fb9e77ca31a618d09fd4564f4ea53667d5374bcb98c8e90a14def2c520399c0"
+
+[[tasks]]
+name = "snorkel-ai/paperless-ngx-feat-saved-view-sharing"
+digest = "sha256:7413edb8a9906d9708b15ed893347ff485d4ec91c47ac9dcb74dbfed37d47475"
+
+[[tasks]]
+name = "snorkel-ai/paperless-ngx-perf-document-counts"
+digest = "sha256:ae05f46360e015ae555f378b0c4e28be915c8bb89a4633bbcd11313e91f3adc4"
+
+[[tasks]]
+name = "snorkel-ai/paperless-ngx-perf-workflow-queries"
+digest = "sha256:928c889934d12a0d8f99a2c526b9dc8cf8770358156b628fce94cb175beb2bd5"
+
+[[tasks]]
+name = "snorkel-ai/paperless-ngx-refactor-task-system"
+digest = "sha256:f3ebf1a834167fad7342976ec1278f6805c81ec375c4c2da3cbd8eb533944105"
+
+[[tasks]]
+name = "snorkel-ai/plausible-feat-shared-dashboard-deeplink"
+digest = "sha256:226a9ad37f83b9cf623f725d8362e7b98114d82c17462b72ffd2afb28768dcc8"
+
+[[tasks]]
+name = "snorkel-ai/plausible-fix-cross-site-resource-attach"
+digest = "sha256:f09b0cd04a6e0adb6d7083cfbdbf30217468d2889011cec4f1e254fc8e74e3b8"
+
+[[tasks]]
+name = "snorkel-ai/plausible-fix-top-pages-comparison"
+digest = "sha256:b208745f6d2696e0136b2c1dae86303f2620c843bdf847bdee18eb3b6d885b9f"
+
+[[tasks]]
+name = "snorkel-ai/posthog-feat-approval-gating"
+digest = "sha256:7d7014e655b8c54158d0c20f877c48b5a2569dcf2393b7118b1df2ca6a41ce91"
+
+[[tasks]]
+name = "snorkel-ai/posthog-feat-llma-enable-tagger"
+digest = "sha256:4230711fcb6b0b338ee7ea41a23c2c386ee344319dc6f8e4722cc3279c78ca05"
+
+[[tasks]]
+name = "snorkel-ai/posthog-feat-personhog-writer-add"
+digest = "sha256:22891994c1e9f4b5837c623b36a4a49b266e2bd716d792a4abdb100efc1a91c4"
+
+[[tasks]]
+name = "snorkel-ai/posthog-feat-prompt-versioning"
+digest = "sha256:27849b29590dace2f60d9d06f0f932e41d686bffec896bcdd3be80878c76dfae"
+
+[[tasks]]
+name = "snorkel-ai/posthog-feat-schema-ingestion-block"
+digest = "sha256:eca0a88d27949a120451af50214fbef55086fa0b1252f71e3a7f20b7ee85caad"
+
+[[tasks]]
+name = "snorkel-ai/posthog-feat-subscriptions-auto-disable"
+digest = "sha256:43fd5d13f61e26ce541893b20db419ede112ca3dfd0a2ce25cb218bf86637991"
+
+[[tasks]]
+name = "snorkel-ai/posthog-fix-llm-gateway-add"
+digest = "sha256:9331a18984970fe5aa222c03426301c45261499e2b22aed72b1c7baa5a4d2af7"
+
+[[tasks]]
+name = "snorkel-ai/posthog-fix-replay-buffering"
+digest = "sha256:a6db6948c186f7f83d489ffc27e71d508e348664597c20e82676e17e50e3bd2b"
+
+[[tasks]]
+name = "snorkel-ai/prefect-feat-dbt-per-node-hardening"
+digest = "sha256:0ff09aac587f077b698c98a69aaf78aa89f2041fef9803d1a695614dabae58f2"
+
+[[tasks]]
+name = "snorkel-ai/prefect-fix-resolve-race-condition"
+digest = "sha256:bcd98a5dfb0275ffeb81f6f06856fe3eae668077798a60495c3a2025641bf943"
+
+[[tasks]]
+name = "snorkel-ai/prefect-fix-subflow-cancellation"
+digest = "sha256:894d8ed3d2588643b7260d0d39e4b3f6598cfc761fe160f9e3d6225b1bd81e43"
+
+[[tasks]]
+name = "snorkel-ai/prefect-fix-task-run-recorder"
+digest = "sha256:9fe6e0ab11bc6ca7ba1672f99b650acacdabaf555c9b97e97b7a93501c0c42fd"
+
+[[tasks]]
+name = "snorkel-ai/teleport-add-traits-matching-logic"
+digest = "sha256:d71c6c852f8529e0d954bc9bce429815465c9b0d49914f5a01bec5ddbf5bad53"
+
+[[tasks]]
+name = "snorkel-ai/teleport-fix-scoped-kube-clusters"
+digest = "sha256:91c9a87d97245f6bcfb0460349a248df503da75290b63ffe782decbb66555b09"
+
+[[tasks]]
+name = "snorkel-ai/turborepo-feat-add-circular-package"
+digest = "sha256:a3e34849e13c7821af759591a87e763a3cd512928127aa9811656f4fab7a6e37"
+
+[[tasks]]
+name = "snorkel-ai/turborepo-fix-preserve-package-json"
+digest = "sha256:fbfabfdc3ac072343d314b4f9397a76015359a8d4c983e93a7eb5e1213f9a2d0"
+
+[[tasks]]
+name = "snorkel-ai/turborepo-fix-prune-missing-sources"
+digest = "sha256:bbb761491a43679848287de50c0fc09d10f0e3ff383e353812079333018ea3a5"
+
+[[tasks]]
+name = "snorkel-ai/turborepo-perf-reuse-input-hashes"
+digest = "sha256:1c42953fa7f2022746aca86c1f53890b77ddbcb1e2129ef8f6c04b0666c14509"
+

@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/harbor-refactor-optional-sandbox-deps"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "harbor", "python-lib", "infrastructure"]
+
 [environment]
 base_image = "harbor-refactor-optional-sandbox-deps:latest"
 build_timeout_sec = 900.0

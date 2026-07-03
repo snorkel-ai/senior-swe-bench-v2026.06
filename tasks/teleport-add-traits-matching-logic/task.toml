@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/teleport-add-traits-matching-logic"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "teleport", "go"]
+
 [environment]
 base_image = "teleport-add-traits-matching-logic:latest"
 build_timeout_sec = 1500.0

@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/teleport-fix-scoped-kube-clusters"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "teleport", "go", "cli"]
+
 [environment]
 base_image = "teleport-fix-scoped-kube-clusters:latest"
 build_timeout_sec = 1800.0

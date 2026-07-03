@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/posthog-feat-schema-ingestion-block"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "posthog", "python-service", "typescript-service", "typescript-frontend"]
+
 [environment]
 base_image = "posthog-feat-schema-ingestion-block:latest"
 build_timeout_sec = 1500.0

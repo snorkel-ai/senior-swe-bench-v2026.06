@@ -26,5 +26,10 @@ MODEL=anthropic/claude-opus-4-8
 AGENT=mini-swe-agent
 
 # Run Harbor
+
+# Option 1: via Harbor Hub
+harbor run -d snorkel-ai/senior-swe-bench-v2026.06 -a $AGENT -m $MODEL
+
+# Option 2: via GitHub repo
 harbor run --repo snorkel-ai/senior-swe-bench-v2026.06 -a $AGENT -m $MODEL
 ```

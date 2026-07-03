@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/prefect-fix-subflow-cancellation"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "prefect", "python-service", "python-lib", "cli"]
+
 [environment]
 base_image = "prefect-fix-subflow-cancellation:latest"
 build_timeout_sec = 1800.0

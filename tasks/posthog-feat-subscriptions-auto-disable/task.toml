@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/posthog-feat-subscriptions-auto-disable"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "posthog", "python-service", "typescript-frontend", "sql-database"]
+
 [environment]
 base_image = "posthog-feat-subscriptions-auto-disable:latest"
 build_timeout_sec = 1200.0

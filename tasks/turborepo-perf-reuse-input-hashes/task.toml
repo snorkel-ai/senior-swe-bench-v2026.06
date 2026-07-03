@@ -1,5 +1,10 @@
 version = "1.0"
 
+[task]
+name = "snorkel-ai/turborepo-perf-reuse-input-hashes"
+authors = [{name = "senior-swe-bench", email = "seniorswebench@snorkel.ai"}]
+keywords = ["senior-swe-bench", "turborepo", "rust", "cli"]
+
 [environment]
 base_image = "turborepo-perf-reuse-input-hashes:latest"
 build_timeout_sec = 1800.0
