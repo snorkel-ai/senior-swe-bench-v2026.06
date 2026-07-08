@@ -81,11 +81,12 @@ RUN cd rust \
     && cargo build -p client-shared --tests \
     && cargo check -p tunnel
 
-RUN mkdir -p /logs/verifier /logs/agent
-
-# Baseline commit so diffs isolate the agent's edits (excludes the prebuild
-# cargo fetch / target/ cache).
-RUN git add -A \
-    && git -c user.email=build@senior-swe-bench -c user.name=build \
-        commit --allow-empty -m 'image baseline' --no-gpg-sign \
-    && git rev-parse HEAD > /var/lib/task_base_ref
+# Provision the dev sandbox: if bootstrap touched the tree, snapshot it under a devcontainer
+# identity so the verifier's agent diff (base..HEAD) is only the agent's edits. When the tree
+# is clean, skip the commit and use the checked-out commit as base.
+RUN git add -A && \
+    if ! git diff --cached --quiet; then \
+        git -c user.email=automation@localhost -c user.name=devcontainer \
+            commit -m 'chore: initialize dev environment' --no-gpg-sign; \
+    fi && \
+    git rev-parse HEAD > /var/lib/devcontainer_base_ref

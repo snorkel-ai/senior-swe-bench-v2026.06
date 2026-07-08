@@ -79,9 +79,6 @@ RUN cargo fetch --manifest-path Cargo.toml 2>&1 | tail -3 \
     && cargo build -p turbo 2>&1 | tail -10 \
     && test -x /repo/turborepo/target/debug/turbo
 
-# Persist log dirs the verifier and agent runner expect
-RUN mkdir -p /logs/verifier /logs/agent
-
 # Pre-install verifier infrastructure deps so test.sh's pip install step is
 # fast (cache hit) instead of a 2-3 min download.
 RUN pip3 install --break-system-packages \
@@ -89,8 +86,12 @@ RUN pip3 install --break-system-packages \
         'unidiff>=0.7' 'pygments>=2.17' 'ast-grep-py>=0.30' \
         -q 2>/dev/null || true
 
-# Baseline commit so harbor's diff tracking can compare against a clean tree
-RUN git add -A \
-    && git -c user.email=build@senior-swe-bench -c user.name=build \
-        commit --allow-empty -m 'image baseline' --no-gpg-sign \
-    && git rev-parse HEAD > /var/lib/task_base_ref
+# Provision the dev sandbox: if bootstrap touched the tree, snapshot it under a devcontainer
+# identity so the verifier's agent diff (base..HEAD) is only the agent's edits. When the tree
+# is clean, skip the commit and use the checked-out commit as base.
+RUN git add -A && \
+    if ! git diff --cached --quiet; then \
+        git -c user.email=automation@localhost -c user.name=devcontainer \
+            commit -m 'chore: initialize dev environment' --no-gpg-sign; \
+    fi && \
+    git rev-parse HEAD > /var/lib/devcontainer_base_ref

@@ -13,10 +13,10 @@ export _SYS_PYTHON
 # before pip install / test-setup / verifiers / validation can touch /repo/.
 # Produces two artifacts:
 #   /var/lib/agent_ref   — SHA of the commit containing only agent changes
-#   /logs/verifier/agent.patch — diff from image baseline to agent commit
+#   /logs/verifier/agent.patch — diff from the base checkpoint to agent commit
 # Consumers: taste judge (reads agent.patch), validation agent (uses agent_ref
 # for a clean git diff instead of HEAD which includes test-setup artifacts).
-_BASE_REF="/var/lib/task_base_ref"
+_BASE_REF="/var/lib/devcontainer_base_ref"
 _REPO="/repo/${REPO_NAME:-}"
 if [ -f "$_BASE_REF" ] && [ -d "$_REPO/.git" ]; then
     _BASE=$(cat "$_BASE_REF" | tr -d '[:space:]')
@@ -29,8 +29,8 @@ if [ -f "$_BASE_REF" ] && [ -d "$_REPO/.git" ]; then
         # this commit. An aborted commit leaves HEAD at base and writes an EMPTY
         # agent.patch, which makes validation run as if the agent did nothing
         # and false-positives the repo-integrity check against the agent's work.
-        git config user.email "verifier@senior-swe-bench" 2>/dev/null
-        git config user.name "verifier" 2>/dev/null
+        git config user.email "automation@localhost" 2>/dev/null
+        git config user.name "devcontainer" 2>/dev/null
         git add -A 2>/dev/null
         git diff --cached --quiet || git -c core.hooksPath=/dev/null commit -m "agent changes" --no-gpg-sign --no-verify 2>/dev/null
         git rev-parse HEAD > /var/lib/agent_ref 2>/dev/null

@@ -57,7 +57,7 @@ RUN git remote remove origin \
 # Materialise tests/sqlite.ini from the in-tree template so
 # unittest.MainTest (and the integration test TestMain) can boot under
 # root. Two changes are baked in:
-#   * I_AM_BEING_UNSAFE_RUNNING_AS_ROOT = true — senior-swe-bench containers
+#   * I_AM_BEING_UNSAFE_RUNNING_AS_ROOT = true — sandbox containers
 #     run as root; setting.SetupGiteaTestEnv strips GITEA_* env vars
 #     before reading run-mode config, so the unsafe-root flag MUST be
 #     read from the INI file.
@@ -98,12 +98,12 @@ RUN go vet -tags 'sqlite sqlite_unlock_notify' \
         ./services/auth/... \
         2>&1 | tail -40 || true
 
-RUN mkdir -p /logs/verifier /logs/agent
-
-# Baseline commit for diff tracking. The runner compares the agent's
-# tree against this baseline; without it, image-time noise (mod cache
-# writes, build artifacts) would show up as agent edits.
-RUN git add -A \
-    && git -c user.email=build@senior-swe-bench -c user.name=build \
-        commit --allow-empty -m 'image baseline' --no-gpg-sign \
-    && git rev-parse HEAD > /var/lib/task_base_ref
+# Provision the dev sandbox: if bootstrap touched the tree, snapshot it under a devcontainer
+# identity so the verifier's agent diff (base..HEAD) is only the agent's edits. When the tree
+# is clean, skip the commit and use the checked-out commit as base.
+RUN git add -A && \
+    if ! git diff --cached --quiet; then \
+        git -c user.email=automation@localhost -c user.name=devcontainer \
+            commit -m 'chore: initialize dev environment' --no-gpg-sign; \
+    fi && \
+    git rev-parse HEAD > /var/lib/devcontainer_base_ref

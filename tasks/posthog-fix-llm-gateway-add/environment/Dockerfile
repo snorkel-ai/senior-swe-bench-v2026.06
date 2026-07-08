@@ -54,11 +54,12 @@ RUN /usr/local/bin/python3 -m pip install --break-system-packages \
         'anthropic>=0.40' 'unidiff>=0.7' 'pygments>=2.17' 'ast-grep-py>=0.30' \
         -q 2>/dev/null || true
 
-# Persist log dirs the verifier and agent runner expect.
-RUN mkdir -p /logs/verifier /logs/agent
-
-# Baseline commit for harbor's diff tracking.
+# Provision the dev sandbox: if bootstrap touched the tree, snapshot it under a devcontainer
+# identity so the verifier's agent diff (base..HEAD) is only the agent's edits. When the tree
+# is clean, skip the commit and use the checked-out commit as base.
 RUN cd /repo/posthog && git add -A && \
-    git -c user.email=build@senior-swe-bench -c user.name=build \
-        commit --allow-empty -m 'image baseline' --no-gpg-sign && \
-    git rev-parse HEAD > /var/lib/task_base_ref
+    if ! git diff --cached --quiet; then \
+        git -c user.email=automation@localhost -c user.name=devcontainer \
+            commit -m 'chore: initialize dev environment' --no-gpg-sign; \
+    fi && \
+    git rev-parse HEAD > /var/lib/devcontainer_base_ref

@@ -100,11 +100,12 @@ RUN mix local.hex --force \
 # verify*_test.exs files load Plausible.* without a fresh full compile.
 RUN mix compile --warnings-as-errors --all-warnings || mix compile
 
-# Plausible-specific log dirs the harbor runners populate.
-RUN mkdir -p /logs/verifier /logs/agent
-
-# Baseline commit so harbor diff tracking compares against a clean tree
+# Provision the dev sandbox: if bootstrap touched the tree, snapshot it under a devcontainer
+# identity so the verifier's agent diff (base..HEAD) is only the agent's edits. When the tree
+# is clean, skip the commit and use the checked-out commit as base.
 RUN git add -A && \
-    git -c user.email=build@senior-swe-bench -c user.name=build \
-        commit --allow-empty -m 'image baseline' --no-gpg-sign && \
-    git rev-parse HEAD > /var/lib/task_base_ref
+    if ! git diff --cached --quiet; then \
+        git -c user.email=automation@localhost -c user.name=devcontainer \
+            commit -m 'chore: initialize dev environment' --no-gpg-sign; \
+    fi && \
+    git rev-parse HEAD > /var/lib/devcontainer_base_ref

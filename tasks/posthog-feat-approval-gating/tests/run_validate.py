@@ -126,7 +126,7 @@ class ValidationConfig:
             va_timeout = int(va_timeout * timeout_mult)
             retry_timeout = int(retry_timeout * timeout_mult)
 
-        base_ref_path = Path("/var/lib/task_base_ref")
+        base_ref_path = Path("/var/lib/devcontainer_base_ref")
         base_ref = base_ref_path.read_text().strip() if base_ref_path.exists() else ""
 
         agent_ref_path = Path("/var/lib/agent_ref")
@@ -1171,9 +1171,9 @@ def create_pre_va_checkpoint(config: ValidationConfig) -> str | None:
         _git(
             [
                 "-c",
-                "user.email=val@senior-swe-bench",
+                "user.email=automation@localhost",
                 "-c",
-                "user.name=validation",
+                "user.name=devcontainer",
                 "commit",
                 "--allow-empty",
                 "--no-verify",

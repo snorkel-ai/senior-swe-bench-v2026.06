@@ -114,19 +114,20 @@ RUN ls test/priv/GeoLite2-City-Test.mmdb >/dev/null 2>&1 \
     && cp test/priv/GeoLite2-City-Test.mmdb priv/GeoLite2-City-Test.mmdb 2>/dev/null \
     || true
 
-# Logging directories that harbor's verifier/agent runners expect.
-RUN mkdir -p /logs/verifier /logs/agent
-
 # Gitignore ClickHouse runtime directories so they never appear as integrity
 # violations even if CH writes to a relative path at runtime.
 RUN printf '\n# ClickHouse runtime data directories (written at runtime, not repo content)\nstore/\ncores/\nmetadata/\nuser_files/\nformat_schemas/\nflags/\nuser_scripts/\npreparations/\n' \
         >> .gitignore
 
-# Baseline commit so harbor can diff agent-applied changes.
+# Provision the dev sandbox: if bootstrap touched the tree, snapshot it under a devcontainer
+# identity so the verifier's agent diff (base..HEAD) is only the agent's edits. When the tree
+# is clean, skip the commit and use the checked-out commit as base.
 RUN git add -A && \
-    git -c user.email=build@senior-swe-bench -c user.name=build \
-        commit --allow-empty -m 'image baseline' --no-gpg-sign && \
-    git rev-parse HEAD > /var/lib/task_base_ref
+    if ! git diff --cached --quiet; then \
+        git -c user.email=automation@localhost -c user.name=devcontainer \
+            commit -m 'chore: initialize dev environment' --no-gpg-sign; \
+    fi && \
+    git rev-parse HEAD > /var/lib/devcontainer_base_ref
 
 # Default env vars matching config/.env.test so setup only starts services.
 ENV DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/plausible_test \

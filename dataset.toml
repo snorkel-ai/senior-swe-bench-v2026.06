@@ -13,200 +13,200 @@ email = "henry@snorkel.ai"
 
 [[tasks]]
 name = "snorkel-ai/better-auth-fix-api-key-run"
-digest = "sha256:3b0754dc996dfbbd7e96858e4396df206c62a6880f26a0c5f536f0bf1fedf231"
+digest = "sha256:39bcec71e8b4e9c08f268c7a5ad8d11f765080678b49a62de74455713e0cb805"
 
 [[tasks]]
 name = "snorkel-ai/better-auth-fix-api-return-response"
-digest = "sha256:2da3c099322db6b33a61a6bbf6545449221536361cbba54d37d0a3b4ee96c79f"
+digest = "sha256:6cb3c7091fbd3a36628c31fc3c01d67fa019ceb58074ee9a6c6eb3da013f2623"
 
 [[tasks]]
 name = "snorkel-ai/better-auth-fix-oauth-provider-return"
-digest = "sha256:1087b8a7da5a62f40b4501db18da148742edd06fcb8ab20a0f0564106ed137c3"
+digest = "sha256:ea05caaa57aaa84dd400b04621c6d90dac806f7cf44edb06f043858966135ff4"
 
 [[tasks]]
 name = "snorkel-ai/better-auth-fix-resolve-dynamic-baseurl"
-digest = "sha256:faf295e209303e84d77dc59920c3bd9882149891af3553bc574eabef86ab38ab"
+digest = "sha256:614b0fd216cdd17c24681bde54bb2f5eec4d97be6be25eaee7d476877609cc10"
 
 [[tasks]]
 name = "snorkel-ai/electric-feat-add-variadic-function"
-digest = "sha256:37fe219d81aa6be59831d0c29e1406f2dba30cdb46c3b00d9394294079e35d32"
+digest = "sha256:df821c87ce3f17eefe129e0c56b503c58070328d163d3a58372d9a6c8d15df20"
 
 [[tasks]]
 name = "snorkel-ai/electric-feat-sync-service-start"
-digest = "sha256:fddcab1eb903429da3da8be8faae629fe4e78d5c04da55c73df8e8547cc18d03"
+digest = "sha256:402b3b68612a7b1aad52b435fbc1c5bf308d1d91dc6c7046d07e8e530d4eac42"
 
 [[tasks]]
 name = "snorkel-ai/electric-fix-classify-admission-control"
-digest = "sha256:64bcc36ecd7f72fd3e74d867568a4183e17a6889dda153bcc3d3a3371249f4ca"
+digest = "sha256:f91d6fb5cc72ab8a695873c73513eb35d35e6027bbb06161080a54a495910e68"
 
 [[tasks]]
 name = "snorkel-ai/electric-fix-elixir-client-cache"
-digest = "sha256:9318b2115ac68f6d3a078242ffa3c3348e29a6bc5f6e01be4c559c0ea5dcc30b"
+digest = "sha256:605155169dffa920b3659d8f7e52b6cc6aba5a268dfaac68e534faf4a30f1b26"
 
 [[tasks]]
 name = "snorkel-ai/electric-fix-resolve-pending-shapes"
-digest = "sha256:489e2e55af2b2d1866b0fdc0af8e20f01a469474186f9c77d868a12843f9865e"
+digest = "sha256:fd1f74f3370fe01eb94bd1e796dc2a339166865a5650aa3005f0e1192ba1adae"
 
 [[tasks]]
 name = "snorkel-ai/electric-perf-array-filter-eval"
-digest = "sha256:320a64755f97a76ddcdaf07c66c245d3caf186917ae95d36b89695438fc294b9"
+digest = "sha256:bc83d25d482ee617e01d247fe302652b00bea0929fe24054ec42b0180b259da1"
 
 [[tasks]]
 name = "snorkel-ai/firezone-feat-portal-add-recent"
-digest = "sha256:da6b2fca906b90d6376af7460bdf06d065653d06faaebd320aafcaddafaf9754"
+digest = "sha256:b2b4925412465cc7735d227525368a3d55af0e6296dc97055b51ddb7941d1319"
 
 [[tasks]]
 name = "snorkel-ai/firezone-fix-connlib-align-device"
-digest = "sha256:b4d77fc546bb1d6405a9e032a693bcf183d29339af1b8e91b9e8751ff3538695"
+digest = "sha256:975ea4e5924beda727670cb2244a2a2844cc74423149c846c7f507b2f388c892"
 
 [[tasks]]
 name = "snorkel-ai/gitea-add-project-column-picker"
-digest = "sha256:ae944a6bd7a3a1c9ecb798c79606bde8230b3158e31c8c35fcce93362e8049dc"
+digest = "sha256:23314de65eb39db786e8b6bf82eb66acc958a16cef46f9a673c63df4092c287b"
 
 [[tasks]]
 name = "snorkel-ai/gitea-feat-fast-forward-only"
-digest = "sha256:88fbe258d7f5c6e60c5acf2b9e388eae0742320ef75209fcaf93fb0132898c00"
+digest = "sha256:181529eac381b1ac8dfba7d8cb3ce6beded62debd4324cc767bd3bd567b7629d"
 
 [[tasks]]
 name = "snorkel-ai/gitea-fix-codeql-code-scanning"
-digest = "sha256:95f00d39f355fa4983235d5129945a825c5cc03b5879548ff3c24a08722da716"
+digest = "sha256:ae07afaea4213761726af86b1f702a5a5b92a17c5dbd3f81a9950e54d5bc8dc3"
 
 [[tasks]]
 name = "snorkel-ai/gitea-fix-diff-highlight-overlap"
-digest = "sha256:25ad2165a5b2298de1551021c33cf266ac2b31d69087f39cc642120a4b38a2dc"
+digest = "sha256:570a76d7092793cc4e08a76e9d4a8fddaf002d93a8ef7da2450c89e003139534"
 
 [[tasks]]
 name = "snorkel-ai/gitea-fix-force-push-timeline"
-digest = "sha256:f75ab60ff9ff0929493fa2da40afd70dd71c4511eb2973e5e190307008f54e42"
+digest = "sha256:4c0504d7a8c3893d65de68463adf51cfa541c6cd9f056fcc22156688bf55d8c2"
 
 [[tasks]]
 name = "snorkel-ai/gitea-refactor-auth-middleware"
-digest = "sha256:dd424b8dac41e77131ad8a29a5ad6fbcdfedc34971328f6cc7b240729d5eeb4e"
+digest = "sha256:d6a534db6a9b5662d188a189447618bc3c626870314556fdfbde20da538bc1f9"
 
 [[tasks]]
 name = "snorkel-ai/harbor-add-agent-file-retention"
-digest = "sha256:108c2eeff0e13b64b6a530ba46f3a33e6e9c022a1e97587b44920f70b690baf9"
+digest = "sha256:e8c2c36728b47aced84e0c806aacf3d6e2a7623709f34ae6d6438fcba3d15ac2"
 
 [[tasks]]
 name = "snorkel-ai/harbor-add-multi-step-tasks"
-digest = "sha256:5a0d5c3ae4b28d8889a7c0cadb36e83a2b59b3e779aa05154c547619ea4b91af"
+digest = "sha256:481ba729a0ca09a77984984b99fd6acc0b89768cda89577c3613f1bb57bf3a8c"
 
 [[tasks]]
 name = "snorkel-ai/harbor-add-windows-tasks-support"
-digest = "sha256:93c10b8da2ada6fc97624e6af5cddae1829277633232fc3f450edfc948cbbd21"
+digest = "sha256:cd16af97ec637bce01c319e5992295c5d20462263ab6665460a7552699072937"
 
 [[tasks]]
 name = "snorkel-ai/harbor-refactor-optional-sandbox-deps"
-digest = "sha256:987aa5df5d6d77d766aef06f01fa6b23c7f33dba3c978550409c91c42adb5d0b"
+digest = "sha256:c400f3875ee673d81ddf5451a9c09e98d580d5f2999774f2a042bc7d28636ada"
 
 [[tasks]]
 name = "snorkel-ai/immich-feat-recently-added-assets"
-digest = "sha256:e6300e265eb110a1720841e408df181b8294ceb2fe27a46f7f64c8b8fc279a5a"
+digest = "sha256:f2bdda128b6a50079435c641182a43d965a197d38ec2d5337f0922621bf41636"
 
 [[tasks]]
 name = "snorkel-ai/immich-feat-release-candidate-detection"
-digest = "sha256:d574f3233f09367fc7a3a43e0cd9bef2991a39305a13a8fe32f086f1c83dd31b"
+digest = "sha256:6c57d56ce8abc746af51fc899a9bfd871158e1a582edb498fa22aca4a1e4463d"
 
 [[tasks]]
 name = "snorkel-ai/immich-fix-server-live-photo"
-digest = "sha256:da837d9e5cb79bd3bc4a8a134163d74d14ba0d44e781481f011151b3b37acb70"
+digest = "sha256:027b0c9c9fe2244cb652e1ed30a37a57e97baa0d5307193b4c929e0884b8bd4d"
 
 [[tasks]]
 name = "snorkel-ai/paperless-ngx-feat-saved-view-sharing"
-digest = "sha256:b8d4752de572b29b9bdbcffe4c9f38ad53413bffb0840fa6d1756dcef514ca06"
+digest = "sha256:10ba892f222608d99a0681a1127a21fd5676d247c9a5d28ff494405bdd777030"
 
 [[tasks]]
 name = "snorkel-ai/paperless-ngx-perf-document-counts"
-digest = "sha256:e163e426c1f389d636ccfbdb1c3d5180d90d2410f2ce832733be379a0cd6ffa5"
+digest = "sha256:a401a2a7dd63445f2385937d60d01fd52f80e73ddc4da399157db96e9b5eb51e"
 
 [[tasks]]
 name = "snorkel-ai/paperless-ngx-perf-workflow-queries"
-digest = "sha256:70e89b76168f2a01d56f0c8ab56df77d90d45f90c2cfe2a1915694e07f8a3786"
+digest = "sha256:db371252bc81784bf21bfdc9404d4f0762f75af3ef56009326a9a3a1ab9d70bf"
 
 [[tasks]]
 name = "snorkel-ai/paperless-ngx-refactor-task-system"
-digest = "sha256:c7a2fa85090cd63a7bf91d1e33a66cbd2bff664e3b2aebd225d619b429ec107b"
+digest = "sha256:77abd51a882042690ac5bf3cbc90f520ac48c39da2d6cbb6014e73cf8ba7e088"
 
 [[tasks]]
 name = "snorkel-ai/plausible-feat-shared-dashboard-deeplink"
-digest = "sha256:5b279571dc599eed241e53814dcc89edb08d199b219a01db36d11b0d04e031ef"
+digest = "sha256:785641c175609648f14325d11be17822229343208d33e0079193787b855b1ddd"
 
 [[tasks]]
 name = "snorkel-ai/plausible-fix-cross-site-resource-attach"
-digest = "sha256:0a3f34f715fb3b24dffe2608ff6d50aa02de8421b0009fa8def535964685a42d"
+digest = "sha256:d90aff084acc9a256764038709aa5426ac37d3f80b486449826337ef6f05dcf6"
 
 [[tasks]]
 name = "snorkel-ai/plausible-fix-top-pages-comparison"
-digest = "sha256:a240b62f8ef12acd06c6051c4097219ae8f625fce9dba124c85dd3fae506a0bf"
+digest = "sha256:2541afb4722ad39f59782bd5ad36b7e93882d1c81e1b0d01ac66aae51ea0338e"
 
 [[tasks]]
 name = "snorkel-ai/posthog-feat-approval-gating"
-digest = "sha256:d0262c7c172e0ec0464b42f60ae2f4ad8264ca57a28c0640dae70191f2e33f65"
+digest = "sha256:a3dea4a56ea385097989568a6b88e02a0f4574f254edde18855b5c8586705add"
 
 [[tasks]]
 name = "snorkel-ai/posthog-feat-llma-enable-tagger"
-digest = "sha256:4e91ecaae2160cedd9e995b1facc1964aa579e490a4b692dad86cef8867eff2a"
+digest = "sha256:b38795bcabf0377bd63a8f394072b5d12a7ceb909c6dd8ecda2f5813c4be04f3"
 
 [[tasks]]
 name = "snorkel-ai/posthog-feat-personhog-writer-add"
-digest = "sha256:78fe3016b457312b290dc00cb72b718288340d0b31b22a028382535a90af4512"
+digest = "sha256:71d4206f6238f103aa08577e5f7b0156efcf581346ec85449def1721c787e9fa"
 
 [[tasks]]
 name = "snorkel-ai/posthog-feat-prompt-versioning"
-digest = "sha256:29f1d8cca4674e7ce38cb6c0674c429bc3dc84960e94af3252a8270ca5333a73"
+digest = "sha256:e68303fd9afd978c7c75d505397a7e9afafc0b9627379720eaf21e961b2a5b07"
 
 [[tasks]]
 name = "snorkel-ai/posthog-feat-schema-ingestion-block"
-digest = "sha256:8b215a9c71c02c0e1a9f6e7a5dbd6748aa4c56f5810985075e9f9b91ab12b228"
+digest = "sha256:bec7b59348b05e44665723613a0c0934d36b9392d72cd51a33f6277741927f22"
 
 [[tasks]]
 name = "snorkel-ai/posthog-feat-subscriptions-auto-disable"
-digest = "sha256:e999cda246f50cc86d9303778ac6dd298f4403681f46ef1f073e581d1f0b194d"
+digest = "sha256:550c917bdc6e8f76a4b27fef72545528b46d3eedd10b370224fd9ecf79fc42e3"
 
 [[tasks]]
 name = "snorkel-ai/posthog-fix-llm-gateway-add"
-digest = "sha256:25ec2d4fd3fbedb1fa1e16a7e167288d63892ea31ef124e7927b54e3b5be2954"
+digest = "sha256:425a986c6218dd6442849a4c35af14c723de34ca13c54f9c8d92a8d8f09bf149"
 
 [[tasks]]
 name = "snorkel-ai/posthog-fix-replay-buffering"
-digest = "sha256:88617067a17295abdded14af44860baa5a055e436209c7285c6317b10fca1618"
+digest = "sha256:ffb23c6374af3fd119a7ab6cf100a75165000413eeabeec21f51c7b26a8f7923"
 
 [[tasks]]
 name = "snorkel-ai/prefect-feat-dbt-per-node-hardening"
-digest = "sha256:b5b58c1712edc87f7c336636493fca8436369353db02eea99fecdcc615840527"
+digest = "sha256:a4ca889f2c00f1f3e41a95010dfcb9431171fe29532fc6a0c7f3149dc556e8b6"
 
 [[tasks]]
 name = "snorkel-ai/prefect-fix-resolve-race-condition"
-digest = "sha256:8020b7063502dba0d628548b12ce7a708e175f57f22351f0d9ec7e7f8dfb3edc"
+digest = "sha256:9b6b6cbb5ef95d827cf7796bbbe942ecc974cd67bc81a73fef49b74fa6ca5420"
 
 [[tasks]]
 name = "snorkel-ai/prefect-fix-subflow-cancellation"
-digest = "sha256:ef7f444fcf1fed91f8280e934f4e64bce09896acd694803184e642828cec8453"
+digest = "sha256:4351f591e572fc916c018c4201099e65ff9340b90f7cbb32254a8f00ffd41229"
 
 [[tasks]]
 name = "snorkel-ai/prefect-fix-task-run-recorder"
-digest = "sha256:c99115c96632d8f582a7f7d0c6eae3e3483ac7ee5f5ee1b4c8a26e1db4f820e9"
+digest = "sha256:41209b2453dd98196eab76ccbe37ebe5059a2f30a753a0fa0336abe327bcd400"
 
 [[tasks]]
 name = "snorkel-ai/teleport-add-traits-matching-logic"
-digest = "sha256:a9960de5bcdd4a751491f540732432740108105211362f65dce488c658f676b6"
+digest = "sha256:d1727e38efcbc513d5635c261a8c8f194fd399f77bc0a68f346504dc528d622c"
 
 [[tasks]]
 name = "snorkel-ai/teleport-fix-scoped-kube-clusters"
-digest = "sha256:c58e4615a5bf4d59761960f8444f4c333313fbefcf1d00a146d7be402c4f46a0"
+digest = "sha256:1ec2118728a744a254948aa265f7348874aa2972ad56a9ae6446b8bbeb915cb1"
 
 [[tasks]]
 name = "snorkel-ai/turborepo-feat-add-circular-package"
-digest = "sha256:bc7fd4d82f58ebe236e3a4cc85cd61432321f4d535f7bba6709b9f8457699655"
+digest = "sha256:ebdb908d8dee7b813a3547ceb6abc1687b2fd348977261498cb6e2216591ad69"
 
 [[tasks]]
 name = "snorkel-ai/turborepo-fix-preserve-package-json"
-digest = "sha256:915e4f6b4646ebeec61c5eec8d6c9260bfad8dad3be9391a98586f2a58713528"
+digest = "sha256:0233ac10449a1ae0c3f67912e16cc63d6982d20975fe527ff5e6761e6f1e6fe8"
 
 [[tasks]]
 name = "snorkel-ai/turborepo-fix-prune-missing-sources"
-digest = "sha256:6274ce4071483a7725f1f5e1f3f61699e4389e45a50cedaf062aeef160133eeb"
+digest = "sha256:b9d8d574338266b17256bda92b23b87b9dee5fe170e47f19e66cbd5bb543dd47"
 
 [[tasks]]
 name = "snorkel-ai/turborepo-perf-reuse-input-hashes"
-digest = "sha256:5c1d9bcb3375294a0f2574f6fdf321670cf6531b81cfe1da2beb61c8236571f8"
+digest = "sha256:b06e428f250758d1a9acc71f0975affcc4b21595c10013c653d05922e69b61fa"
